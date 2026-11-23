@@ -35,10 +35,30 @@ from handoff_verify.parsers._common import (
 )
 
 _CODEX_EXIT_RE = re.compile(
-    r"(?:Process exited with code|Exit code:?)\s+(-?\d+)",
+    r"(?:^|\n)\s*(?:Process exited with code|Exit code:?)\s+(-?\d+)\b",
     re.IGNORECASE,
 )
-_CODEX_OUTPUT_MARKER_RE = re.compile(r"(?:^|\n)Output:\n", re.MULTILINE)
+_CODEX_OUTPUT_MARKER_RE = re.compile(r"(?:^|\n)Output:\r?\n", re.MULTILINE)
+_CODEX_TOTAL_LINES_RE = re.compile(r"^Total output lines:\s*\d+\r?\n(?:\r?\n)?", re.IGNORECASE)
+_CODEX_ERROR_PREFIXES = (
+    "error:",
+    "execution error:",
+    "exec command rejected by user",
+    "patch rejected by user",
+    "command aborted by user",
+    "aborted by user",
+    "command timed out",
+    "execution timed out",
+    "rejected by user",
+    "user rejected",
+    "tool execution aborted",
+)
+
+
+def _is_codex_error_text(text: str) -> bool:
+    low = text.lstrip().lower()
+    return low.startswith(_CODEX_ERROR_PREFIXES)
+
 
 _SHELL_TOOLS = frozenset(
     {
@@ -107,35 +127,30 @@ def _unwrap_codex_output(raw_output: str) -> tuple[str, int | None, bool]:
             exit_code = safe_int(meta.get("exit_code"))
             if exit_code is None:
                 exit_code = safe_int(obj.get("exit_code"))
-            is_err = bool(obj.get("is_error", False)) or (exit_code is not None and exit_code != 0)
+            is_err = (
+                bool(obj.get("is_error", False))
+                or (exit_code is not None and exit_code != 0)
+                or _is_codex_error_text(inner_out)
+            )
             return inner_out, exit_code, is_err
 
     exit_code: int | None = None
-    m_exit = _CODEX_EXIT_RE.search(raw_output[:512])
-    if m_exit:
-        exit_code = int(m_exit.group(1))
-
     clean = raw_output
     m_marker = _CODEX_OUTPUT_MARKER_RE.search(raw_output[:1024])
     if m_marker:
+        header = raw_output[: m_marker.start()]
+        m_exit = _CODEX_EXIT_RE.search(header)
+        if m_exit:
+            exit_code = int(m_exit.group(1))
         clean = raw_output[m_marker.end() :]
+        clean = _CODEX_TOTAL_LINES_RE.sub("", clean, count=1)
+    else:
+        first_line = raw_output.split("\n", 1)[0]
+        m_exit = _CODEX_EXIT_RE.match(first_line)
+        if m_exit:
+            exit_code = int(m_exit.group(1))
 
-    clean_stripped = clean.lstrip()
-    clean_lower = clean_stripped.lower()
-    is_err = (
-        (exit_code is not None and exit_code != 0)
-        or clean_stripped.startswith("Error:")
-        or clean_lower.startswith(
-            (
-                "aborted by user",
-                "command timed out",
-                "execution timed out",
-                "rejected by user",
-                "user rejected",
-                "tool execution aborted",
-            )
-        )
-    )
+    is_err = (exit_code is not None and exit_code != 0) or _is_codex_error_text(clean)
     return clean, exit_code, is_err
 
 

@@ -417,6 +417,11 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
         if tur.get("truncated") is True and not truncated:
             truncated = True
             trunc_reason = "toolUseResult.truncated=true"
+        if not truncated and any(
+            _PAGINATION_BANNER_RE.match(line.strip()) for line in split_lf_lines(raw_out)
+        ):
+            truncated = True
+            trunc_reason = "grep results paginated"
 
         sp = safe_str(raw_in.get("path")) or None
         ev_search = SearchEvent(

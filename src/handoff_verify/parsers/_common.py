@@ -341,6 +341,10 @@ _SHOWING_RANGE_RE = re.compile(
     r"^(?:\[|\(|note:\s*)?showing\s+(?:lines?|results?|items?)\s+(\d+)\s*[-–]\s*(\d+)\s+of\s+(\d+)\b",
     re.IGNORECASE,
 )
+_INLINE_CODEX_ELISION_RE = re.compile(
+    r"(?:…|\.\.\.)\s*\d+\s+(?:tokens?|chars?|characters?|lines?)\s+truncated\s*(?:…|\.\.\.)",
+    re.IGNORECASE,
+)
 _BANNER_TRUNCATION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
@@ -351,7 +355,7 @@ _BANNER_TRUNCATION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (
         re.compile(
-            r"^\([^()\n]{0,160}\b(?:truncated|omitted)\b[^()\n]{0,160}\)\.?$",
+            r"^\([^()\n]{0,160}(?:\btruncated\b|\d+\s+[^()\n]{0,40}\bomitted\b|\.\.\.[^()\n]{0,80}\bomitted\b)[^()\n]{0,160}\)\.?$",
             re.IGNORECASE,
         ),
         "truncated",
@@ -366,8 +370,7 @@ _BANNER_TRUNCATION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (
         re.compile(
-            r"^(?:\.\.\.\s*)?truncated\s+(?:to|after)?\s*\d*\s*"
-            r"(?:lines?|chars?|characters?|bytes?|matches?|results?)?\b",
+            r"^(?:\.\.\.\s*)?truncated\s+(?:(?:to|after)\s+\d+|\d+\s+(?:lines?|chars?|characters?|bytes?|matches?|results?))\b",
             re.IGNORECASE,
         ),
         "output truncated",
@@ -375,7 +378,8 @@ _BANNER_TRUNCATION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
             r"^(?:\.\.\.\s*)?(?:output|response|content|file)\s+"
-            r"(?:exceeded|is\s+longer\s+than)\b",
+            r"(?:exceeded\s+(?:the\s+)?(?:max|maximum|limit|size|\d+)|"
+            r"is\s+longer\s+than\s+(?:the\s+)?(?:max|maximum|\d+))\b",
             re.IGNORECASE,
         ),
         "output limit exceeded",
@@ -394,7 +398,7 @@ _BANNER_TRUNCATION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
             r"^(?:\.\.\.\s*\(?|\()\s*\d+\s+more\s+"
-            r"(?:lines?|matches?|results?|files?|items?|chars?|characters?|bytes?)\s*\)?\.?$",
+            r"(?:lines?|matches?|results?|files?|chars?|characters?|bytes?)\s*\)?\.?$",
             re.IGNORECASE,
         ),
         "additional output omitted",
@@ -411,7 +415,7 @@ _BANNER_TRUNCATION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 
 # Fast linear keyword probe used to avoid per-line regex checks on outputs with no banners
 _TRUNCATION_KEYWORD_RE = re.compile(
-    r"truncat|omitted|limit\s+reached|more\s+(?:lines?|matches?|results?|files?|items?|chars?|characters?|bytes?)"
+    r"truncat|omitted|limit\s+reached|more\s+(?:lines?|matches?|results?|files?|chars?|characters?|bytes?)"
     r"|showing\s+(?:the\s+)?first|showing\s+(?:lines?|results?|items?)|exceeded|longer\s+than",
     re.IGNORECASE,
 )
@@ -420,7 +424,12 @@ _TRUNCATION_KEYWORD_RE = re.compile(
 def is_truncation_banner_line(line: str) -> tuple[bool, str | None]:
     """Return (True, reason) if a single standalone line is an explicit truncation banner."""
     s = line.strip()
-    if not s or len(s) > 240:
+    if not s:
+        return False, None
+    m_inline = _INLINE_CODEX_ELISION_RE.search(s)
+    if m_inline:
+        return True, m_inline.group(0).strip()
+    if len(s) > 240:
         return False, None
     # Never treat a `path/to/file.py:42:code` grep match line as a truncation banner
     if _GREP_MATCH_LINE_RE.match(s):
@@ -822,7 +831,7 @@ _NO_MATCH_OUTPUT_SENTINELS = frozenset(
     }
 )
 _PASSTHROUGH_PIPE_CMDS = frozenset({"head", "tail", "sort", "uniq", "cat", "tee"})
-_SEARCH_VALUE_FLAGS = frozenset(
+_COMMON_SEARCH_VALUE_FLAGS = frozenset(
     {
         "-A",
         "--after-context",
@@ -830,20 +839,29 @@ _SEARCH_VALUE_FLAGS = frozenset(
         "--before-context",
         "-C",
         "--context",
-        "--context-separator",
         "--color",
-        "--colors",
         "-d",
+        "-D",
+        "--devices",
+        "--directories",
+        "--binary-files",
+        "-f",
+        "--file",
+        "--label",
+        "--exclude-from",
+    }
+)
+_RG_ONLY_VALUE_FLAGS = frozenset(
+    {
+        "--context-separator",
+        "--colors",
         "--max-depth",
         "-E",
         "--engine",
         "--encoding",
-        "-f",
-        "--file",
         "--field-match-separator",
         "-j",
         "--threads",
-        "--label",
         "-M",
         "--max-columns",
         "--max-filesize",
@@ -1298,7 +1316,7 @@ def _has_transforming_pipe(pipe_segments: list[str]) -> bool:
 
 
 _GREP_TOOL_ERROR_RE = re.compile(
-    r"^(?:rg|grep|egrep|fgrep|ag|ack|git)\s*:\s*",
+    r"^(?:rg|grep|egrep|fgrep|ag|ack|git|find|fd)\s*:\s*",
     re.IGNORECASE,
 )
 
@@ -1308,14 +1326,15 @@ def _parse_matched_files_from_grep_output(
     *,
     files_only_mode: bool = False,
     single_target_path: str | None = None,
-) -> tuple[list[str], int]:
-    """Extract matched file paths and line match count from direct grep/rg output."""
+) -> tuple[list[str], int, bool]:
+    """Extract (matched_files, match_count, saw_tool_error) from direct grep/rg output."""
     cleaned = _strip_exit_code_lines(output)
     if not cleaned.strip():
-        return [], 0
+        return [], 0, False
     files: list[str] = []
     seen: set[str] = set()
     match_lines = 0
+    saw_tool_error = False
     for line in split_lf_lines(cleaned):
         s = line.strip()
         if not s or s == "--":
@@ -1327,11 +1346,23 @@ def _parse_matched_files_from_grep_output(
         if _EXIT_CODE_LINE_RE.match(s):
             continue
         if _GREP_TOOL_ERROR_RE.match(s):
+            saw_tool_error = True
             continue
         match_lines += 1
         if ":" in s:
             prefix = s.split(":", 1)[0].strip()
-            if prefix and not prefix.isdigit() and " " not in prefix and prefix not in seen:
+            looks_like_path = (
+                bool(prefix)
+                and not prefix.isdigit()
+                and " " not in prefix
+                and (
+                    single_target_path is None
+                    or prefix == single_target_path
+                    or "/" in prefix
+                    or "." in prefix
+                )
+            )
+            if looks_like_path and prefix not in seen:
                 seen.add(prefix)
                 files.append(prefix)
         elif " " not in s and ((files_only_mode and not s.isdigit()) or "/" in s) and s not in seen:
@@ -1339,7 +1370,7 @@ def _parse_matched_files_from_grep_output(
             files.append(s)
     if match_lines > 0 and not files and single_target_path:
         files.append(single_target_path)
-    return files, match_lines
+    return files, match_lines, saw_tool_error
 
 
 def extract_apply_patch_edits(
@@ -1764,7 +1795,20 @@ def _extract_sed_inplace_edits(
 
 
 _SEARCH_NON_MATCH_OUTPUT_FLAGS = frozenset(
-    {"-c", "--count", "--count-matches", "-q", "--quiet", "--silent", "--json", "--stats"}
+    {
+        "-c",
+        "--count",
+        "--count-matches",
+        "-q",
+        "--quiet",
+        "--silent",
+        "--json",
+        "--stats",
+        "-v",
+        "--invert-match",
+        "-L",
+        "--files-without-match",
+    }
 )
 _FIND_VALUE_FLAGS = frozenset(
     {
@@ -1865,10 +1909,18 @@ def _analyze_search_tokens(
         if exit_code != 1:
             return
         cleaned_err = _strip_exit_code_lines(stdout).strip()
-        if cleaned_err and _GREP_TOOL_ERROR_RE.match(cleaned_err):
+        if cleaned_err and any(
+            _GREP_TOOL_ERROR_RE.match(line.strip()) for line in split_lf_lines(cleaned_err)
+        ):
             return
     elif exit_code not in (0, 1, None):
         return
+
+    value_flags = (
+        _COMMON_SEARCH_VALUE_FLAGS | _RG_ONLY_VALUE_FLAGS
+        if search_cmd in ("rg", "ag", "ack")
+        else _COMMON_SEARCH_VALUE_FLAGS
+    )
 
     query: str | None = None
     raw_paths: list[str] = []
@@ -1933,12 +1985,24 @@ def _analyze_search_tokens(
                     result_limit = val_int
                 i += 2
                 continue
-            if tok in _SEARCH_VALUE_FLAGS and i + 1 < len(tokens):
+            if tok.startswith("--max-count="):
+                val_int = safe_int(tok.split("=", 1)[1])
+                if val_int is not None and val_int > 0 and result_limit is None:
+                    result_limit = val_int
+                i += 1
+                continue
+            if tok.startswith("-m") and len(tok) > 2 and tok[2:].isdigit():
+                val_int = int(tok[2:])
+                if val_int > 0 and result_limit is None:
+                    result_limit = val_int
+                i += 1
+                continue
+            if tok in value_flags and i + 1 < len(tokens):
                 i += 2
                 continue
-            # Combined short flags like `-rnq` or `-rnc`
+            # Combined short flags like `-rnq`, `-rnc`, `-rnv`, `-rnL`
             if not tok.startswith("--") and len(tok) > 2:
-                if "q" in tok[1:] or "c" in tok[1:]:
+                if any(ch in tok[1:] for ch in ("q", "c", "v", "L")):
                     count_unknown = True
                 if "l" in tok[1:]:
                     files_only_mode = True
@@ -1967,18 +2031,27 @@ def _analyze_search_tokens(
 
     matched_files: list[str]
     match_count: int | None
+    saw_tool_error = False
     if direct_output:
         single_target = resolved_paths[0] if len(resolved_paths) == 1 else None
-        matched_files, match_count = _parse_matched_files_from_grep_output(
+        matched_files, parsed_count, saw_tool_error = _parse_matched_files_from_grep_output(
             stdout,
             files_only_mode=files_only_mode,
             single_target_path=single_target,
         )
+        if saw_tool_error and parsed_count == 0:
+            # Complete failure (e.g. `grep: srcc/: No such file or directory | head -20`):
+            # never record a failed search as a clean zero-match search.
+            return
+        match_count = None if saw_tool_error else parsed_count
     else:
         matched_files = []
         match_count = None
 
     is_trunc, trunc_reason = (truncated, truncation_reason)
+    if saw_tool_error and not is_trunc:
+        is_trunc = True
+        trunc_reason = "search tool error encountered (incomplete results)"
     if not is_trunc:
         is_trunc, trunc_reason = detect_truncation(
             stdout if direct_output else "",
@@ -2063,7 +2136,8 @@ def _analyze_find_tokens(
                 i += 1
                 continue
             if tok in ("-name", "-iname") and i + 1 < len(tokens):
-                if negated:
+                is_pruned = i + 2 < len(tokens) and tokens[i + 2] == "-prune"
+                if negated or is_pruned:
                     excluded_dirs.append(tokens[i + 1].strip("*/"))
                 else:
                     glob_pattern = tokens[i + 1]
@@ -2135,12 +2209,22 @@ def _analyze_find_tokens(
 
     direct_output = sole_command and not _has_transforming_pipe(pipe_segments)
     cleaned_stdout = _strip_exit_code_lines(stdout)
-    lines = (
-        [line.strip() for line in split_lf_lines(cleaned_stdout) if line.strip()]
-        if direct_output
-        else []
-    )
-    match_count: int | None = len(lines) if direct_output else None
+    lines: list[str] = []
+    saw_find_error = False
+    if direct_output:
+        for line in split_lf_lines(cleaned_stdout):
+            s = line.strip()
+            if not s:
+                continue
+            if is_truncation_banner_line(s)[0]:
+                continue
+            if _GREP_TOOL_ERROR_RE.match(s):
+                saw_find_error = True
+                continue
+            lines.append(s)
+    if saw_find_error and not lines:
+        return
+    match_count: int | None = len(lines) if (direct_output and not saw_find_error) else None
 
     is_trunc, trunc_reason = (truncated, truncation_reason)
     if not is_trunc:
@@ -2253,11 +2337,17 @@ def _analyze_read_tokens(
         parsed = parse_numbered_lines(
             stdout, offset=start, limit=req_limit, expect_line_numbers=False
         )
+        start_line: int | None
         end_line: int | None
-        if explicit_end is not None:
-            end_line = min(explicit_end, parsed.end_line) if parsed.end_line else explicit_end
+        if parsed.start_line is None or parsed.end_line is None:
+            start_line = None
+            end_line = None
         else:
-            end_line = parsed.end_line
+            start_line = start if parsed.line_count > 0 else None
+            if explicit_end is not None:
+                end_line = min(explicit_end, parsed.end_line)
+            else:
+                end_line = parsed.end_line
 
         derived.file_reads.append(
             FileReadEvent(
@@ -2271,7 +2361,7 @@ def _analyze_read_tokens(
                 truncated=truncated or parsed.truncated,
                 truncation_reason=truncation_reason or parsed.truncation_reason,
                 file_path=file_path,
-                start_line=start if parsed.line_count > 0 else None,
+                start_line=start_line,
                 end_line=end_line,
                 offset=start,
                 limit=req_limit,

@@ -907,8 +907,10 @@ def test_rereview_2_single_file_grep_and_count_quiet_flags() -> None:
     assert parsed.searches[1].match_count is None
     assert parsed.searches[2].match_count is None
 
-    # `rg: ... Permission denied` is NOT counted as a match in file `rg`
-    assert parsed.searches[3].match_count == 1
+    # `rg: ... Permission denied` is NOT counted as a match in file `rg`,
+    # and marks the search incomplete (`match_count=None`, `truncated=True`)
+    assert parsed.searches[3].match_count is None
+    assert parsed.searches[3].truncated is True
     assert parsed.searches[3].matched_files == ["src/ok.py"]
 
 
@@ -1217,4 +1219,310 @@ def test_rereview_nonblocking_bom_heredoc_cat_nested_gql_cursor_err_and_perf(
     assert p_misc.assistant_messages[0].text == "T1\nT2"
     assert p_misc.searches[0].matched_files == ["src/a.py"]
     assert p_misc.searches[0].match_count == 1
+    assert p_misc.searches[0].truncated is True
     assert p_misc.commands[0].exit_code == 0
+
+
+# --- Re-review #2 blocking & non-blocking regression tests ---
+
+
+def test_rereview2_1_failed_piped_grep_never_recorded_as_clean_zero() -> None:
+    lines = _jsonl(
+        [
+            {
+                "type": "command",
+                "command": "grep -rn foo srcc/ | head -20",
+                "stdout": "grep: srcc/: No such file or directory\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "rg foo src 2>&1 | tail -5",
+                "stdout": "rg: src: No such file or directory\n",
+                "exit_code": 0,
+            },
+        ]
+    )
+    parsed = parse_generic(lines)
+    assert parsed.searches == []
+    assert build_scope_receipt(parsed).searched_roots == []
+
+
+def test_rereview2_2_codex_real_rejection_abort_and_error_strings() -> None:
+    lines = _jsonl(
+        [
+            # Plain-text `exec command rejected by user`
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "rej_cmd",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "rg foo src"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "rej_cmd",
+                    "output": "exec command rejected by user",
+                },
+            },
+            # JSON-wrapped `exec command rejected by user`
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "rej_json",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "rg bar src"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "rej_json",
+                    "output": json.dumps(
+                        {"output": "exec command rejected by user", "metadata": {}}
+                    ),
+                },
+            },
+            # `patch rejected by user` on apply_patch tool
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "rej_patch",
+                    "name": "apply_patch",
+                    "input": "*** Begin Patch\n*** Update File: a.py\n*** End Patch",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "rej_patch",
+                    "output": "patch rejected by user",
+                },
+            },
+            # `command aborted by user` + `execution error: ...`
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "ab_cmd",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "rg baz src"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "ab_cmd",
+                    "output": "command aborted by user",
+                },
+            },
+            # `rg -n 'exit code' docs` returning `Exit code 2` inside stdout is NOT an error!
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "ok_ec",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "rg -n 'exit code' docs"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "ok_ec",
+                    "output": (
+                        "Process exited with code 0\n"
+                        "Output:\n"
+                        "docs/a.md:3:Exit code 2 means usage error\n"
+                    ),
+                },
+            },
+        ]
+    )
+
+    parsed = parse_codex(lines)
+    assert parsed.file_edits == []
+    assert len(parsed.searches) == 1
+    assert parsed.searches[0].search_paths == ["docs"]
+    assert parsed.searches[0].match_count == 1
+    assert parsed.searches[0].matched_files == ["docs/a.md"]
+
+
+def test_rereview2_3_codex_unicode_elision_and_total_output_lines_header() -> None:
+    codex_cat = (
+        "Chunk ID: c1\n"
+        "Wall time: 0.01s\n"
+        "Process exited with code 0\n"
+        "Output:\n"
+        "Total output lines: 500\n"
+        "\n"
+        "line 1\n"
+        "line 2\n"
+        "…4200 tokens truncated…\n"
+        "line 500\n"
+    )
+    codex_clean_cat = (
+        "Process exited with code 0\nOutput:\nTotal output lines: 2\n\nfirst line\nsecond line\n"
+    )
+    codex_rg = (
+        "Process exited with code 0\n"
+        "Output:\n"
+        "src/a.py:1:foo\n"
+        "…1200 chars truncated…\n"
+        "src/z.py:9:foo\n"
+    )
+    lines = _jsonl(
+        [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "cat_elided",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "cat big.txt"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "cat_elided",
+                    "output": codex_cat,
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "cat_clean",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "cat small.txt"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "cat_clean",
+                    "output": codex_clean_cat,
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "rg_elided",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "rg foo src"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "rg_elided",
+                    "output": codex_rg,
+                },
+            },
+        ]
+    )
+
+    parsed = parse_codex(lines)
+    by_path = {r.file_path: r for r in parsed.file_reads}
+
+    # Elided cat -> truncated=True, start_line/end_line=None
+    assert by_path["big.txt"].truncated is True
+    assert by_path["big.txt"].start_line is None
+    assert by_path["big.txt"].end_line is None
+
+    # Clean cat with `Total output lines: 2\n\n` stripped -> exact lines 1-2 (no +2 shift!)
+    assert by_path["small.txt"].truncated is False
+    assert by_path["small.txt"].start_line == 1
+    assert by_path["small.txt"].end_line == 2
+    assert by_path["small.txt"].content == "first line\nsecond line"
+
+    # Elided rg -> truncated=True and elision line NOT counted as a match
+    assert len(parsed.searches) == 1
+    assert parsed.searches[0].truncated is True
+    assert parsed.searches[0].match_count == 2
+    assert parsed.searches[0].matched_files == ["src/a.py", "src/z.py"]
+
+
+def test_rereview2_4_grep_boolean_r_and_E_flags_and_nonblocking_polish() -> None:
+    lines = _jsonl(
+        [
+            {"type": "command", "command": "grep -r foo src", "stdout": "", "exit_code": 1},
+            {"type": "command", "command": "grep -E 'a|b' src", "stdout": "", "exit_code": 1},
+            {"type": "command", "command": "grep -i -r foo src/sub", "stdout": "", "exit_code": 1},
+            {"type": "command", "command": "grep -w -r foo .", "stdout": "", "exit_code": 1},
+            # Single-file grep without `-n` on YAML (`timeout: 30`)
+            {
+                "type": "command",
+                "command": "grep timeout config.yaml",
+                "stdout": "timeout: 30\n",
+                "exit_code": 0,
+            },
+            # Attached `-m1` and `--max-count=1`
+            {
+                "type": "command",
+                "command": "rg -m1 foo src",
+                "stdout": "src/a.py:1:foo\n",
+                "exit_code": 0,
+            },
+            # Inverted match `-v` does not report positive match count
+            {
+                "type": "command",
+                "command": "grep -v comment src/a.py",
+                "stdout": "real code\n",
+                "exit_code": 0,
+            },
+            # `sed` on elided output does not report `(1, 5000)`
+            {
+                "type": "command",
+                "command": "sed -n '1,5000p' big.txt",
+                "stdout": "line 1\n... [4000 lines truncated] ...\nline 5000\n",
+                "exit_code": 0,
+            },
+        ]
+    )
+
+    parsed = parse_generic(lines)
+    assert (parsed.searches[0].query, parsed.searches[0].search_paths) == ("foo", ["src"])
+    assert (parsed.searches[1].query, parsed.searches[1].search_paths) == ("a|b", ["src"])
+    assert (parsed.searches[2].query, parsed.searches[2].search_paths) == ("foo", ["src/sub"])
+    assert (parsed.searches[3].query, parsed.searches[3].search_paths) == ("foo", ["."])
+
+    # Single-file grep on YAML prefers `config.yaml` over `timeout`
+    assert parsed.searches[4].matched_files == ["config.yaml"]
+    assert parsed.searches[4].match_count == 1
+
+    # Attached `-m1` sets result_limit=1 and flags truncated
+    assert parsed.searches[5].result_limit == 1
+    assert parsed.searches[5].truncated is True
+
+    # `-v` returns match_count=None
+    assert parsed.searches[6].match_count is None
+
+    # `sed` on elided output has truncated=True and unknown window
+    assert parsed.file_reads[0].truncated is True
+    assert parsed.file_reads[0].start_line is None
+    assert parsed.file_reads[0].end_line is None
+
+    # Prose lines inside normal files must NOT trigger false-positive truncation
+    prose = (
+        "Truncated the logs table last week.\n"
+        "Output exceeded our expectations!\n"
+        "(details omitted)\n"
+        "... 3 more items\n"
+    )
+    assert detect_truncation(prose) == (False, None)
