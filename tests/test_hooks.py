@@ -152,7 +152,11 @@ def test_parse_claude_hook_input_fields_and_bool_coercion() -> None:
 
 
 def test_hook_clean_pass_is_silent_in_advise_and_block(tmp_path: Path) -> None:
-    transcript = _write_claude_transcript(tmp_path / "session.jsonl")
+    (tmp_path / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "app.py").write_text("def main():\n    return 0\n", encoding="utf-8")
+    transcript = _write_claude_transcript(
+        tmp_path / "session.jsonl", final_text="Checked src/app.py:1-2."
+    )
     payload = json.dumps(
         {
             "hook_event_name": "Stop",
