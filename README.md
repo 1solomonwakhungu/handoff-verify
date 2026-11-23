@@ -18,6 +18,22 @@ AI coding agents and subagents frequently hand back confident reports containing
 
 Requires Python `>=3.11`. No runtime dependencies.
 
+### From PyPI (recommended)
+
+```bash
+uvx handoff-verify --version           # run with zero install
+uv tool install handoff-verify         # install globally on PATH
+pip install handoff-verify
+```
+
+### As an Agent Skill ([skills.sh](https://skills.sh))
+
+Install into Claude Code, Codex, Cursor, Antigravity, OpenCode, and other skill-compatible agents:
+
+```bash
+npx skills add 1solomonwakhungu/handoff-verify
+```
+
 ### As a Claude Code plugin (bundled hooks + skill)
 
 ```bash
@@ -33,7 +49,7 @@ claude --plugin-dir /path/to/handoff-verify
 
 The plugin bundles `Stop` and `SubagentStop` hooks (`hooks/hooks.json`), a standalone `bin/handoff-verify` launcher (uses system Python 3.11+ or `uv`-managed Python against the bundled `src/`), and `skills/handoff-verify/SKILL.md`.
 
-### From source (works today)
+### From source
 
 ```bash
 git clone https://github.com/1solomonwakhungu/handoff-verify.git
@@ -41,18 +57,6 @@ cd handoff-verify
 uv tool install .            # puts `handoff-verify` on your PATH
 handoff-verify --version
 handoff-verify doctor        # verify PATH, Python >= 3.11, and Claude hook config
-```
-
-To try it without installing, run `uvx --from . handoff-verify --version` inside the clone.
-
-### From PyPI (after the first release)
-
-`handoff-verify` is not on PyPI yet, so these fail until it is published:
-
-```bash
-uvx handoff-verify --version
-uv tool install handoff-verify
-pip install handoff-verify
 ```
 
 ---
@@ -101,7 +105,7 @@ handoff-verify check session.jsonl --format markdown
 handoff-verify check session.jsonl --json          # same as --format json
 ```
 
-Every subcommand's `--help` ends with examples and the exit codes.
+Run `handoff-verify <subcommand> --help` for flags, examples, and exit codes.
 
 Run the bundled 32-case evaluation suite (24 seeded cases + 8 realistic messy-session cases, shipped in both source checkouts and built wheels; pass `--cases-dir <path>` to run a custom local suite):
 
@@ -183,7 +187,7 @@ Generated configuration (`handoff-verify init`):
 - **`SubagentStop` vs `Stop` isolation:** On `SubagentStop`, `handoff-verify` strictly reads `agent_transcript_path` (never falling back to the parent session's `transcript_path`). On `Stop`, it reads `transcript_path`.
 - **Verifies the message Claude Code is about to hand back:** Claude Code can fire `Stop` / `SubagentStop` before the final assistant message is written to the transcript file. The hook compares the transcript with the payload's `last_assistant_message`, waits up to one second for the file to catch up, and otherwise verifies the payload text against the tool evidence already on disk.
 - **Quiet when clean and on warning-only reports:** When verification passes with zero findings — or with warning-only findings (unless `--include-warnings` or `--strict` is passed) — the hook exits `0` with empty stdout and stderr.
-- **`--mode advise` (default):** On error-level findings (or warnings with `--strict`), exits `0` and emits structured Claude Code JSON (`systemMessage` + `hookSpecificOutput.additionalContext`) with concise, bounded Markdown feedback.
+- **`--mode advise` (default):** On error-level findings (or warnings with `--strict`), exits `0` and emits structured Claude Code JSON (`systemMessage` + `hookSpecificOutput.additionalContext`, requires a Claude Code version supporting `additionalContext` on `Stop`) with concise, bounded Markdown feedback. When `--repo` is omitted, the hook defaults `--repo` to the payload `cwd`.
 - **`--mode block`:** On failing claims, writes the concise actionable receipt to stderr and exits `2` so the agent fixes the ungrounded claim before stopping.
 - **Infinite-loop guard (`stop_hook_active`):** When Claude Code sets `stop_hook_active: true`, the hook **never** exits `2` and **never** emits `hookSpecificOutput.additionalContext` — it emits `systemMessage` only and exits `0`, guaranteeing the agent can always stop after at most one verification retry.
 - **Fail-open with visible diagnostics by default:** Parse, I/O, missing-file, usage, or internal errors log a single diagnostic line to stderr and exit `1` (non-blocking in Claude Code while surfacing stderr, instead of silently hiding errors behind exit `0`). Pass `--fail-closed` to exit `2` (blocking) on errors instead.
@@ -200,15 +204,13 @@ Copy the folder into `.claude/skills/` (project) or `~/.claude/skills/` (every p
 mkdir -p .claude/skills && cp -R skills/handoff-verify .claude/skills/
 ```
 
-An agent that only has a shell can self-check before reporting back:
+An agent can audit a finished subagent transcript (or a past session) from the shell:
 
 ```bash
-handoff-verify check --latest --json --quiet-on-pass
+handoff-verify check <subagent-transcript.jsonl> --repo . --format markdown --quiet-on-pass
 ```
 
-Exit `0` with no output means every pointer, quote and absence claim was backed by a tool
-call. On exit `1`, each entry in `findings` has a `code`, the `claim` text, and a `suggestion`
-naming the read or search that would ground it.
+Exit `0` means no error-level findings (warnings may still print unless `--strict` is passed; `--quiet-on-pass` prints nothing only at 0 findings). On exit `1`, each finding includes its `severity`, `code`, `claim`, and a `suggestion` naming the read or search that would ground it. Because `check` reads the last assistant text already flushed to the JSONL file, use the `Stop` hook (not `check --latest`) to verify an agent's own unsent final turn.
 
 ---
 
