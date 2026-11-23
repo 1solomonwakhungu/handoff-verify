@@ -1,0 +1,115 @@
+"""Verification pipeline entry point and scope receipt builder."""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+from handoff_verify.models import (
+    Claim,
+    Finding,
+    ParsedTranscript,
+    ScopeReceipt,
+    VerificationReport,
+)
+
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        if item and item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def build_scope_receipt(transcript: ParsedTranscript) -> ScopeReceipt:
+    """Build a factual summary of searched roots, exclusions, truncations, and unread cursors."""
+    searched_roots: list[str] = []
+    excluded_dirs: list[str] = []
+    for search in transcript.searches:
+        searched_roots.append(search.search_path if search.search_path else ".")
+        excluded_dirs.extend(search.excluded_dirs)
+
+    truncated_outputs: list[dict[str, object]] = []
+    seen_trunc_indices: set[int] = set()
+    for ev in (
+        list(transcript.events)
+        + list(transcript.searches)
+        + list(transcript.file_reads)
+        + list(transcript.commands)
+    ):
+        if ev.truncated and ev.event_index not in seen_trunc_indices:
+            seen_trunc_indices.add(ev.event_index)
+            truncated_outputs.append(
+                {
+                    "event_index": ev.event_index,
+                    "tool_name": ev.tool_name,
+                    "reason": ev.truncation_reason or "truncated",
+                }
+            )
+    truncated_outputs.sort(key=lambda item: int(item["event_index"]))  # type: ignore[arg-type]
+
+    unread_cursors: list[dict[str, object]] = []
+    for pag in transcript.paginations:
+        if (pag.has_more or pag.next_cursor) and not pag.cursor_followed:
+            unread_cursors.append(
+                {
+                    "event_index": pag.event_index,
+                    "tool_name": pag.tool_name,
+                    "resource": pag.resource,
+                    "next_cursor": pag.next_cursor,
+                    "page": pag.page,
+                    "total_pages": pag.total_pages,
+                }
+            )
+
+    files_read = _dedupe_preserve_order([r.file_path for r in transcript.file_reads if r.file_path])
+    files_edited = _dedupe_preserve_order(
+        [e.file_path for e in transcript.file_edits if e.file_path]
+    )
+
+    return ScopeReceipt(
+        searched_roots=_dedupe_preserve_order(searched_roots),
+        excluded_dirs=_dedupe_preserve_order(excluded_dirs),
+        truncated_outputs=truncated_outputs,
+        unread_cursors=unread_cursors,
+        files_read=files_read,
+        files_edited=files_edited,
+    )
+
+
+def verify_transcript(
+    transcript: ParsedTranscript,
+    *,
+    repo_root: Path | None = None,
+    strict: bool = False,
+) -> VerificationReport:
+    """Verify claims in a parsed transcript against observed tool-call evidence.
+
+    In PR 1 (Foundation), this builds the factual ScopeReceipt and returns a clean
+    VerificationReport. Deterministic claim extractors and verifiers plug in here in PR 2.
+    """
+    _ = repo_root  # Reserved for live-repo verification in PR 2
+    t0 = time.perf_counter()
+
+    scope_receipt = build_scope_receipt(transcript)
+    claims: list[Claim] = []
+    findings: list[Finding] = []
+
+    passed = not any(
+        f.severity == "error" or (strict and f.severity == "warning") for f in findings
+    )
+    duration_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+
+    return VerificationReport(
+        schema_version="1.0",
+        transcript_path=transcript.transcript_path,
+        source_format=transcript.source_format,
+        claims=claims,
+        findings=findings,
+        scope_receipt=scope_receipt,
+        passed=passed,
+        duration_ms=duration_ms,
+    )
