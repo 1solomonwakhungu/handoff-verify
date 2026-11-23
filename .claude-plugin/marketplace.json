@@ -1,0 +1,14 @@
+{
+  "name": "handoff-verify",
+  "description": "handoff-verify: deterministic claim and scope verification for Claude Code agents and subagents.",
+  "owner": {
+    "name": "Solomon Wakhungu"
+  },
+  "plugins": [
+    {
+      "name": "handoff-verify",
+      "source": "./",
+      "description": "Deterministic, zero-LLM verification of agent file pointers, verbatim code quotes, and search/pagination scope receipts."
+    }
+  ]
+}

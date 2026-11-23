@@ -225,10 +225,10 @@ def _build_hook_json(
 
 
 def _fail_result(message: str, *, fail_closed: bool) -> HookResult:
-    """Return a fail-open (exit 0) or fail-closed (exit 2) diagnostic result."""
+    """Return a fail-open (exit 1, non-blocking) or fail-closed (exit 2, blocking) diagnostic."""
     clean_msg = " ".join(message.split())
     return HookResult(
-        exit_code=2 if fail_closed else 0,
+        exit_code=2 if fail_closed else 1,
         stdout="",
         stderr=f"handoff-verify hook: {clean_msg}",
         blocked=False,
@@ -241,6 +241,7 @@ def run_claude_code_hook(
     *,
     mode: HookMode = "advise",
     strict: bool = False,
+    include_warnings: bool = False,
     repo_root: Path | None = None,
     fail_closed: bool = False,
     transcript_wait_seconds: float = DEFAULT_TRANSCRIPT_WAIT_SECONDS,
@@ -252,6 +253,10 @@ def run_claude_code_hook(
       If the transcript file has not caught up with it yet, the hook waits up to
       ``transcript_wait_seconds`` and then verifies the payload text directly.
     - Clean verification (``report.passed`` with zero findings): exits ``0`` silently.
+    - Warning-only reports (``report.passed=True`` with non-error findings): exits ``0``
+      silently by default so warnings do not spam stops; pass ``include_warnings=True``
+      to emit ``{"systemMessage": ...}`` (without turn continuation), or ``strict=True``
+      to treat warnings as verification failures.
     - Loop guard (``stop_hook_active=True``): NEVER exits ``2`` and NEVER emits
       ``hookSpecificOutput.additionalContext`` (which continues the turn in Claude
       Code). Emits ``{"systemMessage": ...}`` only and exits ``0`` in BOTH
@@ -260,18 +265,14 @@ def run_claude_code_hook(
       - On verification failure (``not report.passed``): exits ``0`` with
         ``systemMessage`` (and ``hookSpecificOutput.additionalContext`` when
         ``hook_event_name`` is known for a single bounded soft continuation).
-      - On non-failing warnings/notes (``report.passed=True`` with findings):
-        exits ``0`` with ``systemMessage`` only (no turn continuation).
     - ``mode="block"`` (``stop_hook_active=False``):
       - On verification failure (``not report.passed``): writes concise actionable
         receipt to stderr and exits ``2`` to block stopping (max 1 block via
         ``stop_hook_active``).
-      - On non-failing warnings/notes (``report.passed=True`` with findings):
-        exits ``0`` with ``systemMessage`` only.
     - Fail-open default (``fail_closed=False``): any parse, I/O, missing file,
       unrecognized transcript, or internal error emits a single concise
-      diagnostic line to stderr and exits ``0``. With ``fail_closed=True``,
-      errors exit ``2``.
+      diagnostic line to stderr and exits ``1`` (non-blocking in Claude Code while
+      surfacing stderr). With ``fail_closed=True``, errors exit ``2`` (blocking).
     """
     try:
         if mode not in ("advise", "block"):
@@ -331,8 +332,8 @@ def run_claude_code_hook(
             strict=strict,
         )
 
-        # Clean pass: stay completely quiet.
-        if report.passed and not report.findings:
+        # Clean pass or warning-only pass (silent by default unless --include-warnings):
+        if report.passed and (not report.findings or not include_warnings):
             return HookResult(exit_code=0, stdout="", stderr="", blocked=False, report=report)
 
         feedback = format_hook_feedback(report)

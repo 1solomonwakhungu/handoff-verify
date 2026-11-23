@@ -182,17 +182,24 @@ def is_suffix_path_match(claimed: str, observed: str, *, base_dirs: Sequence[str
     return norm_o.endswith("/" + norm_c) or norm_c.endswith("/" + norm_o)
 
 
+def is_basename_path_match(claimed: str, observed: str, *, base_dirs: Sequence[str] = ()) -> bool:
+    """Return True if either path is a bare filename matching the other's basename."""
+    norm_c = normalize_path(claimed, base_dirs=base_dirs)
+    norm_o = normalize_path(observed, base_dirs=base_dirs)
+    if not norm_c or not norm_o:
+        return False
+    if "/" not in norm_c and posixpath.basename(norm_o) == norm_c:
+        return True
+    return "/" not in norm_o and posixpath.basename(norm_c) == norm_o
+
+
 def paths_match(claimed: str, observed: str, *, base_dirs: Sequence[str] = ()) -> bool:
     """Return True if a claimed file path refers to the same file as an observed path."""
     if is_exact_path_match(claimed, observed, base_dirs=base_dirs):
         return True
     if is_suffix_path_match(claimed, observed, base_dirs=base_dirs):
         return True
-    norm_c = normalize_path(claimed, base_dirs=base_dirs)
-    norm_o = normalize_path(observed, base_dirs=base_dirs)
-    if not norm_c or not norm_o:
-        return False
-    return "/" not in norm_c and posixpath.basename(norm_o) == norm_c
+    return is_basename_path_match(claimed, observed, base_dirs=base_dirs)
 
 
 def is_repo_root_path(path: str | None, *, base_dirs: Sequence[str] = ()) -> bool:

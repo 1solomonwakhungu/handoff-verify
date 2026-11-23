@@ -25,18 +25,18 @@ from handoff_verify.models import (
 from handoff_verify.pipeline import verify_transcript
 
 
-def test_eval_suite_24_cases_hit_all_targets() -> None:
+def test_eval_suite_32_cases_hit_all_targets() -> None:
     summary = run_eval_suite()
 
-    assert summary.total == 24
-    assert summary.clean_total == 12
-    assert summary.failure_total == 12
+    assert summary.total == 32
+    assert summary.clean_total == 16
+    assert summary.failure_total == 16
 
     # Precision, recall, false positive rate, and latency targets
     assert summary.fp == 0
     assert summary.fn == 0
-    assert summary.tp == 12
-    assert summary.tn == 12
+    assert summary.tp == 16
+    assert summary.tn == 16
     assert summary.precision == 1.0
     assert summary.recall >= 0.90
     assert summary.recall == 1.0
@@ -134,7 +134,7 @@ def test_eval_formatters_text_markdown_json() -> None:
     summary = run_eval_suite()
 
     text_compact = format_eval_summary(summary, "text", verbose=False)
-    assert "EVAL PASS: 24 cases (12 clean, 12 planted failures)" in text_compact
+    assert "EVAL PASS: 32 cases (16 clean, 16 planted failures)" in text_compact
     assert "Precision:" in text_compact
     assert "Recall:" in text_compact
     assert "By category:" in text_compact
@@ -159,12 +159,13 @@ def test_eval_formatters_text_markdown_json() -> None:
     payload = json.loads(json_str)
     assert payload["schema_version"] == "1.0"
     assert payload["passed_targets"] is True
-    assert payload["metrics"]["total"] == 24
+    assert payload["metrics"]["total"] == 32
     assert payload["metrics"]["precision"] == 1.0
     assert payload["metrics"]["recall"] == 1.0
     assert payload["metrics"]["fp"] == 0
-    assert len(payload["results"]) == 24
+    assert len(payload["results"]) == 32
     assert "pointers" in payload["by_category"]
+    assert "real_session" in payload["by_category"]
 
     with pytest.raises(ValueError, match="Unsupported output format"):
         format_eval_summary(summary, "xml")
@@ -197,7 +198,7 @@ def test_eval_auto_discovery_from_unrelated_cwd(
     assert resolve_evals_dir(resolved / "cases") == resolved
 
     summary = run_eval_suite()
-    assert summary.total == 24
+    assert summary.total == 32
     assert summary.passed_targets is True
 
 
