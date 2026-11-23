@@ -168,16 +168,14 @@ def _cmd_check(args: argparse.Namespace) -> int:
     if transcript is None:
         return 2
 
-    # Never report PASS on empty, unreadable, or completely unrecognized input files
-    if (
-        transcript.source_format == "unknown"
-        and not transcript.events
-        and not transcript.assistant_messages
-    ):
+    # Never report PASS when zero events and zero assistant messages were recognized
+    # (catches empty files, READMEs, garbage, summary-only files, and forced --parser flags).
+    if not transcript.events and not transcript.assistant_messages:
         source_label = transcript.transcript_path or args.transcript
         print(
-            f"Error: no recognizable transcript records found in {source_label} "
-            f"(malformed lines: {transcript.malformed_lines})",
+            f"Error: no recognizable transcript events or assistant messages found in "
+            f"{source_label} (format={transcript.source_format}, "
+            f"malformed lines={transcript.malformed_lines})",
             file=sys.stderr,
         )
         return 2

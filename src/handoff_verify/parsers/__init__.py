@@ -52,7 +52,9 @@ def _iter_sample_lines(source: str | Path | Iterable[str], max_valid: int = 200)
     records: list[dict] = []
 
     def _consume(lines: Iterable[str]) -> None:
-        for raw in lines:
+        for idx, raw in enumerate(lines):
+            if idx == 0 and raw.startswith("\ufeff"):
+                raw = raw.lstrip("\ufeff")
             stripped = raw.strip()
             if not stripped:
                 continue
@@ -66,7 +68,7 @@ def _iter_sample_lines(source: str | Path | Iterable[str], max_valid: int = 200)
                     break
 
     if isinstance(source, (str, Path)):
-        with Path(source).open("r", encoding="utf-8", errors="replace") as fh:
+        with Path(source).open("r", encoding="utf-8-sig", errors="replace") as fh:
             _consume(fh)
     else:
         _consume(source)

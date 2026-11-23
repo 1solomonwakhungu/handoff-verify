@@ -31,8 +31,9 @@ from handoff_verify.parsers._common import (
     split_lf_lines,
 )
 
-_EXIT_CODE_RE = re.compile(r"(?:^|\n)Exit code[:\s]+(-?\d+)\b", re.IGNORECASE)
-_LEADING_EXIT_CODE_RE = re.compile(r"^Exit code[:\s]+-?\d+\s*(?:\r?\n)?", re.IGNORECASE)
+_LEADING_EXIT_CODE_RE = re.compile(r"^Exit code[:\s]+(-?\d+)\s*(?:\r?\n)?", re.IGNORECASE)
+_TRAILING_EXIT_CODE_RE = re.compile(r"(?:^|\r?\n)Exit code[:\s]+(-?\d+)\s*$", re.IGNORECASE)
+_PAGINATION_BANNER_RE = re.compile(r"^\[showing\s+results\s+with\s+pagination\b", re.IGNORECASE)
 _NO_MATCH_SENTINELS = frozenset(
     {
         "no files found",
@@ -99,7 +100,7 @@ def _parse_grep_output(
         low = line.lower()
         if low in _NO_MATCH_SENTINELS:
             continue
-        if is_truncation_banner_line(line)[0]:
+        if is_truncation_banner_line(line)[0] or _PAGINATION_BANNER_RE.match(line):
             continue
         if low.startswith(("found ", "showing ")):
             continue
@@ -170,6 +171,7 @@ def parse_claude_code(
     pending_list: list[_PendingToolCall] = []
     pending_by_id: dict[str, _PendingToolCall] = {}
     last_assistant_msg_id: str | None = None
+    seen_text_blocks_by_msg_id: dict[str, set[str]] = {}
 
     for line_no, record in loaded.records:
         if transcript.cwd is None and isinstance(record.get("cwd"), str) and record["cwd"].strip():
@@ -223,27 +225,34 @@ def parse_claude_code(
                         pending_by_id[tool_id] = call
 
             if text_parts:
-                combined_text = "\n".join(text_parts)
                 after_idx = len(pending_list) - 1 if pending_list else None
-                if (
-                    msg_id is not None
-                    and msg_id == last_assistant_msg_id
-                    and transcript.assistant_messages
-                ):
-                    prev = transcript.assistant_messages[-1]
-                    if prev.text != combined_text:
-                        prev.text = f"{prev.text}\n{combined_text}"
-                    prev.after_event_index = after_idx
+                if msg_id is not None:
+                    seen_blocks = seen_text_blocks_by_msg_id.setdefault(msg_id, set())
+                    unique_parts = [p for p in text_parts if p not in seen_blocks]
+                    seen_blocks.update(unique_parts)
                 else:
-                    transcript.assistant_messages.append(
-                        AssistantMessage(
-                            index=len(transcript.assistant_messages),
-                            text=combined_text,
-                            timestamp=timestamp,
-                            after_event_index=after_idx,
+                    unique_parts = text_parts
+
+                if unique_parts:
+                    combined_text = "\n".join(unique_parts)
+                    if (
+                        msg_id is not None
+                        and msg_id == last_assistant_msg_id
+                        and transcript.assistant_messages
+                    ):
+                        prev = transcript.assistant_messages[-1]
+                        prev.text = f"{prev.text}\n{combined_text}"
+                        prev.after_event_index = after_idx
+                    else:
+                        transcript.assistant_messages.append(
+                            AssistantMessage(
+                                index=len(transcript.assistant_messages),
+                                text=combined_text,
+                                timestamp=timestamp,
+                                after_event_index=after_idx,
+                            )
                         )
-                    )
-                    last_assistant_msg_id = msg_id
+                        last_assistant_msg_id = msg_id
 
         elif rec_type == "user" and isinstance(content, list):
             for block in content:
@@ -498,13 +507,17 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
         stderr = tur["stderr"] if isinstance(tur.get("stderr"), str) else ""
         exit_code = safe_int(tur.get("exitCode") or tur.get("exit_code"))
         if exit_code is None:
-            m_exit = _EXIT_CODE_RE.search(raw_out)
-            if m_exit:
-                exit_code = int(m_exit.group(1))
-            elif call.is_error:
-                exit_code = 1
-            else:
+            m_lead = _LEADING_EXIT_CODE_RE.match(raw_out)
+            m_trail = _TRAILING_EXIT_CODE_RE.search(raw_out) if not m_lead else None
+            if m_lead:
+                exit_code = int(m_lead.group(1))
+            elif m_trail:
+                exit_code = int(m_trail.group(1))
+            elif not call.is_error:
                 exit_code = 0
+            # Note: when call.is_error is True without an explicit Exit code header
+            # (e.g. user rejection or timeout), leave exit_code=None rather than
+            # synthesizing exit_code=1 (which grep/rg uses for "no matches").
 
         truncated, trunc_reason = detect_truncation(stdout, tool_name=name)
         if tur.get("truncated") is True and not truncated:

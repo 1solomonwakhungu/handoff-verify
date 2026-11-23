@@ -628,12 +628,12 @@ def test_b7_garbage_and_pathological_json_lines(tmp_path: Path, capsys) -> None:
     empty = tmp_path / "empty.jsonl"
     empty.write_text("", encoding="utf-8")
     assert main(["check", str(empty)]) == 2
-    assert "no recognizable transcript records" in capsys.readouterr().err
+    assert "no recognizable transcript events" in capsys.readouterr().err
 
     readme = tmp_path / "README.md"
     readme.write_text("# Hello\nNot a transcript.\n", encoding="utf-8")
     assert main(["check", str(readme)]) == 2
-    assert "no recognizable transcript records" in capsys.readouterr().err
+    assert "no recognizable transcript events" in capsys.readouterr().err
 
     # 5,000-digit integer + deeply nested JSON + valid record must count 2 malformed lines
     # without raising ValueError or RecursionError
@@ -790,3 +790,431 @@ def test_cli_stdin_dash_support(monkeypatch, capsys) -> None:
     monkeypatch.setattr("sys.stdin", io.StringIO(payload))
     assert main(["check", "-"]) == 0
     assert capsys.readouterr().out.startswith("PASS:")
+
+
+# --- Re-review blocking & non-blocking regression tests ---
+
+
+def test_rereview_1_rejected_or_aborted_search_not_recorded_as_zero_matches() -> None:
+    # Claude Code user-rejected Bash rg (is_error=True, no Exit code header)
+    claude_lines = _jsonl(
+        [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "rej_1",
+                            "name": "Bash",
+                            "input": {"command": "rg -n TODO src/"},
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "rej_1",
+                            "content": "The user doesn't want to proceed with this tool use.",
+                            "is_error": True,
+                        }
+                    ],
+                },
+            },
+        ]
+    )
+    p_claude = parse_claude_code(claude_lines)
+    assert p_claude.commands[0].exit_code is None
+    assert p_claude.searches == []
+    assert build_scope_receipt(p_claude).searched_roots == []
+
+    # Generic errored command with no exit_code
+    p_gen = parse_generic(
+        _jsonl([{"type": "command", "command": "rg TODO src/", "stdout": "", "is_error": True}])
+    )
+    assert p_gen.searches == []
+
+    # Codex plain-text "aborted by user"
+    codex_lines = _jsonl(
+        [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "ab1",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "rg TODO src/"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "ab1",
+                    "output": "aborted by user",
+                },
+            },
+        ]
+    )
+    p_codex = parse_codex(codex_lines)
+    assert p_codex.commands[0].is_error is True
+    assert p_codex.searches == []
+
+
+def test_rereview_2_single_file_grep_and_count_quiet_flags() -> None:
+    lines = _jsonl(
+        [
+            {
+                "type": "command",
+                "command": "grep import src/a.py",
+                "stdout": "import os\nimport sys\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "grep -c TODO src/a.py",
+                "stdout": "5\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "grep -q TODO src/a.py",
+                "stdout": "",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "rg foo src/",
+                "stdout": "rg: src/secret: Permission denied\nsrc/ok.py:1:foo\n",
+                "exit_code": 0,
+            },
+        ]
+    )
+    parsed = parse_generic(lines)
+    assert len(parsed.searches) == 4
+
+    # Single-file grep counts non-colon output lines accurately
+    assert parsed.searches[0].match_count == 2
+    assert parsed.searches[0].matched_files == ["src/a.py"]
+
+    # -c and -q return match_count=None (not 0)
+    assert parsed.searches[1].match_count is None
+    assert parsed.searches[2].match_count is None
+
+    # `rg: ... Permission denied` is NOT counted as a match in file `rg`
+    assert parsed.searches[3].match_count == 1
+    assert parsed.searches[3].matched_files == ["src/ok.py"]
+
+
+def test_rereview_3_mid_output_elision_and_parenthesized_truncation() -> None:
+    # Mid-output Claude Code and Codex elision markers
+    mid_claude = "\n".join(
+        [f"line {i}" for i in range(1, 51)]
+        + ["... [4000 lines truncated] ..."]
+        + [f"line {i}" for i in range(4051, 4101)]
+    )
+    assert detect_truncation(mid_claude)[0] is True
+
+    mid_codex = "\n".join(
+        [f"line {i}" for i in range(1, 51)]
+        + ["[... omitted 4000 of 4400 lines ...]"]
+        + [f"line {i}" for i in range(4051, 4101)]
+    )
+    assert detect_truncation(mid_codex)[0] is True
+
+    # Parenthesized truncation banner
+    assert detect_truncation("foo\n(Results are truncated. Showing partial output.)")[0] is True
+
+    # `cat big.txt` with mid-output elision must NOT claim a contiguous (1, N) window
+    parsed = parse_generic(
+        _jsonl([{"type": "command", "command": "cat big.txt", "stdout": mid_codex, "exit_code": 0}])
+    )
+    assert len(parsed.file_reads) == 1
+    rd = parsed.file_reads[0]
+    assert rd.truncated is True
+    assert rd.start_line is None
+    assert rd.end_line is None
+
+
+def test_rereview_4_forced_parser_and_summary_only_never_pass(tmp_path: Path, capsys) -> None:
+    garbage = tmp_path / "garbage.jsonl"
+    garbage.write_text("not json at all\n", encoding="utf-8")
+    for parser_name in ("claude_code", "codex", "generic"):
+        assert main(["check", str(garbage), "--parser", parser_name]) == 2
+        assert "no recognizable transcript events" in capsys.readouterr().err
+
+    summary_only = tmp_path / "summary_only.jsonl"
+    summary_only.write_text(
+        json.dumps({"type": "summary", "summary": "Title", "leafUuid": "u1"}) + "\n",
+        encoding="utf-8",
+    )
+    assert main(["check", str(summary_only)]) == 2
+    assert "no recognizable transcript events" in capsys.readouterr().err
+
+
+def test_rereview_5_find_and_fd_flag_values_not_roots() -> None:
+    lines = _jsonl(
+        [
+            {
+                "type": "command",
+                "command": "find . -type f -name '*.py'",
+                "stdout": "./a.py\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "find src -maxdepth 2 -type d -not -path '*/node_modules/*'",
+                "stdout": "src/pkg\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "find src -name '*.py' -exec grep foo {} +",
+                "stdout": "src/a.py\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "fd -e py foo src",
+                "stdout": "src/foo.py\n",
+                "exit_code": 0,
+            },
+        ]
+    )
+    parsed = parse_generic(lines)
+    assert parsed.searches[0].search_paths == ["."]
+    assert parsed.searches[0].glob_pattern == "*.py"
+
+    assert parsed.searches[1].search_paths == ["src"]
+    assert parsed.searches[1].excluded_dirs == ["node_modules"]
+
+    assert parsed.searches[2].search_paths == ["src"]
+
+    assert parsed.searches[3].search_paths == ["src"]
+    assert parsed.searches[3].glob_pattern == "foo"
+
+
+def test_rereview_nonblocking_bom_heredoc_cat_nested_gql_cursor_err_and_perf(
+    tmp_path: Path,
+) -> None:
+    # 1. UTF-8 BOM file parses cleanly and passes check
+    bom_file = tmp_path / "bom.jsonl"
+    bom_file.write_bytes(
+        b"\xef\xbb\xbf"
+        + json.dumps({"type": "assistant", "text": "Clean."}).encode("utf-8")
+        + b"\n"
+    )
+    assert detect_format(bom_file) == "generic"
+    assert main(["check", str(bom_file)]) == 0
+
+    # 2. `cat <<EOF ... EOF` must NOT create FileReadEvent("<<EOF"),
+    #    line continuation `rg TODO \\\nsrc tests` has no '\n',
+    #    `cd pkg && apply_patch <<'EOF'` resolves `pkg/a.py`,
+    #    and Codex argv `["apply_patch", "<patch>"]` extracts edit
+    shell_lines = _jsonl(
+        [
+            {
+                "type": "command",
+                "command": "cat <<EOF\nhello\nEOF",
+                "stdout": "hello",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "rg TODO \\\nsrc tests",
+                "stdout": "",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": (
+                    "cd pkg && apply_patch <<'EOF'\n"
+                    "*** Begin Patch\n"
+                    "*** Update File: a.py\n"
+                    "*** End Patch\n"
+                    "EOF"
+                ),
+                "stdout": "Success",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "apply_patch '*** Begin Patch\n*** Add File: b.py\n*** End Patch'",
+                "stdout": "Success",
+                "exit_code": 0,
+            },
+        ]
+    )
+    p_shell = parse_generic(shell_lines)
+    assert p_shell.file_reads == []
+    assert p_shell.searches[0].search_paths == ["src", "tests"]
+    assert [(e.file_path, e.operation) for e in p_shell.file_edits] == [
+        ("pkg/a.py", "edit"),
+        ("b.py", "write"),
+    ]
+
+    # 3. Nested GraphQL data.repository.issues.pageInfo + errored follow-up + different resource
+    gql_lines = _jsonl(
+        [
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "gql1",
+                            "name": "mcp__gh__query",
+                            "input": {"repo": "org/a"},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "gql2_err",
+                            "name": "mcp__gh__query",
+                            "input": {"repo": "org/a", "after": "CUR_1"},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "pg1",
+                            "name": "mcp__gh__list",
+                            "input": {"repo": "org/a", "page": 1},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "pg2_other_repo",
+                            "name": "mcp__gh__list",
+                            "input": {"repo": "org/b", "page": 2},
+                        },
+                    ],
+                },
+            },
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "gql1",
+                            "content": json.dumps(
+                                {
+                                    "data": {
+                                        "repository": {
+                                            "issues": {
+                                                "nodes": [{"id": 1}],
+                                                "pageInfo": {
+                                                    "hasNextPage": True,
+                                                    "endCursor": "CUR_1",
+                                                },
+                                            }
+                                        }
+                                    }
+                                }
+                            ),
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "gql2_err",
+                            "content": "500 Internal Server Error",
+                            "is_error": True,
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "pg1",
+                            "content": json.dumps({"items": [], "page": 1, "total_pages": 3}),
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "pg2_other_repo",
+                            "content": json.dumps({"items": [], "page": 2, "total_pages": 2}),
+                        },
+                    ],
+                },
+            },
+        ]
+    )
+    p_gql = parse_claude_code(gql_lines)
+    by_id = {p.event_id: p for p in p_gql.paginations}
+    assert "gql1" in by_id
+    assert by_id["gql1"].next_cursor == "CUR_1"
+    assert by_id["gql1"].cursor_followed is False  # errored follow-up does NOT count
+    assert by_id["pg1"].cursor_followed is False  # page 2 of org/b does NOT follow org/a
+
+    # 4. Linear shell tokenizer performance on 200KB quoted argument (<100ms)
+    big_cmd = "echo '" + ("a" * 200_000) + "'"
+    t0 = time.perf_counter()
+    parse_generic(_jsonl([{"type": "command", "command": big_cmd, "stdout": "ok", "exit_code": 0}]))
+    assert (time.perf_counter() - t0) * 1000.0 < 200.0
+
+    # 5. Replayed multi-block assistant text with same msg_id does not double,
+    #    Grep `[Showing results with pagination = ...]` not counted as match,
+    #    and `Exit code 3` inside file content is not read as command exit code.
+    claude_misc = _jsonl(
+        [
+            {
+                "type": "assistant",
+                "message": {
+                    "id": "m_rep",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "T1"}, {"type": "text", "text": "T2"}],
+                },
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "id": "m_rep",
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "T1"}, {"type": "text", "text": "T2"}],
+                },
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "gp1",
+                            "name": "Grep",
+                            "input": {"pattern": "foo"},
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "b_ec",
+                            "name": "Bash",
+                            "input": {"command": "cat doc.txt"},
+                        },
+                    ],
+                },
+            },
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "gp1",
+                            "content": "src/a.py\n[Showing results with pagination = 10]",
+                        },
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "b_ec",
+                            "content": "Line 1\nExit code 3 means invalid config\nLine 3",
+                        },
+                    ],
+                },
+            },
+        ]
+    )
+    p_misc = parse_claude_code(claude_misc)
+    assert p_misc.assistant_messages[0].text == "T1\nT2"
+    assert p_misc.searches[0].matched_files == ["src/a.py"]
+    assert p_misc.searches[0].match_count == 1
+    assert p_misc.commands[0].exit_code == 0

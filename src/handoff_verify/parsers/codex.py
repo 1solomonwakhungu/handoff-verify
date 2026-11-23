@@ -120,7 +120,22 @@ def _unwrap_codex_output(raw_output: str) -> tuple[str, int | None, bool]:
     if m_marker:
         clean = raw_output[m_marker.end() :]
 
-    is_err = (exit_code is not None and exit_code != 0) or clean.lstrip().startswith("Error:")
+    clean_stripped = clean.lstrip()
+    clean_lower = clean_stripped.lower()
+    is_err = (
+        (exit_code is not None and exit_code != 0)
+        or clean_stripped.startswith("Error:")
+        or clean_lower.startswith(
+            (
+                "aborted by user",
+                "command timed out",
+                "execution timed out",
+                "rejected by user",
+                "user rejected",
+                "tool execution aborted",
+            )
+        )
+    )
     return clean, exit_code, is_err
 
 
