@@ -5,7 +5,12 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import os
+import re
+import shlex
+import shutil
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -103,27 +108,199 @@ def _format_inspect_text(transcript: ParsedTranscript) -> str:
     return "\n".join(lines)
 
 
+_EXIT_CODES_HELP = """\
+exit codes:
+  0  verification passed (or the command succeeded)
+  1  findings: at least one claim is not backed by the transcript
+  2  usage error, unreadable transcript, or internal error
+"""
+
+_TOP_EPILOG = (
+    """\
+examples:
+  handoff-verify check --latest                 newest Claude Code session for this directory
+  handoff-verify check session.jsonl --json     machine-readable report
+  handoff-verify check - < session.jsonl        read the transcript from stdin
+  handoff-verify inspect session.jsonl          what the agent read, edited and searched
+  handoff-verify init --write                   install Claude Code Stop/SubagentStop hooks
+
+transcripts:
+  Claude Code   ~/.claude/projects/<cwd-with-dashes>/<session-id>.jsonl
+                subagents: .../<session-id>/subagents/agent-<id>.jsonl
+  Codex CLI     ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
+
+"""
+    + _EXIT_CODES_HELP
+)
+
+_CHECK_EPILOG = (
+    """\
+examples:
+  handoff-verify check --latest
+  handoff-verify check session.jsonl --json | jq '.findings[] | {code, message, suggestion}'
+  handoff-verify check session.jsonl --repo . --format markdown
+  cat session.jsonl | handoff-verify check - --quiet-on-pass
+
+Each finding carries a stable `code`, the offending `claim`, the `evidence` checked and a
+`suggestion` naming the read or search that would ground the claim.
+
+"""
+    + _EXIT_CODES_HELP
+)
+
+_HOOK_EPILOG = """\
+Reads the Claude Code hook JSON payload on stdin (hook_event_name, transcript_path,
+agent_transcript_path, last_assistant_message, stop_hook_active, cwd).
+
+  advise  exit 0; on findings prints {"systemMessage", "hookSpecificOutput.additionalContext"}
+          so the model sees the findings once and can correct its report
+  block   exit 2 with the findings on stderr, so the agent must fix them before stopping
+
+Never blocks twice in a row: when stop_hook_active is true it only prints a systemMessage.
+Fails open (exit 0, one line on stderr) on unreadable input unless --fail-closed is given.
+
+example:
+  handoff-verify hook claude-code --mode block < payload.json
+"""
+
+_INIT_EPILOG = """\
+examples:
+  handoff-verify init                          print the hook JSON without changing anything
+  handoff-verify init --write                  merge it into ./.claude/settings.json
+  handoff-verify init --write --mode block     make the agent fix findings before stopping
+  handoff-verify init --write --settings ~/.claude/settings.json      every project
+  handoff-verify init --write --command "uvx handoff-verify"          no global install
+
+The hook command must resolve on the PATH of the non-interactive shell Claude Code uses.
+"""
+
+_FORMAT_ALIASES = {"md": "markdown"}
+
+
+def _format_choice(choices: tuple[str, ...]) -> Callable[[str], str]:
+    """Build an argparse `type` accepting the listed formats plus common aliases."""
+
+    def parse(value: str) -> str:
+        normalized = _FORMAT_ALIASES.get(value.lower(), value.lower())
+        if normalized not in choices:
+            raise argparse.ArgumentTypeError(
+                f"invalid choice: {value!r} (choose from {', '.join(choices)})"
+            )
+        return normalized
+
+    return parse
+
+
+def claude_code_project_dirs(cwd: Path) -> list[Path]:
+    """Return candidate Claude Code transcript directories for a working directory."""
+    roots: list[Path] = []
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if config_dir:
+        roots.append(Path(config_dir).expanduser())
+    roots.append(Path.home() / ".claude")
+
+    spellings = [str(cwd)]
+    with contextlib.suppress(OSError):
+        spellings.append(str(cwd.resolve()))
+
+    candidates: list[Path] = []
+    for root in roots:
+        for spelling in spellings:
+            candidate = root / "projects" / re.sub(r"[^A-Za-z0-9]", "-", spelling)
+            if candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
+def find_latest_claude_code_transcript(cwd: Path) -> tuple[Path | None, list[Path]]:
+    """Return the most recently modified main-session transcript for `cwd`."""
+    searched = claude_code_project_dirs(cwd)
+    newest: Path | None = None
+    newest_mtime = -1.0
+    for directory in searched:
+        if not directory.is_dir():
+            continue
+        for path in directory.glob("*.jsonl"):
+            with contextlib.suppress(OSError):
+                mtime = path.stat().st_mtime
+                if mtime > newest_mtime:
+                    newest, newest_mtime = path, mtime
+    return newest, searched
+
+
+def _resolve_transcript_arg(args: argparse.Namespace) -> str | None:
+    """Return the transcript argument, resolving --latest; print a usage hint on failure."""
+    raw_arg: str | None = args.transcript
+    if getattr(args, "latest", False):
+        if raw_arg is not None:
+            print("Error: pass either a transcript path or --latest, not both.", file=sys.stderr)
+            return None
+        latest, searched = find_latest_claude_code_transcript(Path.cwd())
+        if latest is None:
+            listing = "\n".join(f"  {d}" for d in searched)
+            print(
+                "Error: no Claude Code session transcript found for this directory. Looked in:\n"
+                f"{listing}\n"
+                "Pass a transcript path explicitly, or run from the project directory.",
+                file=sys.stderr,
+            )
+            return None
+        return str(latest)
+    if raw_arg is None:
+        print(
+            "Error: missing transcript. Pass a JSONL transcript path, '-' to read stdin, or "
+            "--latest for the newest Claude Code session in this directory.\n"
+            "  Claude Code: ~/.claude/projects/<cwd-with-dashes>/<session-id>.jsonl\n"
+            "  Codex CLI:   ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl",
+            file=sys.stderr,
+        )
+    return raw_arg
+
+
 def _load_transcript_arg(raw_arg: str, parser_hint: str) -> ParsedTranscript | None:
     if raw_arg == "-":
         return auto_parse(sys.stdin, format_hint=parser_hint, transcript_path="<stdin>")
 
-    transcript_path = Path(raw_arg)
+    transcript_path = Path(raw_arg).expanduser()
+    if transcript_path.is_dir():
+        print(
+            f"Error: {transcript_path} is a directory, expected a JSONL transcript file. "
+            "Use --latest to pick the newest Claude Code session for the current directory.",
+            file=sys.stderr,
+        )
+        return None
     if not transcript_path.is_file():
         print(f"Error: transcript file not found: {transcript_path}", file=sys.stderr)
         return None
     return auto_parse(transcript_path, format_hint=parser_hint)
 
 
+def _warn_if_mostly_not_jsonl(transcript: ParsedTranscript) -> None:
+    """Warn on stderr when most lines failed to parse (a Markdown file, a log, a diff)."""
+    recognized = len(transcript.events) + len(transcript.assistant_messages)
+    if transcript.malformed_lines > max(recognized, 3):
+        print(
+            f"Warning: {transcript.malformed_lines} line(s) were not valid JSON and only "
+            f"{recognized} transcript record(s) were recognized; this may not be an agent "
+            "transcript.",
+            file=sys.stderr,
+        )
+
+
 def _cmd_inspect(args: argparse.Namespace) -> int:
+    raw_arg = _resolve_transcript_arg(args)
+    if raw_arg is None:
+        return 2
     try:
-        transcript = _load_transcript_arg(args.transcript, args.parser)
+        transcript = _load_transcript_arg(raw_arg, args.parser)
     except (OSError, ValueError) as exc:
         print(f"Error: failed to read transcript: {exc}", file=sys.stderr)
         return 2
     if transcript is None:
         return 2
 
-    if args.format == "json":
+    _warn_if_mostly_not_jsonl(transcript)
+    if args.json or args.format == "json":
         print(json.dumps(_build_inspect_payload(transcript), indent=2))
     else:
         print(_format_inspect_text(transcript))
@@ -138,8 +315,11 @@ def _cmd_check(args: argparse.Namespace) -> int:
             print(f"Error: repository directory not found: {repo_root}", file=sys.stderr)
             return 2
 
+    raw_arg = _resolve_transcript_arg(args)
+    if raw_arg is None:
+        return 2
     try:
-        transcript = _load_transcript_arg(args.transcript, args.parser)
+        transcript = _load_transcript_arg(raw_arg, args.parser)
     except (OSError, ValueError) as exc:
         print(f"Error: failed to read transcript: {exc}", file=sys.stderr)
         return 2
@@ -149,18 +329,21 @@ def _cmd_check(args: argparse.Namespace) -> int:
     # Never report PASS when zero events and zero assistant messages were recognized
     # (catches empty files, READMEs, garbage, summary-only files, and forced --parser flags).
     if not transcript.events and not transcript.assistant_messages:
-        source_label = transcript.transcript_path or args.transcript
+        source_label = transcript.transcript_path or raw_arg
         print(
             f"Error: no recognizable transcript events or assistant messages found in "
             f"{source_label} (format={transcript.source_format}, "
-            f"malformed lines={transcript.malformed_lines})",
+            f"malformed lines={transcript.malformed_lines}). Expected a Claude Code, Codex "
+            f"CLI, or generic JSONL transcript; `handoff-verify --help` lists where they live.",
             file=sys.stderr,
         )
         return 2
 
+    _warn_if_mostly_not_jsonl(transcript)
     report = verify_transcript(transcript, repo_root=repo_root, strict=args.strict)
 
-    rendered = format_report(report, args.format, quiet_on_pass=args.quiet_on_pass)
+    output_format = "json" if args.json else args.format
+    rendered = format_report(report, output_format, quiet_on_pass=args.quiet_on_pass)
     if rendered:
         print(rendered)
 
@@ -221,7 +404,24 @@ def _cmd_init(args: argparse.Namespace) -> int:
     print(
         f"{action} Claude Code hooks in {settings_path} (SubagentStop, Stop; command={hook_cmd!r})."
     )
+    executable = _hook_executable(hook_cmd)
+    if executable and shutil.which(executable) is None:
+        print(
+            f"Warning: `{executable}` is not on PATH, so the hook will fail with 'command not "
+            "found' on every stop. Install the CLI (`uv tool install handoff-verify`) or "
+            're-run with --command "<absolute path or launcher>".',
+            file=sys.stderr,
+        )
     return 0
+
+
+def _hook_executable(hook_command: str) -> str | None:
+    """Return the program a hook command line starts with, if it can be tokenized."""
+    try:
+        tokens = shlex.split(hook_command)
+    except ValueError:
+        return None
+    return tokens[0] if tokens else None
 
 
 def _cmd_eval(args: argparse.Namespace) -> int:
@@ -244,6 +444,8 @@ def build_parser() -> argparse.ArgumentParser:
             "Deterministic, zero-LLM verification of AI coding agent handoff claims "
             "against tool-call transcripts."
         ),
+        epilog=_TOP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--version",
@@ -256,16 +458,30 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_parser = subparsers.add_parser(
         "inspect",
         help="Parse and summarize a transcript's format, tool events, and warnings.",
+        description="Show what a transcript's agent actually read, edited, searched and said.",
     )
     inspect_parser.add_argument(
         "transcript",
+        nargs="?",
+        default=None,
         help="Path to the JSONL transcript file (or '-' for stdin).",
     )
     inspect_parser.add_argument(
+        "--latest",
+        action="store_true",
+        help="Use the newest Claude Code session transcript for the current directory.",
+    )
+    inspect_parser.add_argument(
         "--format",
-        choices=("text", "json"),
+        type=_format_choice(("text", "json")),
+        metavar="{text,json}",
         default="text",
         help="Output format (default: text).",
+    )
+    inspect_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Shorthand for --format json.",
     )
     inspect_parser.add_argument(
         "--parser",
@@ -278,10 +494,23 @@ def build_parser() -> argparse.ArgumentParser:
     check_parser = subparsers.add_parser(
         "check",
         help="Verify claims in a transcript against observed tool-call evidence.",
+        description=(
+            "Check every file pointer, verbatim quote and absence/completeness claim in the "
+            "agent's final message against what its tool calls actually observed."
+        ),
+        epilog=_CHECK_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     check_parser.add_argument(
         "transcript",
+        nargs="?",
+        default=None,
         help="Path to the JSONL transcript file (or '-' for stdin).",
+    )
+    check_parser.add_argument(
+        "--latest",
+        action="store_true",
+        help="Use the newest Claude Code session transcript for the current directory.",
     )
     check_parser.add_argument(
         "--repo",
@@ -295,9 +524,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     check_parser.add_argument(
         "--format",
-        choices=("text", "markdown", "json"),
+        type=_format_choice(("text", "markdown", "json")),
+        metavar="{text,markdown,json}",
         default="text",
-        help="Output format (default: text).",
+        help="Output format (default: text). `md` is accepted for markdown.",
+    )
+    check_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Shorthand for --format json.",
     )
     check_parser.add_argument(
         "--quiet-on-pass",
@@ -322,6 +557,8 @@ def build_parser() -> argparse.ArgumentParser:
         "claude-code",
         help="Handle Claude Code Stop / SubagentStop hook JSON payloads on stdin.",
         allow_abbrev=False,
+        epilog=_HOOK_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     claude_hook_parser.add_argument(
         "--mode",
@@ -349,12 +586,13 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser = subparsers.add_parser(
         "init",
         help="Print or install harness hook configuration (e.g., Claude Code settings.json).",
+        epilog=_INIT_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     init_parser.add_argument(
         "--claude-code",
         action="store_true",
-        required=True,
-        help="Generate or install Claude Code Stop / SubagentStop hooks.",
+        help="Target Claude Code Stop / SubagentStop hooks (the default and only harness).",
     )
     init_parser.add_argument(
         "--write",
@@ -399,7 +637,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     eval_parser.add_argument(
         "--format",
-        choices=("text", "markdown", "json"),
+        type=_format_choice(("text", "markdown", "json")),
+        metavar="{text,markdown,json}",
         default="text",
         help="Output format (default: text).",
     )
