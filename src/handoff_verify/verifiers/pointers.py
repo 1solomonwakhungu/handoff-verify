@@ -38,6 +38,8 @@ _BARE_LINENUM_LINE_RE = re.compile(r"^(\d+)[:-]")
 _SIMPLE_COLON_LINE_END_RE = re.compile(r":(\d{1,6})$")
 _PY_TRACEBACK_FILE_RE = re.compile(r'File\s+"([^"]+)",\s+line\s+(\d+)')
 _EDIT_SNIPPET_LINE_RE = re.compile(r"^\s*(\d+)[→\t]")
+_DIFF_NEW_FILE_RE = re.compile(r"^\+\+\+ (?:b/)?([^\t\n]+)")
+_DIFF_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 _EDIT_SUMMARY_VERB_RE = re.compile(
     r"\b(?:updated?|edited?|modif(?:y|ied)|fixed?|changed?|patched?|"
     r"added?|removed?|deleted?|refactored?|wrote|written|created?|applied?|replaced?|"
@@ -173,6 +175,24 @@ def _filter_matching_events(
     ]
 
 
+def _is_foreign_shell_edit(
+    edit: FileEditEvent,
+    norm_claimed: str,
+    base_dirs: tuple[str, ...],
+) -> bool:
+    """Return True for a shell-inferred edit of a same-named file outside the session's tree.
+
+    Agents routinely build scratch copies (`git archive HEAD | tar -x -C /tmp/x`, `cp -R`),
+    then `sed -i` / `rm` inside them. Such a path shares a suffix with a repository file but is
+    a different file, so it must not make a citation of the repository file look stale. Edit
+    and Write tool calls are deliberate and stay matched by suffix (worktree sessions).
+    """
+    if edit.operation not in ("bash_modify", "delete") or not base_dirs:
+        return False
+    norm_edit = normalize_path(edit.file_path, base_dirs=base_dirs)
+    return norm_edit.startswith("/") and norm_edit != norm_claimed
+
+
 # --- B5 + B15: Pre-built O(N) output line index & observed path index ---
 
 
@@ -199,9 +219,41 @@ class _OutputLineIndex:
         base = posixpath.basename(norm_p)
         self._by_basename.setdefault(base, set()).add(norm_p)
 
+    def _scan_diff(self, text: str, event_index: int) -> None:
+        """Credit new-side line numbers shown in unified diff hunks to their `+++` file.
+
+        Reviewers read `git diff` / `git show` far more often than whole files, and a hunk
+        header pins every context and added line to an exact line number in the new file.
+        """
+        if "@@ -" not in text or "+++ " not in text:
+            return
+        diff_path: str | None = None
+        new_line = 0
+        remaining = 0
+        for line in split_lf_lines(text):
+            m_file = _DIFF_NEW_FILE_RE.match(line)
+            if m_file and remaining == 0:
+                target = m_file.group(1).strip()
+                diff_path = None if target == "/dev/null" else target
+                continue
+            m_hunk = _DIFF_HUNK_RE.match(line)
+            if m_hunk:
+                new_line = int(m_hunk.group(1))
+                remaining = int(m_hunk.group(2)) if m_hunk.group(2) is not None else 1
+                continue
+            if remaining <= 0 or diff_path is None:
+                continue
+            if not line or line[0] in "+ ":
+                self._add(diff_path, new_line, event_index)
+                new_line += 1
+                remaining -= 1
+            elif line[0] not in "-\\":
+                remaining = 0
+
     def _scan_text(self, text: str, event_index: int, *, scan_inline: bool = False) -> None:
         if not text:
             return
+        self._scan_diff(text, event_index)
         for line in split_lf_lines(text):
             m = _GREP_CONTENT_LINE_RE.match(line)
             if m and (not scan_inline or " " not in m.group(1)):
@@ -263,6 +315,12 @@ class _OutputLineIndex:
                 and ev.raw_output
             ):
                 self._scan_text(ev.raw_output, ev.event_index, scan_inline=True)
+
+        # A diff saved to a file and then read (`git diff > /tmp/pr.diff`, then Read) shows the
+        # same hunks; `content` has the Read tool's own line-number gutter already stripped.
+        for read in transcript.file_reads:
+            if read.has_result and not read.is_error and read.content:
+                self._scan_diff(read.content, read.event_index)
 
     def matching_lines(
         self, claimed_path: str, *, after_event_index: int | None = None
@@ -621,7 +679,13 @@ def verify_pointers(
             key=lambda e: e.event_index,
         )
         edits = sorted(
-            _filter_matching_events(valid_edits, lambda e: e.file_path, claimed_path, base_dirs),
+            (
+                e
+                for e in _filter_matching_events(
+                    valid_edits, lambda e: e.file_path, claimed_path, base_dirs
+                )
+                if not _is_foreign_shell_edit(e, norm_path, base_dirs)
+            ),
             key=lambda e: e.event_index,
         )
         output_lines = output_line_index.matching_lines(claimed_path) if c_start else set()
@@ -651,9 +715,10 @@ def verify_pointers(
         # --- 1. Unread file check ---
         if c_start is not None:
             assert c_end is not None
-            output_covers_range = bool(output_lines) and all(
-                ln in output_lines for ln in range(c_start, c_end + 1)
-            )
+            # A range whose first and last lines were both shown (`grep -n` hits at 88 and 95
+            # cited as `:88-95`) is anchored in observed output even if the lines between
+            # were not printed; only a range with an unseen endpoint is an extrapolation.
+            output_covers_range = c_start in output_lines and c_end in output_lines
             if not reads and not write_edits and not output_covers_range:
                 unread_fired = True
                 if in_searches:
@@ -944,9 +1009,11 @@ def verify_pointers(
                         windows.append((ln, ln))
 
                     merged = _merge_windows(windows)
+                    endpoints_in_output = c_start in output_lines and c_end in output_lines
                     if (
                         not unknown_untruncated_read
                         and merged
+                        and not endpoints_in_output
                         and not _window_covers(merged, c_start, c_end)
                     ):
                         line_label = (

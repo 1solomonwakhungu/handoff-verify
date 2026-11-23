@@ -16,38 +16,53 @@ AI coding agents and subagents frequently hand back confident reports containing
 
 ## Installation
 
-Requires Python `>=3.11`.
+Requires Python `>=3.11`. No runtime dependencies.
 
-```bash
-# Run directly from PyPI once published (or via git URL)
-uvx handoff-verify --version
-uvx --from git+https://github.com/1solomonwakhungu/handoff-verify.git handoff-verify --version
-
-# Install globally as a CLI tool with uv
-uv tool install handoff-verify
-
-# Or install with pip
-pip install handoff-verify
-```
-
-### From source
+### From source (works today)
 
 ```bash
 git clone https://github.com/1solomonwakhungu/handoff-verify.git
 cd handoff-verify
-uv sync --dev
-uv run handoff-verify --version
+uv tool install .            # puts `handoff-verify` on your PATH
+handoff-verify --version
+```
+
+To try it without installing, run `uvx --from . handoff-verify --version` inside the clone.
+
+### From PyPI (after the first release)
+
+`handoff-verify` is not on PyPI yet, so these fail until it is published:
+
+```bash
+uvx handoff-verify --version
+uv tool install handoff-verify
+pip install handoff-verify
 ```
 
 ---
 
 ## 60-Second Quickstart
 
+Check the Claude Code session you just ran, from the project directory:
+
+```bash
+handoff-verify check --latest
+```
+
+`--latest` picks the newest transcript for the current directory. To check a specific one,
+pass its path. Transcripts live here:
+
+| Harness | Transcript location |
+| --- | --- |
+| Claude Code | `~/.claude/projects/<cwd-with-dashes>/<session-id>.jsonl` |
+| Claude Code subagent | `~/.claude/projects/<cwd-with-dashes>/<session-id>/subagents/agent-<id>.jsonl` |
+| Codex CLI | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` |
+
 Inspect what a transcript actually read, edited, searched, truncated, or left unread:
 
 ```bash
 handoff-verify inspect session.jsonl
-handoff-verify inspect session.jsonl --format json
+handoff-verify inspect session.jsonl --json
 ```
 
 Verify claims in a transcript (pass `-` to read from stdin):
@@ -67,8 +82,10 @@ handoff-verify check session.jsonl --strict
 
 # Render actionable Markdown (great for parent agents / PR comments) or machine-readable JSON
 handoff-verify check session.jsonl --format markdown
-handoff-verify check session.jsonl --format json
+handoff-verify check session.jsonl --json          # same as --format json
 ```
+
+Every subcommand's `--help` ends with examples and the exit codes.
 
 Run the bundled 24-case seeded regression suite (shipped in both source checkouts and built wheels; the bundled suite runs by default, so pass `--cases-dir <path>` when running a custom local suite):
 
@@ -92,17 +109,24 @@ Wire `handoff-verify` into Claude Code's `SubagentStop` and `Stop` lifecycle hoo
 
 ```bash
 # Preview the hook configuration JSON
-handoff-verify init --claude-code
+handoff-verify init
 
 # Safely create or merge into .claude/settings.json (preserves existing hooks and keys)
-handoff-verify init --claude-code --write
+handoff-verify init --write
 
 # Use block mode (exit 2 on findings) or a custom wrapper command (e.g. uvx)
-handoff-verify init --claude-code --write --mode block
-handoff-verify init --claude-code --write --command "uvx handoff-verify"
+handoff-verify init --write --mode block
+handoff-verify init --write --command "uvx handoff-verify"
+
+# Install for every project instead of this one
+handoff-verify init --write --settings ~/.claude/settings.json
 ```
 
-Generated configuration (`handoff-verify init --claude-code`):
+`init --write` warns if the hook command is not on your PATH, because Claude Code would then
+report "command not found" on every stop. Start with the default `advise` mode; see
+[How it behaves on real sessions](#how-it-behaves-on-real-sessions) before choosing `block`.
+
+Generated configuration (`handoff-verify init`):
 
 ```json
 {
@@ -134,11 +158,59 @@ Generated configuration (`handoff-verify init --claude-code`):
 ### Hook modes & safety guarantees
 
 - **`SubagentStop` vs `Stop` isolation:** On `SubagentStop`, `handoff-verify` strictly reads `agent_transcript_path` (never falling back to the parent session's `transcript_path`). On `Stop`, it reads `transcript_path`.
+- **Verifies the message Claude Code is about to hand back:** Claude Code can fire `Stop` / `SubagentStop` before the final assistant message is written to the transcript file. The hook compares the transcript with the payload's `last_assistant_message`, waits up to one second for the file to catch up, and otherwise verifies the payload text against the tool evidence already on disk.
 - **Quiet when clean:** When verification passes with zero findings, the hook exits `0` with empty stdout and stderr.
 - **`--mode advise` (default):** On failing claims, exits `0` and emits structured Claude Code JSON (`systemMessage` + `hookSpecificOutput.additionalContext`) with concise, bounded Markdown feedback.
 - **`--mode block`:** On failing claims, writes the concise actionable receipt to stderr and exits `2` so the agent fixes the ungrounded claim before stopping.
 - **Infinite-loop guard (`stop_hook_active`):** When Claude Code sets `stop_hook_active: true`, the hook **never** exits `2` and **never** emits `hookSpecificOutput.additionalContext` — it emits `systemMessage` only and exits `0`, guaranteeing the agent can always stop after at most one verification retry.
 - **Fail-open by default:** Parse, I/O, missing-file, or internal errors log a single diagnostic line to stderr and exit `0` so a hook failure never bricks a coding session. Pass `--fail-closed` to exit `2` on errors instead.
+
+---
+
+## Using it from an agent
+
+[`skills/handoff-verify/SKILL.md`](skills/handoff-verify/SKILL.md) is a ready-made skill that
+tells an agent when to run the check, how to read a finding, and what to do about each code.
+Copy the folder into `.claude/skills/` (project) or `~/.claude/skills/` (every project):
+
+```bash
+mkdir -p .claude/skills && cp -R skills/handoff-verify .claude/skills/
+```
+
+An agent that only has a shell can self-check before reporting back:
+
+```bash
+handoff-verify check --latest --json --quiet-on-pass
+```
+
+Exit `0` with no output means every pointer, quote and absence claim was backed by a tool
+call. On exit `1`, each entry in `findings` has a `code`, the `claim` text, and a `suggestion`
+naming the read or search that would ground it.
+
+---
+
+## How it behaves on real sessions
+
+The seeded eval suite below is a regression benchmark. As a calibration check, the verifier
+was also run over 1,571 real Claude Code transcripts from one developer's machine (972 main
+sessions, 599 subagents; mostly code-review and implementation work):
+
+| | Transcripts with an error-level finding |
+| --- | ---: |
+| As first tagged `0.1.0` | 512 (32.6%) |
+| With the shell-read and scratch-copy fixes | 343 (21.8%) |
+
+Sampling the remaining findings shows most are not fabrications. They are citations of files
+the agent did look at, through a route the verifier cannot map to line numbers:
+
+- output redirected to a log that is read back later (`sed -n 1,40p a.py > /tmp/x.log`)
+- `grep -n` hits where the cited line sits next to, not on, a printed line
+- a parent agent relaying `path:line` from a subagent report under a slightly different path
+- files produced by a script and then linked in the report
+
+So treat a finding as "the transcript does not show this", not "this is false". `advise`
+mode costs the agent one extra read when it is a false alarm; `block` mode would have
+held up the final stop of roughly one of these sessions in five.
 
 ---
 

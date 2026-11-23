@@ -299,8 +299,12 @@ def test_cli_init_claude_code_refuses_malformed_settings(
     assert bad_settings.read_text(encoding="utf-8") == "{not valid json"
 
 
-def test_cli_init_requires_target_flag() -> None:
-    assert main(["init"]) == 2
+def test_cli_init_defaults_to_claude_code(capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["init"]) == 0
+    default_out = capsys.readouterr().out
+    assert main(["init", "--claude-code"]) == 0
+    assert capsys.readouterr().out == default_out
+    assert "SubagentStop" in json.loads(default_out)["hooks"]
 
 
 def test_cli_hook_usage_errors_fail_open_by_default_and_fail_closed_with_flag(
