@@ -308,6 +308,7 @@ def build_parser() -> argparse.ArgumentParser:
     claude_hook_parser = hook_subparsers.add_parser(
         "claude-code",
         help="Handle Claude Code Stop / SubagentStop hook JSON payloads on stdin.",
+        allow_abbrev=False,
     )
     claude_hook_parser.add_argument(
         "--mode",

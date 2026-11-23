@@ -22,7 +22,7 @@ HookMode = Literal["advise", "block"]
 
 CLAUDE_CODE_EVENTS: tuple[str, ...] = ("SubagentStop", "Stop")
 DEFAULT_CLAUDE_SETTINGS_PATH = Path(".claude/settings.json")
-_SHELL_COMPOUND_OPERATORS = frozenset({"&&", "||", ";", "|", "&", "\n"})
+_SHELL_COMPOUND_OPERATORS = frozenset({"&&", "||", ";", "|", "|&", "&", "\n"})
 
 
 class SettingsError(ValueError):
@@ -348,13 +348,15 @@ def _tokenize_command(command: str) -> list[str]:
 
 
 def _is_compound_shell_command(command: str) -> bool:
-    """Return True if a command contains unquoted shell control operators (&&, ||, ;, |, &)."""
+    """Return True if a command contains newlines or unquoted shell control operators."""
+    if "\n" in command or "\r" in command:
+        return True
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
         lexer.whitespace_split = True
         tokens = list(lexer)
     except ValueError:
-        return any(op in command for op in ("&&", "||", ";", "|", "\n"))
+        return any(op in command for op in ("&&", "||", "|&", ";", "|"))
     return any(tok in _SHELL_COMPOUND_OPERATORS for tok in tokens)
 
 
@@ -402,9 +404,9 @@ def _matches_managed_hook(existing_command: str, target_command: str) -> bool:
 
 
 def _is_global_matcher_group(entry: dict[str, Any]) -> bool:
-    """Return True if a hook matcher group has no scoped matcher (global / catch-all)."""
+    """Return True if a hook matcher group is global / match-all (omitted, empty, or '*')."""
     matcher = entry.get("matcher")
-    return matcher is None or (isinstance(matcher, str) and not matcher.strip())
+    return matcher is None or (isinstance(matcher, str) and matcher.strip() in ("", "*"))
 
 
 def build_claude_code_settings_snippet(

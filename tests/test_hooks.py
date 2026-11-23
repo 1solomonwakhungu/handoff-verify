@@ -631,6 +631,47 @@ def test_merge_preserves_matcher_scoped_groups_and_compound_commands() -> None:
     # Second run is strictly idempotent.
     assert merge_claude_code_settings(merged, mode="advise") == merged
 
+    # Multi-line commands and |& pipelines are preserved; matcher="*" is treated as global.
+    special = {
+        "hooks": {
+            "SubagentStop": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "handoff-verify hook claude-code --mode advise",
+                        }
+                    ],
+                }
+            ],
+            "Stop": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "export FOO=1\nhandoff-verify hook claude-code --mode block",
+                        },
+                        {
+                            "type": "command",
+                            "command": "handoff-verify hook claude-code --mode block |& tee /tmp/x",
+                        },
+                    ]
+                }
+            ],
+        }
+    }
+    merged_special = merge_claude_code_settings(special, mode="block")
+    # matcher="*" was updated in place (no duplicate global SubagentStop entry).
+    assert len(merged_special["hooks"]["SubagentStop"]) == 1
+    assert (
+        merged_special["hooks"]["SubagentStop"][0]["hooks"][0]["command"]
+        == "handoff-verify hook claude-code --mode block"
+    )
+    # Both multi-line and |& commands in Stop were preserved intact, plus 1 new global entry.
+    assert merged_special["hooks"]["Stop"][0] == special["hooks"]["Stop"][0]
+    assert len(merged_special["hooks"]["Stop"]) == 2
+
 
 def test_merge_deduplicates_preexisting_duplicate_global_entries() -> None:
     duplicated = {
