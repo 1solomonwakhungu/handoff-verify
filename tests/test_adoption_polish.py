@@ -173,6 +173,47 @@ def test_redirected_sed_and_tee_readback_ground_pointers_and_quotes(tmp_path: Pa
     ]
     assert ("error", "UNREAD_FILE") in _codes(tmp_path, overwritten_redir)
 
+    # 7. Shell overwrite (`echo ... > /tmp/slice.log`) invalidates earlier redirect provenance
+    shell_overwrite = [
+        *_bash("b1", "sed -n '10,12p' src/tax.py > /tmp/slice.log", ""),
+        *_bash("b2", "echo unrelated > /tmp/slice.log", ""),
+        *_read("r1", "/tmp/slice.log", "     1→unrelated\n"),
+        _final("`src/tax.py:11` handles errors."),
+    ]
+    assert ("error", "UNREAD_FILE") in _codes(tmp_path, shell_overwrite)
+
+    # 8. Same-command tie (`cmd1 > f; cmd2 > f`): later overwrite wins
+    same_cmd_tie = [
+        *_bash(
+            "b1",
+            "sed -n '10,12p' src/tax.py > /tmp/s.log ; sed -n '1,3p' src/other.py > /tmp/s.log",
+            "",
+        ),
+        *_read("r1", "/tmp/s.log", "     1→o1\n     2→o2\n     3→o3\n"),
+        _final("`src/tax.py:11` handles errors."),
+    ]
+    assert ("error", "UNREAD_FILE") in _codes(tmp_path, same_cmd_tie)
+
+    # 9. Append (`>>`) credits both sources without over-extending single-file line mapping
+    appended = [
+        *_bash(
+            "b1",
+            "sed -n '1,3p' src/a.py > /tmp/both.log ; sed -n '1,3p' src/b.py >> /tmp/both.log",
+            "",
+        ),
+        *_read("r1", "/tmp/both.log", "     1→a1\n     2→b1\n"),
+        _final("Checked `src/a.py:1` and `src/b.py:2`."),
+    ]
+    assert _codes(tmp_path, appended) == []
+
+    # 10. Partial `tail -5` read-back of a large redirected slice MUST NOT credit line 1
+    tail_readback = [
+        *_bash("b1", "sed -n '1,400p' src/big.py > /tmp/big.log", ""),
+        *_bash("b2", "tail -5 /tmp/big.log", "line396\nline397\nline398\nline399\nline400\n"),
+        _final("`src/big.py:10` initializes the cache."),
+    ]
+    assert ("error", "UNREAD_FILE") in _codes(tmp_path, tail_readback)
+
 
 # --- 1B: grep -n / rg -n context & adjacent lines ---
 
@@ -196,6 +237,48 @@ def test_grep_context_flags_and_adjacent_lines(tmp_path: Path) -> None:
     ]
     assert _codes(tmp_path, rg_ctx) == []
 
+    # Context lines themselves must NOT get extra ±2 expansion (24 ± 2 = 22..26, NOT 20)
+    rg_ctx_tight = [
+        *_bash(
+            "b1",
+            "rg -n -C 2 'rate_limit' src/",
+            (
+                "src/api/limiter.py-22-def f():\n"
+                "src/api/limiter.py-23-    x = 1\n"
+                "src/api/limiter.py:24:    if req > rate_limit:\n"
+                "src/api/limiter.py-25-        raise Err()\n"
+                "src/api/limiter.py-26-    return x\n"
+            ),
+        ),
+        _final("`src/api/limiter.py:20` sets defaults."),
+    ]
+    assert ("error", "UNREAD_FILE") in _codes(tmp_path, rg_ctx_tight)
+
+    # Glued `-rnC3`, `--context=3`, hyphen-digit filename `docs/adr-0001-x.md-12-...`, and `| head`
+    hyphen_ctx = [
+        *_bash(
+            "b1",
+            "rg -rnC3 'decision' docs/",
+            (
+                "docs/adr-0001-x.md-11-## Context\n"
+                "docs/adr-0001-x.md:12:The decision uses token_bucket(rate, cap).\n"
+                "docs/adr-0001-x.md-13-Fallback is reject_request(req).\n"
+            ),
+        ),
+        _final("`docs/adr-0001-x.md:11-13` specifies `reject_request(req)`."),
+    ]
+    assert _codes(tmp_path, hyphen_ctx) == []
+
+    trunc_ctx = [
+        *_bash(
+            "b1",
+            "rg -n --context=20 'rate_limit' src/ | head -n 1",
+            "src/api/limiter.py:24:    if req > rate_limit:\n",
+        ),
+        _final("`src/api/limiter.py:40` sets retry delay."),
+    ]
+    assert ("error", "UNREAD_FILE") in _codes(tmp_path, trunc_ctx)
+
     # 2. Adjacent line (±2) next to `grep -n` hit passes, while far line still fails
     grep_adj = [
         *_bash("b1", "grep -rn 'MAX_ITEMS' src/", "src/cfg.py:30:MAX_ITEMS = 100\n"),
@@ -210,11 +293,26 @@ def test_grep_context_flags_and_adjacent_lines(tmp_path: Path) -> None:
     assert ("error", "UNREAD_FILE") in _codes(tmp_path, grep_far)
 
     # 3. Single-file `grep -n` joined with `;` credits bare `42:content` lines
+    #    (while ISO dates from `&& date` do not credit bogus year line numbers)
     compound_grep = [
-        *_bash("b1", "grep -n 'TIMEOUT' src/client.py ; echo ok", "42:TIMEOUT = 15\nok\n"),
+        *_bash(
+            "b1",
+            "grep -n 'TIMEOUT' src/client.py ; echo 2026-11-23-ok",
+            "42:TIMEOUT = 15\n2026-11-23-ok\n",
+        ),
         _final("`src/client.py:42-43` sets the timeout."),
     ]
     assert _codes(tmp_path, compound_grep) == []
+
+    compound_date_leak = [
+        *_bash(
+            "b1",
+            "grep -n 'TIMEOUT' src/client.py ; echo 2026-11-23-ok",
+            "42:TIMEOUT = 15\n2026-11-23-ok\n",
+        ),
+        _final("`src/client.py:2026` is bogus."),
+    ]
+    assert ("error", "UNREAD_FILE") in _codes(tmp_path, compound_date_leak)
 
 
 # --- 1C: Parent relaying subagent citations under different path spellings ---
@@ -242,13 +340,34 @@ def test_parent_relay_subagent_and_unique_basename_matching(tmp_path: Path) -> N
     ]
     assert _codes(tmp_path, records) == []
 
-    # 2. Ambiguous basename across two DIFFERENT read files MUST NOT blindly match out-of-window
-    ambiguous = [
+    # 2. Reading a doc (Read tool, NOT Agent/Task) that mentions `src/x.py:10-200` MUST NOT
+    #    launder `src/x.py:150` as observed!
+    doc_launder = [
+        *_read(
+            "r1",
+            "/repo/README.md",
+            "     1→See `src/x.py:10-200` for details.\n",
+        ),
+        _final("Checked `src/x.py:150` and confirmed it returns 0."),
+    ]
+    assert ("error", "UNREAD_FILE") in _codes(tmp_path, doc_launder)
+
+    # 3. Monorepo ambiguous basename (`src/a/app.py` + `src/b/app.py`) does not false-alarm on
+    #    covered lines, while ambiguous suffix (`pkg/app.py`) never falls through to root `app.py`.
+    monorepo_ok = [
         *_read("r1", "/repo/src/a/app.py", "     1→a1\n     2→a2\n"),
         *_read("r2", "/repo/src/b/app.py", "     1→b1\n     2→b2\n"),
         _final("`app.py:1` initializes the app."),
     ]
-    assert ("error", "UNREAD_FILE") in _codes(tmp_path, ambiguous)
+    assert _codes(tmp_path, monorepo_ok) == []
+
+    suffix_no_wrong_fallback = [
+        *_read("r1", "/repo/a/pkg/app.py", "     1→a1\n"),
+        *_read("r2", "/repo/b/pkg/app.py", "     1→b1\n"),
+        *_read("r3", "/repo/app.py", "     1→root1\n     2→root2\n     3→root3\n"),
+        _final("`pkg/app.py:3` is a different file."),
+    ]
+    assert ("error", "UNREAD_FILE") in _codes(tmp_path, suffix_no_wrong_fallback)
 
 
 # --- 1D: Negated existence mentions ---
@@ -265,12 +384,21 @@ def test_negated_mentions_ignored_while_passive_unread_still_caught(tmp_path: Pa
     ]
     assert _codes(tmp_path, clean_negated) == []
 
-    # Non-existence words in a later clause of a real citation MUST NOT suppress UNREAD_FILE
-    still_caught = [
-        *_read("r1", "/repo/src/app.py", "     1→def main():\n     2→    return 0\n"),
-        _final("In `src/api/handler.py:42`, missing keys return 404 not found."),
-    ]
-    assert ("error", "UNREAD_FILE") in _codes(tmp_path, still_caught)
+    # Code-review findings with "is missing <X>", ": missing <X>", "are missing <X>",
+    # "missing: path:line", "without path:line", or later-clause "not found" MUST STILL FAIL!
+    for fabricated in (
+        "In `src/api/handler.py:42`, missing keys return 404 not found.",
+        "`src/api/handler.py:42` is missing a null check.",
+        "`src/api/handler.py:42`: missing error handling.",
+        "`a.py:10` and `b.py:20` are missing validation.",
+        "The guard was missing: `src/x.py:42`.",
+        "Without `src/config.py:12` the fallback breaks.",
+    ):
+        still_caught = [
+            *_read("r1", "/repo/src/app.py", "     1→def main():\n     2→    return 0\n"),
+            _final(fabricated),
+        ]
+        assert ("error", "UNREAD_FILE") in _codes(tmp_path, still_caught), fabricated
 
 
 # --- 1E: Non-code absence phrases ---
@@ -287,17 +415,32 @@ def test_noncode_absence_phrases_ignored_while_code_usage_caught(tmp_path: Path)
     ]
     assert _codes(tmp_path, clean_prose) == []
 
-    # Genuine code-search absence claims MUST STILL trigger NO_SEARCH_EVIDENCE
+    # Genuine code-search absence claims (including singular usage & listing-framed open PRs)
+    # MUST STILL trigger findings!
     for claim_text in (
         "There is no usage of `legacy_auth` anywhere in the codebase.",
         "There is no other usage of `legacy_auth`.",
         "There are no usages of `legacy_auth`.",
+        "I checked and found no usage.",
+        "There is no usage in `src/cli`.",
     ):
         caught = [
             *_read("r1", "/repo/src/app.py", "     1→def main():\n     2→    return 0\n"),
             _final(claim_text),
         ]
         assert ("error", "NO_SEARCH_EVIDENCE") in _codes(tmp_path, caught), claim_text
+
+    # Listing-framed "`gh pr list` returned no open PRs" with unread pagination cursor -> caught
+    pr_pag_unread = [
+        *_tool(
+            "p1",
+            "mcp__github__list_prs",
+            {"repo": "acme/payments"},
+            json.dumps({"items": [], "has_more": True, "nextCursor": "cur_2"}),
+        ),
+        _final("`gh pr list` returned no open PRs."),
+    ]
+    assert ("error", "UNREAD_PAGINATION_CURSOR") in _codes(tmp_path, pr_pag_unread)
 
 
 # --- 2: Hook UX (warning-only silence + --include-warnings + fail-open exit 1 + hook race) ---
@@ -349,6 +492,20 @@ def test_hook_warning_only_silent_by_default_and_cli_include_warnings(
     data = json.loads(out)
     assert "EXCLUDED_SEARCH_DIRS" in data["systemMessage"]
     assert "hookSpecificOutput" not in data
+
+    # --include-warnings under stop_hook_active=True: still exits 0 without additionalContext
+    payload_active = json.dumps(
+        {
+            "hook_event_name": "Stop",
+            "transcript_path": str(transcript),
+            "stop_hook_active": True,
+        }
+    )
+    res_active = run_claude_code_hook(payload_active, mode="block", include_warnings=True)
+    assert res_active.exit_code == 0
+    data_active = json.loads(res_active.stdout)
+    assert "stop_hook_active" in data_active["systemMessage"]
+    assert "hookSpecificOutput" not in data_active
 
 
 # --- 3: Doctor command ---
@@ -435,6 +592,82 @@ def test_doctor_checks_all_states_and_json_cli(
     assert rep_old_py.has_errors is True
     assert "[ERROR] python_version" in format_doctor_text(rep_old_py)
 
+    # 6. Env-prefixed and compound shell hook commands resolve executable properly (not FOO=1 / cd)
+    settings.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "cd /tmp && FOO=1 handoff-verify hook claude-code",
+                                }
+                            ]
+                        }
+                    ],
+                    "SubagentStop": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "FOO=1 handoff-verify hook claude-code",
+                                }
+                            ]
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc_env_cmd = main(["doctor", "--settings", str(settings)])
+    assert rc_env_cmd == 0
+    assert "READY" in capsys.readouterr().out
+
+    # 7. Partial-event hook config (only Stop, missing SubagentStop) -> WARN
+    settings.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {
+                            "hooks": [
+                                {"type": "command", "command": "handoff-verify hook claude-code"}
+                            ]
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    rc_partial = main(["doctor", "--settings", str(settings)])
+    assert rc_partial == 0
+    out_partial = capsys.readouterr().out
+    assert "missing SubagentStop" in out_partial
+
+    # 8. Plugin detection + duplicate hook warning when both settings.json & plugin are active
+    plugins_dir = fake_home / ".claude" / "plugins"
+    plugins_dir.mkdir(parents=True)
+    (plugins_dir / "installed_plugins.json").write_text(
+        json.dumps({"plugins": {"handoff-verify@handoff-verify": {"enabled": True}}}),
+        encoding="utf-8",
+    )
+    rc_dup = main(["doctor"])
+    assert rc_dup == 0
+    out_dup = capsys.readouterr().out
+    assert "Duplicate hook configuration" in out_dup
+
+    # Plugin alone (no settings.json) -> READY
+    settings.unlink()
+    rc_plugin_only = main(["doctor"])
+    assert rc_plugin_only == 0
+    out_plugin = capsys.readouterr().out
+    assert "READY" in out_plugin
+    assert "Claude Code plugin installed" in out_plugin
+
 
 # --- 4: Claude Code plugin packaging & bin launcher ---
 
@@ -483,3 +716,36 @@ def test_claude_plugin_manifests_and_bin_launcher() -> None:
     )
     assert proc_hook.returncode == 1
     assert "handoff-verify hook:" in proc_hook.stderr
+
+    # Launcher missing-Python fallback: exit 1 for hook, exit 2 for hook --fail-closed, 127 for CLI
+    no_py_env = {"PATH": "/nonexistent-empty-bin", "CLAUDE_PLUGIN_ROOT": str(REPO_ROOT)}
+    assert (
+        subprocess.run(
+            ["/bin/sh", str(launcher), "hook", "claude-code"],
+            capture_output=True,
+            text=True,
+            env=no_py_env,
+            check=False,
+        ).returncode
+        == 1
+    )
+    assert (
+        subprocess.run(
+            ["/bin/sh", str(launcher), "hook", "claude-code", "--fail-closed"],
+            capture_output=True,
+            text=True,
+            env=no_py_env,
+            check=False,
+        ).returncode
+        == 2
+    )
+    assert (
+        subprocess.run(
+            ["/bin/sh", str(launcher), "--version"],
+            capture_output=True,
+            text=True,
+            env=no_py_env,
+            check=False,
+        ).returncode
+        == 127
+    )

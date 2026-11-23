@@ -23,7 +23,7 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _ARROW_PREFIX_RE = re.compile(r"^\s*\d+→")
 _TAB_NUM_PREFIX_RE = re.compile(r"^\s*\d+\t")
 _GREP_PREFIX_RE = re.compile(r"^[^\s:][^:\n]*:\d+[:-]")
-_GREP_CONTEXT_PREFIX_RE = re.compile(r"^([^\s:-][^\s:]*?)-\d+-")
+_DASH_NUM_DASH_RE = re.compile(r"-(\d+)-")
 _GREP_NO_LINENUM_RE = re.compile(r"^([^\s:]+):(.*)$")
 _BARE_LINENUM_PREFIX_RE = re.compile(r"^\d+[:-]")
 _COLON_NUM_PREFIX_RE = re.compile(r"^\s*\d+\s*[:|]\s?")
@@ -44,17 +44,35 @@ _CALL_SHORTHAND_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*)\(([^()]*)\)$")
 _IDENT_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
+def _parse_grep_context_content(
+    line: str, seen_files: set[str] | None = None
+) -> tuple[str, str] | None:
+    """Parse `path/to/file-42-content` into `(path, content)`, handling hyphenated filenames."""
+    if not line or line[0] in ("-", " ", "\t", ":"):
+        return None
+    head = line.split(None, 1)[0]
+    for m in _DASH_NUM_DASH_RE.finditer(head):
+        cand = head[: m.start()]
+        if ":" in cand:
+            continue
+        base = posixpath.basename(cand)
+        _, ext = posixpath.splitext(base)
+        if (
+            (seen_files and cand in seen_files)
+            or base in KNOWN_EXTENSIONLESS_FILES
+            or (ext and len(ext) <= 12 and ext[1:].isalnum())
+        ):
+            return cand, line[m.end() :]
+    return None
+
+
 def _strip_grep_any_prefix(line: str) -> str | None:
     """Strip `file:line:` or `file-line-` prefix from a grep/rg output line if present."""
     if _GREP_PREFIX_RE.match(line):
         return _GREP_PREFIX_RE.sub("", line, count=1)
-    m_ctx = _GREP_CONTEXT_PREFIX_RE.match(line)
-    if m_ctx:
-        cand = m_ctx.group(1)
-        base = posixpath.basename(cand)
-        _, ext = posixpath.splitext(base)
-        if base in KNOWN_EXTENSIONLESS_FILES or (ext and len(ext) <= 12 and ext[1:].isalnum()):
-            return line[m_ctx.end() :]
+    parsed = _parse_grep_context_content(line)
+    if parsed is not None:
+        return parsed[1]
     return None
 
 
@@ -301,19 +319,12 @@ def _append_grep_and_diff_entries(
             content_part = _GREP_PREFIX_RE.sub("", ln, count=1)
             by_file.setdefault(norm_fp, []).append(content_part)
             continue
-        m_ctx = _GREP_CONTEXT_PREFIX_RE.match(ln)
-        if m_ctx:
-            cand = m_ctx.group(1)
-            base = posixpath.basename(cand)
-            _, ext = posixpath.splitext(base)
-            if (
-                cand in seen_files
-                or base in KNOWN_EXTENSIONLESS_FILES
-                or (ext and len(ext) <= 12 and ext[1:].isalnum())
-            ):
-                norm_fp = normalize_path(cand, base_dirs=base_dirs)
-                by_file.setdefault(norm_fp, []).append(ln[m_ctx.end() :])
-                continue
+        parsed_ctx = _parse_grep_context_content(ln, seen_files)
+        if parsed_ctx is not None:
+            cand, content_part = parsed_ctx
+            norm_fp = normalize_path(cand, base_dirs=base_dirs)
+            by_file.setdefault(norm_fp, []).append(content_part)
+            continue
         if single_file_target and _BARE_LINENUM_PREFIX_RE.match(ln):
             content_part = _BARE_LINENUM_PREFIX_RE.sub("", ln, count=1)
             by_file.setdefault(single_file_target, []).append(content_part)
@@ -566,6 +577,7 @@ def _entries_for_file(
         distinct = {e.file_path for e in suffix}
         if len(distinct) == 1:
             return suffix
+        return []
     basename = [
         e
         for e in eligible
@@ -574,6 +586,9 @@ def _entries_for_file(
     if basename:
         distinct_base = {e.file_path for e in basename}
         if len(distinct_base) == 1:
+            return basename
+        norm_c = normalize_path(claimed_path, base_dirs=base_dirs)
+        if "/" not in norm_c:
             return basename
     return []
 

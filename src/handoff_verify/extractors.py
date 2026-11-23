@@ -519,6 +519,12 @@ _UNTOUCHED_SUFFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
+_NEGATION_CLAUSE_END = (
+    r"(?:\s+(?:in\s+(?:this|the)\s+(?:repo|repository|project|codebase|dir|directory|branch)|"
+    r"on\s+disk|anymore|here|yet))?"
+    r"(?:\s*$|\s*[,;.)\]]|\s+(?:and|or|but|so|because)\b)"
+)
+
 _NONEXISTENT_SUBJECT_SUFFIX_RE = re.compile(
     r"^(?:"
     r"\s*(?:\([^)\n]{1,40}\)\s*)?(?:still\s+|actually\s+)?"
@@ -530,23 +536,34 @@ _NONEXISTENT_SUBJECT_SUFFIX_RE = re.compile(
     r"not\s+found|is\s+missing|was\s+missing|are\s+missing|were\s+missing|"
     r"is\s+non-?existent|was\s+never\s+created|"
     r"cannot\s+be\s+found|could\s+not\s+be\s+found|couldn't\s+be\s+found|"
-    r"is\s+not\s+present|isn't\s+present)\b|"
-    r"\s*(?:—|–|-|:)\s*(?:not\s+found|does\s+not\s+exist|doesn't\s+exist|missing|non-?existent)\b|"
+    r"is\s+not\s+present|isn't\s+present)" + _NEGATION_CLAUSE_END + r"|"
+    r"\s*(?:—|–|-|:)\s*(?:not\s+found|does\s+not\s+exist|doesn't\s+exist|missing|non-?existent)"
+    + _NEGATION_CLAUSE_END
+    + r"|"
     r"\s+and\s+\S+(?:\s+\S+){0,2}\s+"
-    r"(?:do\s+not\s+exist|don't\s+exist|were\s+not\s+found|weren't\s+found|are\s+missing)\b"
-    r")",
+    r"(?:do\s+not\s+exist|don't\s+exist|were\s+not\s+found|weren't\s+found|are\s+missing)"
+    + _NEGATION_CLAUSE_END
+    + r")",
     re.IGNORECASE,
 )
 
-_NONEXISTENT_PREFIX_RE = re.compile(
+# Line-numbered pointers require explicit existence-negation prefixes so code-review
+# phrasings like "The guard was missing: `src/x.py:42`" or "without `src/config.py:12`"
+# are still verified.
+_NONEXISTENT_LINE_PREFIX_RE = re.compile(
     r"\b(?:"
     r"there\s+(?:is|was|are|were)\s+no(?:\s+(?:such\s+)?(?:file|line|entry|path))?(?:\s+at)?|"
     r"there\s+(?:isn't|wasn't)\s+(?:a|any)(?:\s+(?:file|line|entry|path))?(?:\s+at)?|"
     r"no\s+such(?:\s+file(?:\s+or\s+directory)?)?|"
     r"non-?existent(?:\s+file)?|"
-    r"missing(?:\s+file)?|"
-    r"cannot\s+find|could\s+not\s+find|couldn't\s+find|"
-    r"no|without"
+    r"cannot\s+find|could\s+not\s+find|couldn't\s+find"
+    r")\s*[:—–-]?\s*$",
+    re.IGNORECASE,
+)
+
+_NONEXISTENT_BARE_PREFIX_RE = re.compile(
+    r"\b(?:"
+    r"missing(?:\s+file)?|no|without"
     r")\s*[:—–-]?\s*$",
     re.IGNORECASE,
 )
@@ -608,12 +625,14 @@ def _is_hypothetical_pointer(
         if idx != -1:
             raw_suffix = raw_suffix[:idx]
     near_prefix = prefix[-50:]
-    if _NONEXISTENT_SUBJECT_SUFFIX_RE.match(raw_suffix) or _NONEXISTENT_PREFIX_RE.search(
+    if _NONEXISTENT_SUBJECT_SUFFIX_RE.match(raw_suffix) or _NONEXISTENT_LINE_PREFIX_RE.search(
         near_prefix
     ):
         return True
 
     if not has_line:
+        if _NONEXISTENT_BARE_PREFIX_RE.search(near_prefix):
+            return True
         # R2-9: coordinated prospective sentences ("... add `a.py` and document it in `b.md`")
         if _PROSPECTIVE_SENTENCE_RE.search(sentence) and not re.search(
             r"\b(?:I|we)\s+(?:checked|read|updated|edited|fixed|verified|modified|created|added)\b",
@@ -1351,8 +1370,12 @@ _ABSENCE_STRONG_PATTERNS: tuple[re.Pattern[str], ...] = (
         re.IGNORECASE,
     ),
     re.compile(
-        r"\bno\s+usage\s+(?:of\b|(?:in|across)\s+(?:the\s+)?(?:codebase|repo|repository|project)\b|"
+        r"\bno\s+usage\s+(?:of\b|found\b|(?:in|under|within|across)\s+|"
         r"anywhere\b|elsewhere\b)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bfound\s+no\s+usage\b",
         re.IGNORECASE,
     ),
     re.compile(
@@ -1434,6 +1457,16 @@ _NON_SEARCH_ABSENCE_AFTER_RE = re.compile(
     r"(?:limits?|quotas?|docs?|documentation|examples?|instructions?|guide|section|"
     r"notes?|text|help|data|stats?|statistics|metrics?|tracking|telemetry|billing|fees?|costs?)"
     r")\b",
+    re.IGNORECASE,
+)
+
+_OPEN_LISTING_ABSENCE_RE = re.compile(
+    r"\bno\s+open\s+(?:issues?|prs?|pull\s+requests?|tickets?)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_LISTING_FRAME_RE = re.compile(
+    r"\b(?:gh\s+issue|gh\s+pr|list(?:ed|ing)?|returned|pages?|cursors?|"
+    r"reviewed\s+all|checked\s+all)\b",
     re.IGNORECASE,
 )
 
@@ -1817,6 +1850,31 @@ def extract_scope_claims(
                             )
                         )
                     break
+                else:
+                    # "no open PRs/issues" only counts as an absence claim when explicitly
+                    # framed by a listing/pagination tool or verb ("`gh pr list` returned
+                    # no open PRs"), never in status prose ("no open issue blocking this PR").
+                    m_open = _OPEN_LISTING_ABSENCE_RE.search(sentence)
+                    if (
+                        m_open
+                        and not _has_hedging(sentence, m_open.start(), m_open.end())
+                        and not _NON_SEARCH_ABSENCE_AFTER_RE.match(
+                            sentence[m_open.end() : m_open.end() + 45]
+                        )
+                        and _EXPLICIT_LISTING_FRAME_RE.search(sentence)
+                    ):
+                        key = ("absence", sentence)
+                        if key not in seen:
+                            seen.add(key)
+                            claims.append(
+                                Claim(
+                                    kind="absence",
+                                    text=m_open.group(0).strip(),
+                                    file_path=primary_scope,
+                                    context=sentence,
+                                    message_index=message_index,
+                                )
+                            )
 
             # Completeness claims
             for pat in _COMPLETENESS_PATTERNS:

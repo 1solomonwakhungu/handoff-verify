@@ -370,9 +370,9 @@ $ handoff-verify check evals/cases/fail_11_claude_subagent_fabricated.jsonl --fo
 
 ---
 
-## 32-Case Eval Results
+## 32-Case Seeded Eval Results
 
-Measured via `uv run handoff-verify eval --format markdown` on the bundled 32-case evaluation suite (`evals/manifest.json` + `evals/cases/`: 16 clean sessions and 16 planted failures across Claude Code, Codex CLI, and Generic JSONL, including 8 realistic messy-session `real_session` cases covering redirected log readbacks, `rg -n -C` / adjacent grep lines, parent/subagent path relays, negated mentions, and non-code absence phrases). Latency numbers vary slightly by machine and scale linearly with transcript size.
+Measured via `uv run handoff-verify eval --format markdown` on the bundled 32-case **seeded evaluation suite** (`evals/manifest.json` + `evals/cases/`: 16 clean sessions and 16 planted failures across Claude Code, Codex CLI, and Generic JSONL, including 8 real-session-shaped `real_session` regression fixtures covering redirected log readbacks, `rg -n -C` / adjacent grep lines, parent/subagent path relays, negated mentions, and non-code absence phrases). Because these cases were authored alongside the verifier as a deterministic regression benchmark rather than a held-out production corpus, treat the table below as baseline regression coverage rather than a guarantee on arbitrary real-world phrasings. Latency numbers vary slightly by machine and scale linearly with transcript size.
 
 | Metric | Measured (macOS / Python 3.13) | Target |
 | --- | ---: | ---: |

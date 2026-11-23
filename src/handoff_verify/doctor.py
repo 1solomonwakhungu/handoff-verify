@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -15,6 +16,9 @@ from handoff_verify import __version__
 from handoff_verify.hooks import CLAUDE_CODE_EVENTS, DEFAULT_CLAUDE_SETTINGS_PATH
 
 CheckStatus = Literal["ok", "warn", "error"]
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+_SHELL_BUILTINS = frozenset({"cd", "export", "env", "exec", "command", "builtin", "set", "unset"})
+_SHELL_OPS = frozenset({"&&", "||", ";", "|", "|&", "&"})
 
 
 @dataclass
@@ -61,11 +65,51 @@ class DoctorReport:
 
 
 def _extract_hook_executable(command: str) -> str | None:
+    """Extract the executable token invoking handoff-verify, skipping env vars and shell ops."""
     try:
-        tokens = shlex.split(command)
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
     except ValueError:
         tokens = command.split()
-    return tokens[0] if tokens else None
+
+    # Split into simple command segments on shell operators and prefer the segment that
+    # mentions handoff-verify (so `cd dir && FOO=1 handoff-verify hook ...` checks `handoff-verify`,
+    # never `cd` or `FOO=1`).
+    segments: list[list[str]] = []
+    cur: list[str] = []
+    for tok in tokens:
+        if tok in _SHELL_OPS:
+            if cur:
+                segments.append(cur)
+                cur = []
+        else:
+            cur.append(tok)
+    if cur:
+        segments.append(cur)
+
+    target_seg: list[str] | None = None
+    for seg in segments:
+        if any("handoff-verify" in t.lower() or "handoff_verify" in t.lower() for t in seg):
+            target_seg = seg
+            break
+    if target_seg is None:
+        target_seg = segments[0] if segments else []
+
+    idx = 0
+    while idx < len(target_seg):
+        tok = target_seg[idx]
+        if _ENV_ASSIGN_RE.match(tok):
+            idx += 1
+            continue
+        if tok in _SHELL_BUILTINS:
+            idx += 1
+            # Skip flags to `env` / `command`
+            while idx < len(target_seg) and target_seg[idx].startswith("-"):
+                idx += 1
+            continue
+        return tok
+    return None
 
 
 def _is_hv_hook_entry(command: str) -> bool:
@@ -128,7 +172,16 @@ def _inspect_settings_file(path: Path) -> dict[str, Any]:
                     exe = _extract_hook_executable(cmd_str)
                     if exe and "${" not in exe and "$" not in exe:
                         exe_path = Path(exe).expanduser()
-                        resolves = exe_path.is_file() or shutil.which(exe) is not None
+                        if exe_path.is_absolute():
+                            resolves = exe_path.is_file()
+                        elif "/" in exe:
+                            # Relative path resolves against project root (parent of .claude) or cwd
+                            project_base = (
+                                path.parent.parent if path.parent.name == ".claude" else path.parent
+                            )
+                            resolves = (project_base / exe_path).is_file() or exe_path.is_file()
+                        else:
+                            resolves = shutil.which(exe) is not None
                         if not resolves and exe not in info["missing_executables"]:
                             info["missing_executables"].append(exe)
         if found_cmds:
@@ -146,15 +199,25 @@ def _detect_claude_plugin(claude_dirs: list[Path]) -> Path | None:
             continue
         try:
             raw = installed.read_text(encoding="utf-8")
-            if "handoff-verify" in raw:
-                data = json.loads(raw)
-                if isinstance(data, dict):
-                    plugins = data.get("plugins", data)
-                    if isinstance(plugins, dict) and any("handoff-verify" in k for k in plugins):
-                        return installed
-                    if isinstance(plugins, list) and any(
-                        isinstance(p, dict) and "handoff-verify" in str(p.get("name", ""))
-                        for p in plugins
+            if "handoff-verify" not in raw:
+                continue
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                continue
+            plugins = data.get("plugins", data)
+            if isinstance(plugins, dict):
+                for key, val in plugins.items():
+                    if "handoff-verify" not in key:
+                        continue
+                    if isinstance(val, dict) and val.get("enabled") is False:
+                        continue
+                    return installed
+            elif isinstance(plugins, list):
+                for item in plugins:
+                    if (
+                        isinstance(item, dict)
+                        and "handoff-verify" in str(item.get("name", ""))
+                        and item.get("enabled") is not False
                     ):
                         return installed
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
@@ -171,6 +234,34 @@ def _claude_config_dirs() -> list[Path]:
     if default_dir not in dirs:
         dirs.append(default_dir)
     return dirs
+
+
+def _find_project_settings_files(effective_cwd: Path) -> list[Path]:
+    """Locate project `.claude/settings.json` and `settings.local.json`, walking up to git root."""
+    candidates: list[Path] = []
+    search_dirs: list[Path] = [effective_cwd]
+    # Walk up to repo root (stopping at first `.git` directory/file)
+    cur = effective_cwd
+    for _ in range(12):
+        if (cur / ".git").exists():
+            break
+        parent = cur.parent
+        if parent == cur:
+            break
+        search_dirs.append(parent)
+        cur = parent
+
+    for directory in search_dirs:
+        for rel in (DEFAULT_CLAUDE_SETTINGS_PATH, Path(".claude/settings.local.json")):
+            cand = directory / rel
+            if cand.is_file() and cand not in candidates:
+                candidates.append(cand)
+        if candidates:
+            break
+
+    if not candidates:
+        candidates.append(effective_cwd / DEFAULT_CLAUDE_SETTINGS_PATH)
+    return candidates
 
 
 def run_doctor(
@@ -241,11 +332,14 @@ def run_doctor(
     if settings_path is not None:
         candidate_settings.append(settings_path.expanduser())
     else:
-        candidate_settings.append(effective_cwd / DEFAULT_CLAUDE_SETTINGS_PATH)
+        candidate_settings.extend(_find_project_settings_files(effective_cwd))
         for cfg_dir in _claude_config_dirs():
-            user_settings = cfg_dir / "settings.json"
-            if user_settings not in candidate_settings:
-                candidate_settings.append(user_settings)
+            for name in ("settings.json", "settings.local.json"):
+                user_settings = cfg_dir / name
+                if (
+                    name == "settings.json" or user_settings.is_file()
+                ) and user_settings not in candidate_settings:
+                    candidate_settings.append(user_settings)
 
     inspected = [_inspect_settings_file(p) for p in candidate_settings]
     plugin_path = _detect_claude_plugin(_claude_config_dirs()) if settings_path is None else None
@@ -267,6 +361,7 @@ def run_doctor(
         "configured_events": sorted(configured_events),
         "plugin_installed": plugin_path is not None,
         "plugin_registry": str(plugin_path) if plugin_path else None,
+        "duplicate_sources": bool(configured_files and plugin_path is not None),
     }
 
     if malformed:
@@ -297,6 +392,23 @@ def run_doctor(
         next_steps.append(
             f"Put `{bad_exe}` on PATH or update {bad_file} with "
             '`handoff-verify init --write --command "<absolute path or launcher>"`.'
+        )
+    elif configured_files and plugin_path is not None:
+        sources = ", ".join(configured_files)
+        checks.append(
+            DoctorCheck(
+                name="claude_hooks",
+                status="warn",
+                summary=(
+                    f"Duplicate hook configuration: both settings ({sources}) and Claude plugin "
+                    f"({plugin_path}) are active"
+                ),
+                details=hook_details,
+            )
+        )
+        next_steps.append(
+            "Remove the manual hook entries from settings.json or uninstall the plugin so hooks "
+            "do not run twice on every Stop."
         )
     elif expected_events.issubset(configured_events):
         sources = ", ".join(configured_files)
