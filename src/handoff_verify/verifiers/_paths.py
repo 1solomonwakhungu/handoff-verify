@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import os
 import posixpath
 from collections.abc import Sequence
 from pathlib import Path
@@ -91,8 +92,14 @@ def build_base_dirs(cwd: str | None, repo_root: Path | None) -> tuple[str, ...]:
 @functools.lru_cache(maxsize=8192)
 def _normalize_path_cached(raw: str, base_dirs: tuple[str, ...]) -> str:
     s = _to_posix(raw)
-    if not s:
+    if not s or "\x00" in s:
         return ""
+
+    # Preserve leading `~/` in normalized form so `~/.claude/settings.json` stays readable
+    # and matches any user's `/Users/<u/>...` or `/home/<u/>...` in `is_exact_path_match`.
+    if s.startswith("~/"):
+        rest = posixpath.normpath(s[2:]).lstrip("/")
+        return "~/" + rest if rest and rest != "." else "~"
 
     is_abs = s.startswith("/")
     norm = posixpath.normpath(s)
@@ -122,14 +129,35 @@ def normalize_path(raw: str, *, base_dirs: Sequence[str] = ()) -> str:
     return _normalize_path_cached(raw, bd)
 
 
+def _strip_home_prefix(path: str) -> str | None:
+    """Strip `/Users/<user>/`, `/home/<user>/`, `os.path.expanduser('~')/`, or `~/`."""
+    if path.startswith("~/"):
+        return path[2:]
+    with contextlib.suppress(OSError, KeyError, RuntimeError):
+        home = os.path.expanduser("~").replace("\\", "/").rstrip("/")
+        if home and home.startswith("/") and path.startswith(home + "/"):
+            return path[len(home) + 1 :]
+    for prefix in ("/Users/", "/home/"):
+        if path.startswith(prefix):
+            rest = path[len(prefix) :]
+            if "/" in rest:
+                return rest.split("/", 1)[1]
+    return None
+
+
 def is_exact_path_match(claimed: str, observed: str, *, base_dirs: Sequence[str] = ()) -> bool:
-    """Return True if claimed and observed match exactly (or abs-vs-rel suffix)."""
+    """Return True if claimed and observed match exactly (or abs-vs-rel / tilde-home match)."""
     norm_c = normalize_path(claimed, base_dirs=base_dirs)
     norm_o = normalize_path(observed, base_dirs=base_dirs)
     if not norm_c or not norm_o:
         return False
     if norm_c == norm_o:
         return True
+    if norm_c.startswith("~/") or norm_o.startswith("~/"):
+        hc = _strip_home_prefix(norm_c)
+        ho = _strip_home_prefix(norm_o)
+        if hc and ho and hc == ho:
+            return True
     c_abs = norm_c.startswith("/")
     o_abs = norm_o.startswith("/")
     if o_abs and not c_abs and norm_o.endswith("/" + norm_c):
@@ -217,14 +245,16 @@ def resolve_in_repo(
     base_dirs: Sequence[str] = (),
     fallback_observed: Sequence[str] = (),
 ) -> Path | None:
-    """Resolve a claimed path inside `repo_root`, returning None if outside `repo_root`."""
+    """Resolve a claimed path inside `repo_root`, returning None if outside or invalid."""
+    if "\x00" in claimed:
+        return None
     norm_c = normalize_path(claimed, base_dirs=base_dirs)
-    if not norm_c:
+    if not norm_c or "\x00" in norm_c:
         return None
 
     try:
         resolved_root = repo_root.resolve()
-    except OSError:
+    except (OSError, ValueError):
         resolved_root = repo_root
 
     def _confined(candidate: Path) -> Path | None:
@@ -232,7 +262,7 @@ def resolve_in_repo(
             res = candidate.resolve()
             if res.is_relative_to(resolved_root):
                 return res
-        except OSError:
+        except (OSError, ValueError):
             return None
         return None
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import posixpath
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -16,19 +17,28 @@ from handoff_verify.verifiers._paths import (
     paths_match,
 )
 
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _ARROW_PREFIX_RE = re.compile(r"^\s*\d+→")
 _TAB_NUM_PREFIX_RE = re.compile(r"^\s*\d+\t")
 _GREP_PREFIX_RE = re.compile(r"^[^\s:][^:\n]*:\d+[:-]")
+_GREP_NO_LINENUM_RE = re.compile(r"^([^\s:]+):(.*)$")
+_BARE_LINENUM_PREFIX_RE = re.compile(r"^\d+[:-]")
 _COLON_NUM_PREFIX_RE = re.compile(r"^\s*\d+\s*[:|]\s?")
 _WS_RUN_RE = re.compile(r"[ \t]+")
 _PUNCT_OPEN_SPACE_RE = re.compile(r"([(\[{])\s+")
 _PUNCT_CLOSE_SPACE_RE = re.compile(r"\s+([)\]},;])")
 _TRAILING_COMMA_RE = re.compile(r",([)\]}])")
 _OP_SPACE_RE = re.compile(r"\s*(==|!=|<=|>=|=>|->|:=|\+=|-=|\*=|/=|=|:|,)\s*")
+# R2-2: recognize before/after edit descriptions (`from \`a\` to \`b\``, `\`a\` -> \`b\``, `is now`)
 _PAST_TENSE_QUOTE_RE = re.compile(
-    r"\b(?:previously|before|used\s+to|formerly|originally|was|had|old|removed|replaced)\b",
+    r"(?:\b(?:previously|before|used\s+to|formerly|originally|was|had|old|removed|replaced|"
+    r"is\s+now)\b|"
+    r"\bfrom\s+`[^`]+`\s+to\s+`|"
+    r"`[^`]+`\s*(?:→|->|=>)\s*`)",
     re.IGNORECASE,
 )
+_CALL_SHORTHAND_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*)\(([^()]*)\)$")
+_IDENT_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
 def _strip_line_prefixes(lines: list[str]) -> list[str]:
@@ -50,8 +60,13 @@ def _strip_line_prefixes(lines: list[str]) -> list[str]:
     return lines
 
 
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", text) if "\x1b" in text else text
+
+
 def _normalize_lines(text: str) -> list[str]:
-    raw_lines = _strip_line_prefixes(split_lf_lines(text))
+    clean_text = _strip_ansi(text)
+    raw_lines = _strip_line_prefixes(split_lf_lines(clean_text))
     norm: list[str] = []
     for ln in raw_lines:
         cleaned = _WS_RUN_RE.sub(" ", ln.strip())
@@ -153,6 +168,39 @@ def _ordered_subsequence_match(
     return True
 
 
+def _matches_call_shorthand(snippet_raw: str, corpus_flat: str) -> bool:
+    """Tolerate typed/abbreviated call shorthands like `load(path, strict)`."""
+    m = _CALL_SHORTHAND_RE.fullmatch(snippet_raw.strip())
+    if not m:
+        return False
+    func_name = m.group(1)
+    args_str = m.group(2).strip()
+    if not args_str:
+        return False
+    # Require the exact function call or definition `func_name(` with identifier boundary
+    call_prefix = func_name + "("
+    start = 0
+    arg_tokens = [
+        tok for tok in _IDENT_TOKEN_RE.findall(args_str) if tok not in ("True", "False", "None")
+    ]
+    if not arg_tokens:
+        return False
+    while True:
+        idx = corpus_flat.find(call_prefix, start)
+        if idx == -1:
+            return False
+        left_ok = idx == 0 or not _is_ident_char(corpus_flat[idx - 1])
+        if left_ok:
+            # Find matching closing paren within 240 chars
+            close_idx = corpus_flat.find(")", idx + len(call_prefix), idx + len(call_prefix) + 240)
+            if close_idx != -1:
+                actual_args = corpus_flat[idx + len(call_prefix) : close_idx]
+                actual_idents = set(_IDENT_TOKEN_RE.findall(actual_args))
+                if all(tok in actual_idents for tok in arg_tokens):
+                    return True
+        start = idx + 1
+
+
 def _matches(
     snippet: _NormalizedText,
     entry: _LazyCorpusEntry,
@@ -162,7 +210,6 @@ def _matches(
     """Return True if snippet matches entry exactly or under whitespace/operator normalization."""
     if not snippet.block:
         return True
-    # Fast raw check before normalizing a huge entry!
     if _bounded_contains(snippet.raw, entry.raw_text):
         return True
     corpus = entry.prepared()
@@ -175,6 +222,8 @@ def _matches(
         and len(snippet.compact) >= 6
         and _bounded_contains(snippet.compact, corpus.compact)
     ):
+        return True
+    if _matches_call_shorthand(snippet.raw, corpus.flat):
         return True
     if allow_subsequence and len(snippet.lines) >= 2:
         return _ordered_subsequence_match(snippet.lines, corpus.lines)
@@ -235,12 +284,37 @@ def _build_lazy_corpus(
         if not s.has_result or s.is_error or not s.output:
             continue
         by_file: dict[str, list[str]] = {}
+        roots = s.search_paths or ([s.search_path] if s.search_path else [])
+        single_file_target: str | None = None
+        if len(roots) == 1:
+            base = posixpath.basename(roots[0].rstrip("/"))
+            if "." in base and not base.startswith("."):
+                single_file_target = normalize_path(roots[0], base_dirs=base_dirs)
+
         for ln in split_lf_lines(s.output):
             if _GREP_PREFIX_RE.match(ln):
                 path_part = ln.split(":", 1)[0].strip()
                 norm_fp = normalize_path(path_part, base_dirs=base_dirs)
                 content_part = _GREP_PREFIX_RE.sub("", ln, count=1)
                 by_file.setdefault(norm_fp, []).append(content_part)
+            elif single_file_target and _BARE_LINENUM_PREFIX_RE.match(ln):
+                # R2-7: single-file `grep -n` / `rg -n` prints `42:content` without filename
+                content_part = _BARE_LINENUM_PREFIX_RE.sub("", ln, count=1)
+                by_file.setdefault(single_file_target, []).append(content_part)
+            else:
+                # R2-7: `grep -r` without `-n` prints `path/file.py:content`
+                m_noln = _GREP_NO_LINENUM_RE.match(ln)
+                if m_noln:
+                    cand_p = m_noln.group(1).strip()
+                    cand_base = posixpath.basename(cand_p)
+                    if (
+                        ("/" in cand_p or "." in cand_base)
+                        and not cand_p.startswith(("http", "https"))
+                        and "." in cand_base
+                        and not cand_base.startswith(".")
+                    ):
+                        norm_fp = normalize_path(cand_p, base_dirs=base_dirs)
+                        by_file.setdefault(norm_fp, []).append(m_noln.group(2))
         for norm_fp, flines in by_file.items():
             entries.append(
                 _LazyCorpusEntry(
@@ -264,6 +338,29 @@ def _build_lazy_corpus(
     for cmd in transcript.commands:
         if not cmd.has_result:
             continue
+        # R2-7: credit unified `git diff` / `git show` hunks to each file `+++ b/<path>`
+        if cmd.stdout and ("+++ b/" in cmd.stdout or "diff --git " in cmd.stdout):
+            diff_by_file: dict[str, list[str]] = {}
+            cur_file: str | None = None
+            for ln in split_lf_lines(cmd.stdout):
+                if ln.startswith("+++ b/"):
+                    cur_file = normalize_path(ln[6:].strip(), base_dirs=base_dirs)
+                    continue
+                if ln.startswith(("diff --git ", "--- ", "@@ ")):
+                    continue
+                if cur_file and ln and ln[0] in ("+", " "):
+                    diff_by_file.setdefault(cur_file, []).append(ln[1:])
+            for norm_fp, dlines in diff_by_file.items():
+                entries.append(
+                    _LazyCorpusEntry(
+                        source_kind="command_diff",
+                        file_path=norm_fp,
+                        event_index=cmd.event_index,
+                        tool_name=cmd.tool_name,
+                        raw_text="\n".join(dlines),
+                    )
+                )
+
         # B7: include executed command string as well as stdout/stderr so command mentions match
         combined = "\n".join(p for p in (cmd.command, cmd.stdout, cmd.stderr) if p)
         if not combined:

@@ -916,3 +916,509 @@ def test_nb9_nonexistence_in_next_clause_does_not_suppress_file_pointer(tmp_path
     codes = {f.code for f in rep.findings}
     assert "UNREAD_FILE" in codes
     assert "FILE_NOT_FOUND" in codes
+
+
+# --- Round 2 Re-Review Regression Tests (R2-1 through R2-10 + NB) ---
+
+
+def test_r2_1_partial_reread_after_edit_keeps_unshifted_lines_valid() -> None:
+    lines = "\n".join(f"line{i} = {i}" for i in range(1, 201))
+    tr = ParsedTranscript(
+        cwd="/repo",
+        file_reads=[
+            FileReadEvent(
+                event_index=0,
+                tool_name="Read",
+                file_path="src/a.py",
+                start_line=1,
+                end_line=200,
+                line_count=200,
+                content=lines,
+            ),
+            FileReadEvent(
+                event_index=2,
+                tool_name="Read",
+                file_path="src/a.py",
+                start_line=140,
+                end_line=160,
+                line_count=21,
+                content="\n".join(f"line{i} = {i}" for i in range(140, 161)),
+            ),
+        ],
+        file_edits=[
+            FileEditEvent(
+                event_index=1,
+                tool_name="Edit",
+                file_path="src/a.py",
+                operation="edit",
+                old_text="line150 = 150",
+                new_text="a = 1\nb = 2\nc = 3\nline150 = 150",
+            )
+        ],
+        assistant_messages=[
+            AssistantMessage(index=0, text="Config is defined at `src/a.py:20`.", is_final=True)
+        ],
+    )
+    assert verify_transcript(tr).findings == []
+
+    # Shifted line BELOW edit (line 180) and NOT in post-edit re-read 140-160 MUST still fail!
+    tr_stale = ParsedTranscript(
+        cwd="/repo",
+        file_reads=tr.file_reads,
+        file_edits=tr.file_edits,
+        assistant_messages=[
+            AssistantMessage(index=0, text="Helper runs at `src/a.py:180`.", is_final=True)
+        ],
+    )
+    rep_stale = verify_transcript(tr_stale)
+    assert rep_stale.passed is False
+    assert any(f.code == "STALE_FILE_READ" for f in rep_stale.findings)
+
+
+def test_r2_2_changed_from_old_to_new_and_arrow_quotes_are_clean() -> None:
+    read = FileReadEvent(
+        event_index=0,
+        tool_name="Read",
+        file_path="src/auth.py",
+        start_line=1,
+        end_line=10,
+        content="timeout = 30\n",
+    )
+    edit = FileEditEvent(
+        event_index=1,
+        tool_name="Edit",
+        file_path="src/auth.py",
+        operation="edit",
+        old_text="timeout = 30",
+        new_text="timeout = 45",
+    )
+    for text in (
+        "Changed `src/auth.py:1` from `timeout = 30` to `timeout = 45`.",
+        "Updated `src/auth.py:1`: `timeout = 30` → `timeout = 45`.",
+        "Updated `src/auth.py:1`: `timeout = 30` -> `timeout = 45`.",
+        "In `src/auth.py:1`, `timeout = 30` is now `timeout = 45`.",
+        "Bumped `src/auth.py:1` from `timeout = 30` to `timeout = 45`.",
+    ):
+        tr = ParsedTranscript(
+            cwd="/repo",
+            file_reads=[read],
+            file_edits=[edit],
+            assistant_messages=[AssistantMessage(index=0, text=text, is_final=True)],
+        )
+        assert verify_transcript(tr).findings == [], f"Failed for: {text}"
+
+
+def test_r2_3_scoped_anywhere_in_dir_or_file_is_clean() -> None:
+    tr_dir = ParsedTranscript(
+        cwd="/repo",
+        searches=[
+            SearchEvent(
+                event_index=0,
+                tool_name="Grep",
+                query="legacy_auth",
+                search_path="src/auth",
+                search_paths=["src/auth"],
+                match_count=0,
+            )
+        ],
+        assistant_messages=[
+            AssistantMessage(
+                index=0,
+                text="There are no other usages of `legacy_auth` anywhere in `src/auth/`.",
+                is_final=True,
+            )
+        ],
+    )
+    assert verify_transcript(tr_dir).findings == []
+
+    tr_file = ParsedTranscript(
+        cwd="/repo",
+        file_reads=[
+            FileReadEvent(
+                event_index=0,
+                tool_name="Read",
+                file_path="src/auth/a.py",
+                start_line=1,
+                end_line=20,
+                line_count=20,
+            )
+        ],
+        assistant_messages=[
+            AssistantMessage(
+                index=0,
+                text="`legacy_auth` isn't used anywhere else in `src/auth/a.py`.",
+                is_final=True,
+            )
+        ],
+    )
+    assert verify_transcript(tr_file).findings == []
+
+
+def test_r2_4_ordinary_closing_prose_produces_zero_findings() -> None:
+    tr = ParsedTranscript(
+        cwd="/repo",
+        file_reads=[
+            FileReadEvent(
+                event_index=0, tool_name="Read", file_path="src/a.py", start_line=1, end_line=10
+            )
+        ],
+        assistant_messages=[
+            AssistantMessage(
+                index=0,
+                text=(
+                    "All tests pass and there are no remaining issues. "
+                    "No further issues found. "
+                    "No remaining TODOs. "
+                    "I read all 3 files you listed and summarized them. "
+                    "The function has no references to global state. "
+                    "There are no instances where this can return None. "
+                    "This endpoint has no consumers yet."
+                ),
+                is_final=True,
+            )
+        ],
+    )
+    assert verify_transcript(tr).findings == []
+
+
+def test_r2_5_signature_and_call_shorthands_are_clean() -> None:
+    tr = ParsedTranscript(
+        cwd="/repo",
+        file_reads=[
+            FileReadEvent(
+                event_index=0,
+                tool_name="Read",
+                file_path="src/auth.py",
+                start_line=1,
+                end_line=10,
+                content=(
+                    "def validate_token(token: str, *, strict: bool = False) -> dict[str, Any]:\n"
+                    "    data = load(path, strict=strict, encoding='utf-8')\n"
+                    "    return check(token, data)\n"
+                ),
+            )
+        ],
+        assistant_messages=[
+            AssistantMessage(
+                index=0,
+                text=(
+                    "`validate_token(token)` in `src/auth.py:1` checks the token and returns "
+                    "`dict[str, Any]`. It calls `load(path, strict)` with `strict=True` and "
+                    "uses `check(token)`."
+                ),
+                is_final=True,
+            )
+        ],
+    )
+    assert verify_transcript(tr).findings == []
+
+
+def test_r2_6_fenced_usage_example_after_file_mention_is_clean() -> None:
+    tr = ParsedTranscript(
+        cwd="/repo",
+        file_reads=[
+            FileReadEvent(
+                event_index=0,
+                tool_name="Read",
+                file_path="src/cli.py",
+                start_line=1,
+                end_line=10,
+                content="def main():\n    pass\n",
+            )
+        ],
+        assistant_messages=[
+            AssistantMessage(
+                index=0,
+                text=(
+                    "`src/cli.py` now supports a `--json` flag:\n"
+                    "```bash\n"
+                    "handoff-verify check session.jsonl --json\n"
+                    "```\n\n"
+                    "`src/cli.py` emits structured output:\n"
+                    "```json\n"
+                    '{"passed": true, "findings": []}\n'
+                    "```\n"
+                ),
+                is_final=True,
+            )
+        ],
+    )
+    assert verify_transcript(tr).findings == []
+
+
+def test_r2_7_single_file_grep_no_linenum_grep_and_git_diff_credited() -> None:
+    tr = ParsedTranscript(
+        cwd="/repo",
+        searches=[
+            SearchEvent(
+                event_index=0,
+                tool_name="Bash:grep",
+                query="verify_token",
+                search_path="src/a.py",
+                search_paths=["src/a.py"],
+                output="42:    return verify_token(user, secret)",
+            ),
+            SearchEvent(
+                event_index=1,
+                tool_name="Bash:grep",
+                query="timeout",
+                search_path=".",
+                output="src/auth.py:    timeout = 30",
+            ),
+        ],
+        commands=[
+            CommandEvent(
+                event_index=2,
+                tool_name="Bash",
+                command="git diff",
+                stdout=(
+                    "diff --git a/src/diffed.py b/src/diffed.py\n"
+                    "--- a/src/diffed.py\n"
+                    "+++ b/src/diffed.py\n"
+                    "@@ -1,2 +1,3 @@\n"
+                    " def run():\n"
+                    "+    return compute_result(1, 2)\n"
+                ),
+                exit_code=0,
+            )
+        ],
+        file_reads=[
+            FileReadEvent(
+                event_index=3,
+                tool_name="Read",
+                file_path="src/auth.py",
+                start_line=1,
+                end_line=5,
+                content="x = 1\n",
+            ),
+            FileReadEvent(
+                event_index=4,
+                tool_name="Read",
+                file_path="src/diffed.py",
+                start_line=1,
+                end_line=5,
+                content="def run():\n    pass\n",
+            ),
+        ],
+        assistant_messages=[
+            AssistantMessage(
+                index=0,
+                text=(
+                    "In `src/a.py:42`, it calls `return verify_token(user, secret)`. "
+                    "In `src/auth.py`, it sets `timeout = 30`. "
+                    "In `src/diffed.py`, it calls `return compute_result(1, 2)`."
+                ),
+                is_final=True,
+            )
+        ],
+    )
+    assert verify_transcript(tr).findings == []
+
+
+def test_r2_8_unrelated_root_grep_and_bash_find_do_not_bypass() -> None:
+    # Unrelated root Grep (`import os`) + "no callers of `legacy_auth`" -> NO_SEARCH_EVIDENCE
+    tr_unrelated = ParsedTranscript(
+        cwd="/repo",
+        searches=[SearchEvent(event_index=0, tool_name="Grep", query="import os", search_path=".")],
+        assistant_messages=[
+            AssistantMessage(
+                index=0,
+                text="There are no callers of `legacy_auth` anywhere in the repo.",
+                is_final=True,
+            )
+        ],
+    )
+    rep_unrel = verify_transcript(tr_unrelated)
+    assert rep_unrel.passed is False
+    assert any(f.code == "NO_SEARCH_EVIDENCE" for f in rep_unrel.findings)
+
+    # Bash:find / Bash:fd listing-only -> NO_SEARCH_EVIDENCE
+    tr_find = ParsedTranscript(
+        cwd="/repo",
+        searches=[
+            SearchEvent(
+                event_index=0,
+                tool_name="Bash:find",
+                query="*.py",
+                search_path=".",
+                raw_input={"command": "find . -name '*.py'"},
+            )
+        ],
+        assistant_messages=[
+            AssistantMessage(
+                index=0,
+                text="There are no callers of `legacy_auth` anywhere in the repo.",
+                is_final=True,
+            )
+        ],
+    )
+    rep_find = verify_transcript(tr_find)
+    assert rep_find.passed is False
+    assert any(f.code == "NO_SEARCH_EVIDENCE" for f in rep_find.findings)
+
+
+def test_r2_9_followup_bullets_coordinated_prospective_and_untouched_are_clean() -> None:
+    tr = ParsedTranscript(
+        cwd="/repo",
+        assistant_messages=[
+            AssistantMessage(
+                index=0,
+                text=(
+                    "I left `src/b.py` untouched.\n"
+                    "Next step: add `tests/test_a.py` and document it in `docs/usage.md`.\n\n"
+                    "Follow-ups:\n"
+                    "- Add coverage in `tests/test_a.py`\n"
+                    "- Wire it into `src/cli.py` later\n"
+                ),
+                is_final=True,
+            )
+        ],
+    )
+    assert verify_transcript(tr).findings == []
+
+
+def test_r2_10_rename_and_move_summaries_clean_with_and_without_repo(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "b.py").write_text("def helper():\n    return 1\n", encoding="utf-8")
+
+    # 1. git mv src/a.py src/b.py -> "Renamed `src/a.py` to `src/b.py`."
+    tr_git_mv = ParsedTranscript(
+        cwd=str(tmp_path),
+        commands=[
+            CommandEvent(
+                event_index=0,
+                tool_name="Bash",
+                command="git mv src/a.py src/b.py",
+                stdout="",
+                exit_code=0,
+            )
+        ],
+        assistant_messages=[
+            AssistantMessage(index=0, text="Renamed `src/a.py` to `src/b.py`.", is_final=True)
+        ],
+    )
+    assert verify_transcript(tr_git_mv, repo_root=tmp_path).findings == []
+
+    # 2. mv + delete edit -> "Moved `src/a.py` to `src/b.py`." & "helpers now live in `src/b.py`."
+    tr_mv = ParsedTranscript(
+        cwd=str(tmp_path),
+        file_reads=[
+            FileReadEvent(
+                event_index=0, tool_name="Read", file_path="src/a.py", start_line=1, end_line=5
+            )
+        ],
+        file_edits=[
+            FileEditEvent(
+                event_index=1, tool_name="Bash", file_path="src/a.py", operation="delete"
+            ),
+            FileEditEvent(
+                event_index=1,
+                tool_name="Bash",
+                file_path="src/b.py",
+                operation="write",
+                content="x=1\n",
+            ),
+        ],
+        assistant_messages=[
+            AssistantMessage(
+                index=0,
+                text=(
+                    "Moved `src/a.py` to `src/b.py`. "
+                    "The helpers from `src/a.py` now live in `src/b.py`."
+                ),
+                is_final=True,
+            )
+        ],
+    )
+    assert verify_transcript(tr_mv, repo_root=tmp_path).findings == []
+
+
+def test_r2_nb_tilde_subagent_lineless_nul_backtrack_ansi_and_linear_line(tmp_path: Path) -> None:
+    # 1. Tilde path matching `/Users/x/.claude/settings.json`
+    tr_tilde = ParsedTranscript(
+        cwd="/repo",
+        file_reads=[
+            FileReadEvent(
+                event_index=0,
+                tool_name="Read",
+                file_path="/Users/x/.claude/settings.json",
+                start_line=1,
+                end_line=5,
+            )
+        ],
+        file_edits=[
+            FileEditEvent(
+                event_index=1,
+                tool_name="Edit",
+                file_path="/Users/x/.claude/settings.json",
+                operation="edit",
+                old_text="a",
+                new_text="b",
+            )
+        ],
+        assistant_messages=[
+            AssistantMessage(index=0, text="Updated `~/.claude/settings.json`.", is_final=True)
+        ],
+    )
+    assert verify_transcript(tr_tilde).findings == []
+
+    # 2. Subagent-relayed line-less path
+    tr_sub = ParsedTranscript(
+        cwd="/repo",
+        events=[
+            ToolEvent(
+                event_index=0,
+                tool_name="Task",
+                raw_output="Checked src/auth/login.py and confirmed.",
+                has_result=True,
+            )
+        ],
+        assistant_messages=[
+            AssistantMessage(index=0, text="Subagent reviewed `src/auth/login.py`.", is_final=True)
+        ],
+    )
+    assert verify_transcript(tr_sub).findings == []
+
+    # 3. Backtracking bug: "`src/a.py`, line 42 of `src/b.py`" must NOT produce src/a.py:4
+    ptrs = extract_pointer_claims("Check `src/a.py`, line 42 of `src/b.py`.")
+    got = {(p.file_path, p.start_line, p.end_line) for p in ptrs}
+    assert ("src/b.py", 42, 42) in got
+    assert ("src/a.py", 4, 4) not in got
+
+    # 4. NUL byte in cited path must not crash resolve_in_repo
+    tr_nul = ParsedTranscript(
+        cwd=str(tmp_path),
+        assistant_messages=[
+            AssistantMessage(index=0, text="See `src/a\x00b.py:1`.", is_final=True)
+        ],
+    )
+    verify_transcript(tr_nul, repo_root=tmp_path)
+
+    # 5. ANSI color codes in command stdout still match clean quotes
+    tr_ansi = ParsedTranscript(
+        cwd="/repo",
+        commands=[
+            CommandEvent(
+                event_index=0,
+                tool_name="Bash",
+                command="pytest",
+                stdout="\x1b[31mAssertionError: expected 200, got 403\x1b[0m\n",
+                exit_code=1,
+                is_error=True,
+            )
+        ],
+        assistant_messages=[
+            AssistantMessage(
+                index=0,
+                text="Test failed with `AssertionError: expected 200, got 403`.",
+                is_final=True,
+            )
+        ],
+    )
+    assert verify_transcript(tr_ansi).findings == []
+
+    # 6. Linear O(n) latency on 40 KB single line of plain words
+    big_line = " ".join(["word"] * 8000)
+    t0 = time.perf_counter()
+    assert extract_pointer_claims(big_line) == []
+    assert (time.perf_counter() - t0) * 1000.0 < 100.0
