@@ -3,10 +3,12 @@
   "version": "0.1.0",
   "description": "Deterministic, zero-LLM claim and scope verification for AI coding agents and subagents. Verifies file pointers, verbatim code quotes, and search/pagination scope receipts on Stop and SubagentStop.",
   "author": {
-    "name": "Solomon Wakhungu"
+    "name": "Solomon Wakhungu",
+    "url": "https://github.com/1solomonwakhungu"
   },
   "homepage": "https://github.com/1solomonwakhungu/handoff-verify",
   "repository": "https://github.com/1solomonwakhungu/handoff-verify",
   "license": "MIT",
-  "keywords": ["verification", "transcripts", "subagents", "hooks", "claims", "hallucination"]
+  "keywords": ["verification", "transcripts", "subagents", "hooks", "claims", "hallucination", "agents", "agent-skills"],
+  "skills": "./skills/"
 }
