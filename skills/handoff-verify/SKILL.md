@@ -34,6 +34,9 @@ handoff-verify check <path-to-transcript.jsonl> --json
 
 # See what a transcript's agent actually read, edited and searched
 handoff-verify inspect <path-to-transcript.jsonl>
+
+# Check PATH, Python version, and Claude Code hook configuration
+handoff-verify doctor
 ```
 
 Exit codes: `0` passed, `1` findings, `2` usage or parse error. With `--quiet-on-pass`, a
@@ -81,8 +84,8 @@ claim false. Resolve it by looking, then either keep the claim or correct it.
 
 ## Limits
 
-- Reads through pipelines the tool cannot map to line numbers (output redirected to a log
-  that is read later, `python - <<EOF` scripts) may be reported as unread. One direct read of
-  the cited lines clears the finding.
+- Reads through arbitrary scripts (`python - <<EOF` slicing files) cannot always be mapped to
+  line numbers and may still be reported as unread. One direct read of the cited lines clears
+  the finding.
 - It verifies that claims are grounded in the transcript. It does not judge whether the
   conclusions drawn from them are right.

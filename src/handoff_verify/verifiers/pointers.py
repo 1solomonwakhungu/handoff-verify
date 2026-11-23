@@ -20,26 +20,42 @@ from handoff_verify.models import (
     ParsedTranscript,
     SearchEvent,
 )
-from handoff_verify.parsers._common import split_lf_lines
+from handoff_verify.parsers._common import (
+    _resolve_path_with_cd,
+    _safe_shlex_split,
+    _scan_shell_redirections,
+    _split_shell_segments,
+    _strip_heredocs,
+    _update_active_subdir,
+    safe_int,
+    split_lf_lines,
+)
 from handoff_verify.verifiers._paths import (
     KNOWN_EXTENSIONLESS_FILES,
     build_base_dirs,
+    is_basename_path_match,
     is_exact_path_match,
     is_suffix_path_match,
     normalize_path,
     paths_match,
     resolve_in_repo,
 )
+from handoff_verify.verifiers._redirects import RedirectProvenance, collect_redirected_reads
 
 _T = TypeVar("_T")
 
 _GREP_CONTENT_LINE_RE = re.compile(r"^([^\s:][^:\n]*):(\d+)[:-]")
+_DASH_NUM_DASH_RE = re.compile(r"-(\d+)-")
+_ISO_DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\b")
 _BARE_LINENUM_LINE_RE = re.compile(r"^(\d+)[:-]")
 _SIMPLE_COLON_LINE_END_RE = re.compile(r":(\d{1,6})$")
 _PY_TRACEBACK_FILE_RE = re.compile(r'File\s+"([^"]+)",\s+line\s+(\d+)')
 _EDIT_SNIPPET_LINE_RE = re.compile(r"^\s*(\d+)[→\t]")
 _DIFF_NEW_FILE_RE = re.compile(r"^\+\+\+ (?:b/)?([^\t\n]+)")
 _DIFF_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+_GREP_ADJACENCY_RADIUS = 2
+_GREP_BRIDGE_MAX_GAP = 4
+_SUBAGENT_TOOL_NAMES = frozenset({"agent", "task"})
 _EDIT_SUMMARY_VERB_RE = re.compile(
     r"\b(?:updated?|edited?|modif(?:y|ied)|fixed?|changed?|patched?|"
     r"added?|removed?|deleted?|refactored?|wrote|written|created?|applied?|replaced?|"
@@ -146,7 +162,11 @@ def _filter_matching_events(
     claimed_path: str,
     base_dirs: tuple[str, ...],
 ) -> list[_T]:
-    """3-tier path match: exact -> unique relative suffix -> basename-only fallback."""
+    """3-tier path match: exact -> suffix (unique or same-tier) -> basename fallback.
+
+    Never falls back from an ambiguous suffix match (`src/pkg/app.py`, `other/pkg/app.py`)
+    to a less-specific bare root file (`app.py`).
+    """
     exact = [
         item
         for item in items
@@ -167,12 +187,45 @@ def _filter_matching_events(
         distinct = {normalize_path(path_getter(item), base_dirs=base_dirs) for item in suffix}
         if len(distinct) == 1:
             return suffix
+        # Ambiguous multi-segment suffix: stay within the suffix tier rather than falling
+        # through to a less-specific root basename match.
+        return []
 
-    return [
+    basename = [
         item
         for item in items
-        if path_getter(item) and paths_match(claimed_path, path_getter(item), base_dirs=base_dirs)
+        if path_getter(item)
+        and is_basename_path_match(claimed_path, path_getter(item), base_dirs=base_dirs)
     ]
+    if basename:
+        distinct_base = {
+            normalize_path(path_getter(item), base_dirs=base_dirs) for item in basename
+        }
+        if len(distinct_base) == 1:
+            return basename
+        # Multiple files share the same basename (e.g. monorepo `index.ts` / `app.py`):
+        # keep all candidates so callers can check whether any single file covers the claim
+        # without hard-failing on monorepo filenames.
+        norm_c = normalize_path(claimed_path, base_dirs=base_dirs)
+        if "/" not in norm_c:
+            return basename
+
+    return []
+
+
+def _parse_grep_context_line(line: str, seen_files: set[str]) -> tuple[str, int] | None:
+    """Parse `path/to/file-42-content`, supporting hyphens/digits inside filenames."""
+    if not line or line[0] in ("-", " ", "\t", ":") or _ISO_DATE_PREFIX_RE.match(line):
+        return None
+    head = line.split(None, 1)[0]
+    for m in _DASH_NUM_DASH_RE.finditer(head):
+        cand = head[: m.start()]
+        if ":" in cand:
+            continue
+        if _looks_like_grep_context_path(cand, seen_files):
+            with contextlib.suppress(ValueError):
+                return cand, int(m.group(1))
+    return None
 
 
 def _is_foreign_shell_edit(
@@ -196,15 +249,219 @@ def _is_foreign_shell_edit(
 # --- B5 + B15: Pre-built O(N) output line index & observed path index ---
 
 
+def _looks_like_grep_context_path(candidate: str, seen_files: set[str]) -> bool:
+    """Return True if `candidate` in `candidate-41-text` is a plausible file path."""
+    if not candidate or "://" in candidate:
+        return False
+    if candidate in seen_files:
+        return True
+    base = posixpath.basename(candidate)
+    if not base or base.startswith("."):
+        return False
+    if base in KNOWN_EXTENSIONLESS_FILES:
+        return True
+    _, ext = posixpath.splitext(base)
+    return bool(ext and len(ext) <= 12 and ext[1:].isalnum())
+
+
+def _extract_grep_context_window(
+    raw_input: dict[str, object] | None,
+    command: str = "",
+) -> tuple[int, int]:
+    """Return explicit (before, after) context lines requested via -A/-B/-C flags."""
+    before = 0
+    after = 0
+    if isinstance(raw_input, dict):
+        for key in ("-C", "context", "C"):
+            val = safe_int(raw_input.get(key))
+            if val is not None and val > 0:
+                before = max(before, val)
+                after = max(after, val)
+        for key in ("-B", "before_context", "B"):
+            val = safe_int(raw_input.get(key))
+            if val is not None and val > 0:
+                before = max(before, val)
+        for key in ("-A", "after_context", "A"):
+            val = safe_int(raw_input.get(key))
+            if val is not None and val > 0:
+                after = max(after, val)
+
+    if command:
+        stripped, _ = _strip_heredocs(command)
+        for comp in _split_shell_segments(stripped, ("&&", "||", ";", "\n")):
+            pipes = _split_shell_segments(comp, ("|",))
+            if not pipes:
+                continue
+            clean_first, _ = _scan_shell_redirections(pipes[0])
+            toks = _safe_shlex_split(clean_first)
+            if not toks:
+                continue
+            prog = Path(toks[0]).name
+            if prog == "git" and len(toks) > 1 and toks[1] == "grep":
+                flag_toks = toks[2:]
+            elif prog in ("rg", "grep", "egrep", "fgrep", "ag", "ack"):
+                flag_toks = toks[1:]
+            else:
+                continue
+            i = 0
+            while i < len(flag_toks):
+                tok = flag_toks[i]
+                if tok == "--":
+                    break
+                if tok in ("-C", "--context") and i + 1 < len(flag_toks):
+                    val = safe_int(flag_toks[i + 1])
+                    if val is not None and val > 0:
+                        before = max(before, val)
+                        after = max(after, val)
+                    i += 2
+                    continue
+                if tok.startswith("--context="):
+                    val = safe_int(tok.split("=", 1)[1])
+                    if val is not None and val > 0:
+                        before = max(before, val)
+                        after = max(after, val)
+                    i += 1
+                    continue
+                if tok in ("-B", "--before-context") and i + 1 < len(flag_toks):
+                    val = safe_int(flag_toks[i + 1])
+                    if val is not None and val > 0:
+                        before = max(before, val)
+                    i += 2
+                    continue
+                if tok.startswith("--before-context="):
+                    val = safe_int(tok.split("=", 1)[1])
+                    if val is not None and val > 0:
+                        before = max(before, val)
+                    i += 1
+                    continue
+                if tok in ("-A", "--after-context") and i + 1 < len(flag_toks):
+                    val = safe_int(flag_toks[i + 1])
+                    if val is not None and val > 0:
+                        after = max(after, val)
+                    i += 2
+                    continue
+                if tok.startswith("--after-context="):
+                    val = safe_int(tok.split("=", 1)[1])
+                    if val is not None and val > 0:
+                        after = max(after, val)
+                    i += 1
+                    continue
+                if not tok.startswith("--") and tok.startswith("-") and len(tok) >= 2:
+                    # Handle glued flags like -C3, -rnC3, -rnA 3, -B2
+                    body = tok[1:]
+                    for idx_c, ch in enumerate(body):
+                        if ch in ("C", "A", "B"):
+                            glued = body[idx_c + 1 :]
+                            val = (
+                                safe_int(glued)
+                                if glued
+                                else (
+                                    safe_int(flag_toks[i + 1]) if i + 1 < len(flag_toks) else None
+                                )
+                            )
+                            if val is not None and val > 0:
+                                if ch in ("C", "B"):
+                                    before = max(before, val)
+                                if ch in ("C", "A"):
+                                    after = max(after, val)
+                            if not glued and i + 1 < len(flag_toks):
+                                i += 1
+                            break
+                i += 1
+
+    # Cap explicit context expansion so absurd values cannot blindly ground an entire file
+    return min(before, 25), min(after, 25)
+
+
+def _single_file_grep_target_in_command(command: str) -> str | None:
+    """If a compound command has exactly one single-file `grep`/`rg`, return that file path."""
+    if not command:
+        return None
+    stripped, _ = _strip_heredocs(command)
+    active_subdir: str | None = None
+    targets: list[str] = []
+    for comp in _split_shell_segments(stripped, ("&&", "||", ";", "\n")):
+        pipes = _split_shell_segments(comp, ("|",))
+        if not pipes:
+            continue
+        clean_first, _ = _scan_shell_redirections(pipes[0])
+        toks = _safe_shlex_split(clean_first)
+        if not toks:
+            continue
+        if toks[0] == "cd":
+            active_subdir = _update_active_subdir(
+                active_subdir, toks[1] if len(toks) >= 2 else None
+            )
+            continue
+        prog = Path(toks[0]).name
+        if prog not in ("grep", "rg", "egrep", "fgrep"):
+            continue
+        # Walk flags simply to collect positional args after query
+        pos_args: list[str] = []
+        has_e = False
+        i = 1
+        end_flags = False
+        while i < len(toks):
+            t = toks[i]
+            if not end_flags and t == "--":
+                end_flags = True
+                i += 1
+                continue
+            if not end_flags and t.startswith("-"):
+                if t in ("-e", "--regexp", "-f", "--file"):
+                    has_e = True
+                    i += 2
+                    continue
+                if t in (
+                    "-A",
+                    "-B",
+                    "-C",
+                    "-m",
+                    "-g",
+                    "-t",
+                    "-T",
+                    "--context",
+                    "--after-context",
+                    "--before-context",
+                    "--max-count",
+                    "--glob",
+                    "--include",
+                    "--exclude",
+                    "--exclude-dir",
+                    "--color",
+                ):
+                    i += 2
+                    continue
+                i += 1
+                continue
+            pos_args.append(t)
+            i += 1
+        file_args = pos_args if has_e else pos_args[1:]
+        if len(file_args) == 1:
+            candidate = _resolve_path_with_cd(file_args[0], active_subdir) or file_args[0]
+            base = posixpath.basename(candidate.rstrip("/"))
+            if "." in base and not base.startswith("."):
+                targets.append(candidate)
+        else:
+            return None
+    return targets[0] if len(targets) == 1 else None
+
+
 class _OutputLineIndex:
     """Single-pass index of `path:line` observations across searches, commands, and tool outputs."""
 
-    def __init__(self, transcript: ParsedTranscript, base_dirs: tuple[str, ...]) -> None:
+    def __init__(
+        self,
+        transcript: ParsedTranscript,
+        base_dirs: tuple[str, ...],
+        redirected_reads: list[tuple[FileReadEvent, RedirectProvenance]] = (),
+    ) -> None:
         self._base_dirs = base_dirs
         # norm_path -> dict[line_no, max_event_index]
         self._by_path: dict[str, dict[int, int]] = {}
         self._by_basename: dict[str, set[str]] = {}
-        self._index_transcript(transcript)
+        self.tool_observed_paths: set[str] = set()
+        self._index_transcript(transcript, redirected_reads)
 
     def _add(self, raw_path: str, line_no: int, event_index: int) -> None:
         if line_no < 1 or not raw_path:
@@ -218,6 +475,28 @@ class _OutputLineIndex:
             line_map[line_no] = event_index
         base = posixpath.basename(norm_p)
         self._by_basename.setdefault(base, set()).add(norm_p)
+
+    def _add_grep_hits(
+        self,
+        hits_by_file: dict[str, set[int]],
+        event_index: int,
+        *,
+        ctx_before: int = 0,
+        ctx_after: int = 0,
+    ) -> None:
+        """Credit grep/rg matched lines, context window, and tight consecutive clusters."""
+        before = max(_GREP_ADJACENCY_RADIUS, ctx_before)
+        after = max(_GREP_ADJACENCY_RADIUS, ctx_after)
+        for raw_path, lines in hits_by_file.items():
+            ordered = sorted(ln for ln in lines if ln >= 1)
+            for idx, ln in enumerate(ordered):
+                for adj in range(max(1, ln - before), ln + after + 1):
+                    self._add(raw_path, adj, event_index)
+                if idx + 1 < len(ordered):
+                    nxt = ordered[idx + 1]
+                    if 1 < nxt - ln <= _GREP_BRIDGE_MAX_GAP:
+                        for mid in range(ln + 1, nxt):
+                            self._add(raw_path, mid, event_index)
 
     def _scan_diff(self, text: str, event_index: int) -> None:
         """Credit new-side line numbers shown in unified diff hunks to their `+++` file.
@@ -250,16 +529,52 @@ class _OutputLineIndex:
             elif line[0] not in "-\\":
                 remaining = 0
 
-    def _scan_text(self, text: str, event_index: int, *, scan_inline: bool = False) -> None:
+    def _scan_text(
+        self,
+        text: str,
+        event_index: int,
+        *,
+        scan_inline: bool = False,
+        ctx_before: int = 0,
+        ctx_after: int = 0,
+        single_file_target: str | None = None,
+        truncated: bool = False,
+    ) -> None:
         if not text:
             return
         self._scan_diff(text, event_index)
+        grep_hits: dict[str, set[int]] = {}
+        seen_match_files: set[str] = set()
+        saw_context_lines = False
         for line in split_lf_lines(text):
             m = _GREP_CONTENT_LINE_RE.match(line)
             if m and (not scan_inline or " " not in m.group(1)):
                 with contextlib.suppress(ValueError):
-                    self._add(m.group(1), int(m.group(2)), event_index)
+                    p = m.group(1)
+                    ln = int(m.group(2))
+                    seen_match_files.add(p)
+                    grep_hits.setdefault(p, set()).add(ln)
                 continue
+            if not scan_inline:
+                ctx_parsed = _parse_grep_context_line(line, seen_match_files)
+                if ctx_parsed is not None:
+                    p, ln = ctx_parsed
+                    # Credit explicit context lines directly (without adding extra +-2 slack).
+                    self._add(p, ln, event_index)
+                    saw_context_lines = True
+                    continue
+                if single_file_target and not _ISO_DATE_PREFIX_RE.match(line):
+                    m_num = _BARE_LINENUM_LINE_RE.match(line)
+                    if m_num:
+                        with contextlib.suppress(ValueError):
+                            ln = int(m_num.group(1))
+                            sep = line[m_num.end() - 1]
+                            if sep == ":":
+                                grep_hits.setdefault(single_file_target, set()).add(ln)
+                            else:
+                                self._add(single_file_target, ln, event_index)
+                                saw_context_lines = True
+                        continue
             m_tb = _PY_TRACEBACK_FILE_RE.search(line)
             if m_tb:
                 with contextlib.suppress(ValueError):
@@ -278,35 +593,96 @@ class _OutputLineIndex:
                         with contextlib.suppress(ValueError):
                             self._add(p_part, int(m_end.group(1)), event_index)
 
-    def _index_transcript(self, transcript: ParsedTranscript) -> None:
+        if grep_hits:
+            if scan_inline:
+                for p, lns in grep_hits.items():
+                    for ln in lns:
+                        self._add(p, ln, event_index)
+            else:
+                # When context lines were already printed and parsed individually (or when
+                # output was truncated), do not blindly expand by -C/-A/-B flag values.
+                eff_before = 0 if (truncated or saw_context_lines) else min(ctx_before, 5)
+                eff_after = 0 if (truncated or saw_context_lines) else min(ctx_after, 5)
+                self._add_grep_hits(
+                    grep_hits,
+                    event_index,
+                    ctx_before=eff_before,
+                    ctx_after=eff_after,
+                )
+
+    def _scan_tool_result_pointers(self, text: str, event_index: int) -> None:
+        """Index file pointers (including ranges, #L, and bare filenames) from subagent results."""
+        if not text:
+            return
+        from handoff_verify.extractors import extract_pointer_claims
+
+        for ptr in extract_pointer_claims(text, base_dirs=self._base_dirs):
+            if not ptr.file_path:
+                continue
+            self.tool_observed_paths.add(ptr.file_path)
+            if ptr.start_line is not None:
+                end = ptr.end_line if ptr.end_line is not None else ptr.start_line
+                capped_end = min(end, ptr.start_line + 500)
+                for ln in range(ptr.start_line, capped_end + 1):
+                    self._add(ptr.file_path, ln, event_index)
+
+    def _index_transcript(
+        self,
+        transcript: ParsedTranscript,
+        redirected_reads: list[tuple[FileReadEvent, RedirectProvenance]],
+    ) -> None:
         indexed_ev: set[int] = set()
+        for r in transcript.file_reads:
+            indexed_ev.add(r.event_index)
+        for e in transcript.file_edits:
+            indexed_ev.add(e.event_index)
+
         for search in transcript.searches:
             if not search.has_result or search.is_error or not search.output:
                 continue
             indexed_ev.add(search.event_index)
-            self._scan_text(search.output, search.event_index)
-            # R2-7: single-file `grep -n` / `rg -n` prints `42:...` without a filename prefix
+            cmd_str = ""
+            if isinstance(search.raw_input, dict):
+                raw_cmd = search.raw_input.get("command") or search.raw_input.get("cmd")
+                if isinstance(raw_cmd, str):
+                    cmd_str = raw_cmd
+            ctx_b, ctx_a = _extract_grep_context_window(search.raw_input, cmd_str)
             roots = search.search_paths or ([search.search_path] if search.search_path else [])
+            single_target: str | None = None
             if len(roots) == 1:
-                target = roots[0]
-                base = posixpath.basename(target.rstrip("/"))
+                base = posixpath.basename(roots[0].rstrip("/"))
                 if "." in base and not base.startswith("."):
-                    for ln in split_lf_lines(search.output):
-                        m_num = _BARE_LINENUM_LINE_RE.match(ln)
-                        if m_num:
-                            with contextlib.suppress(ValueError):
-                                self._add(target, int(m_num.group(1)), search.event_index)
+                    single_target = roots[0]
+            self._scan_text(
+                search.output,
+                search.event_index,
+                ctx_before=ctx_b,
+                ctx_after=ctx_a,
+                single_file_target=single_target,
+                truncated=search.truncated,
+            )
 
         for cmd in transcript.commands:
             if not cmd.has_result:
                 continue
             indexed_ev.add(cmd.event_index)
+            ctx_b, ctx_a = _extract_grep_context_window(cmd.raw_input, cmd.command or "")
+            single_target = _single_file_grep_target_in_command(cmd.command or "")
+            has_head_pipe = "| head" in (cmd.command or "")
             if cmd.stdout:
-                self._scan_text(cmd.stdout, cmd.event_index)
+                self._scan_text(
+                    cmd.stdout,
+                    cmd.event_index,
+                    ctx_before=ctx_b,
+                    ctx_after=ctx_a,
+                    single_file_target=single_target,
+                    truncated=cmd.truncated or has_head_pipe,
+                )
             if cmd.stderr:
-                self._scan_text(cmd.stderr, cmd.event_index)
+                self._scan_text(cmd.stderr, cmd.event_index, scan_inline=True)
 
-        # Also index other completed tool outputs (e.g., Task/subagent results relaying path:line)
+        # Index other completed tool outputs (strictly gating full pointer/range relay on
+        # Agent/Task subagent results so Read/Edit/WebFetch docs cannot launder line ranges).
         for ev in transcript.events:
             if (
                 ev.event_index not in indexed_ev
@@ -314,13 +690,21 @@ class _OutputLineIndex:
                 and not ev.is_error
                 and ev.raw_output
             ):
-                self._scan_text(ev.raw_output, ev.event_index, scan_inline=True)
+                if ev.tool_name.lower() in _SUBAGENT_TOOL_NAMES:
+                    self._scan_text(ev.raw_output, ev.event_index, scan_inline=True)
+                    self._scan_tool_result_pointers(ev.raw_output, ev.event_index)
+                else:
+                    self._scan_text(ev.raw_output, ev.event_index, scan_inline=True)
 
         # A diff saved to a file and then read (`git diff > /tmp/pr.diff`, then Read) shows the
         # same hunks; `content` has the Read tool's own line-number gutter already stripped.
+        redirected_read_ids = {id(r) for r, _ in redirected_reads}
         for read in transcript.file_reads:
             if read.has_result and not read.is_error and read.content:
-                self._scan_diff(read.content, read.event_index)
+                if id(read) in redirected_read_ids:
+                    self._scan_text(read.content, read.event_index, truncated=read.truncated)
+                else:
+                    self._scan_diff(read.content, read.event_index)
 
     def matching_lines(
         self, claimed_path: str, *, after_event_index: int | None = None
@@ -353,8 +737,14 @@ class _OutputLineIndex:
                 ]
                 if len(suffix) == 1:
                     matched_paths = suffix
-                elif "/" not in norm_c:
-                    matched_paths = list(candidate_paths)
+                elif not suffix:
+                    basename_matches = [
+                        p
+                        for p in candidate_paths
+                        if is_basename_path_match(norm_c, p, base_dirs=self._base_dirs)
+                    ]
+                    if len(basename_matches) == 1 or "/" not in norm_c:
+                        matched_paths = basename_matches
 
         out: set[int] = set()
         for p in matched_paths:
@@ -635,20 +1025,27 @@ def verify_pointers(
 ) -> list[Finding]:
     """Verify file pointer claims against transcript reads, edits, searches, and optional repo."""
     base_dirs = build_base_dirs(transcript.cwd, repo_root)
+    synthesized_redirect_reads, redirected_reads = collect_redirected_reads(transcript, base_dirs)
     valid_reads = [
         r for r in transcript.file_reads if r.has_result and not r.is_error and r.file_path
-    ]
+    ] + synthesized_redirect_reads
     valid_edits = [
         e for e in transcript.file_edits if e.has_result and not e.is_error and e.file_path
     ]
     valid_searches = [s for s in transcript.searches if s.has_result and not s.is_error]
 
     # B15: Build O(N) indices ONCE before looping over claims
-    output_line_index = _OutputLineIndex(transcript, base_dirs)
+    output_line_index = _OutputLineIndex(transcript, base_dirs, redirected_reads=redirected_reads)
     search_observed_paths = _collect_search_observed_paths(valid_searches, base_dirs)
     ls_observed_paths = _collect_ls_joined_paths(transcript.commands, base_dirs)
     moved_sources, moved_dests = _collect_moved_paths(transcript.commands, base_dirs)
-    all_listed_paths = search_observed_paths | ls_observed_paths | moved_sources | moved_dests
+    all_listed_paths = (
+        search_observed_paths
+        | ls_observed_paths
+        | moved_sources
+        | moved_dests
+        | output_line_index.tool_observed_paths
+    )
 
     findings: list[Finding] = []
     live_file_cache: dict[Path, list[str] | None] = {}

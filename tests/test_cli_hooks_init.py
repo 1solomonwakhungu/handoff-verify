@@ -176,7 +176,7 @@ def test_cli_hook_claude_code_subprocess_clean_and_fail_open(tmp_path: Path) -> 
     assert proc_clean.stdout == ""
     assert proc_clean.stderr == ""
 
-    # Fail-open on invalid JSON stdin exits 0.
+    # Fail-open on invalid JSON stdin exits 1 (non-blocking in Claude Code while surfacing stderr).
     proc_open = subprocess.run(
         [sys.executable, "-m", "handoff_verify.cli", "hook", "claude-code"],
         input="not-json",
@@ -184,7 +184,7 @@ def test_cli_hook_claude_code_subprocess_clean_and_fail_open(tmp_path: Path) -> 
         text=True,
         check=False,
     )
-    assert proc_open.returncode == 0
+    assert proc_open.returncode == 1
     assert proc_open.stdout == ""
     assert "handoff-verify hook:" in proc_open.stderr
 
@@ -311,14 +311,14 @@ def test_cli_hook_usage_errors_fail_open_by_default_and_fail_closed_with_flag(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     # Typo / unsupported flag / unknown hook target MUST NOT exit 2 without --fail-closed
-    # (exit 2 blocks every Stop in Claude Code!).
-    assert main(["hook", "claude-code", "--mode", "advise", "--timeout", "5"]) == 0
+    # (exit 2 blocks every Stop in Claude Code; exit 1 surfaces stderr without blocking).
+    assert main(["hook", "claude-code", "--mode", "advise", "--timeout", "5"]) == 1
     assert "unrecognized arguments" in capsys.readouterr().err
 
-    assert main(["hook", "claude-code", "--mode", "warn"]) == 0
+    assert main(["hook", "claude-code", "--mode", "warn"]) == 1
     assert "invalid choice" in capsys.readouterr().err
 
-    assert main(["hook", "claude_code"]) == 0
+    assert main(["hook", "claude_code"]) == 1
     assert "invalid choice" in capsys.readouterr().err
 
     # With --fail-closed, hook usage errors exit 2.

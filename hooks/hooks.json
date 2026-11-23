@@ -1,0 +1,25 @@
+{
+  "description": "Verify agent file pointers, verbatim code quotes, and search/pagination scope receipts on SubagentStop and Stop.",
+  "hooks": {
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/handoff-verify\" hook claude-code --mode advise"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/handoff-verify\" hook claude-code --mode advise"
+          }
+        ]
+      }
+    ]
+  }
+}
