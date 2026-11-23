@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from pathlib import Path
 from typing import Any
 
 from handoff_verify import __version__
-from handoff_verify.models import ParsedTranscript, VerificationReport
+from handoff_verify.formatters import format_report
+from handoff_verify.hooks import (
+    DEFAULT_CLAUDE_SETTINGS_PATH,
+    SettingsError,
+    build_claude_code_hook_command,
+    build_claude_code_settings_snippet,
+    run_claude_code_hook,
+    write_claude_code_settings,
+)
+from handoff_verify.models import ParsedTranscript
 from handoff_verify.parsers import auto_parse
 from handoff_verify.pipeline import build_scope_receipt, verify_transcript
 
@@ -92,39 +102,6 @@ def _format_inspect_text(transcript: ParsedTranscript) -> str:
     return "\n".join(lines)
 
 
-def _format_check_output(report: VerificationReport, fmt: str) -> str:
-    if fmt == "json":
-        return json.dumps(report.to_dict(), indent=2)
-
-    status = "PASS" if report.passed else "FAIL"
-    summary = (
-        f"{len(report.findings)} findings "
-        f"({len(report.claims)} claims checked, "
-        f"{len(report.scope_receipt.files_read)} files read, "
-        f"{report.duration_ms:.1f}ms)"
-    )
-
-    if fmt == "markdown":
-        if report.passed and not report.findings:
-            return f"**handoff-verify:** {status} — {summary}"
-        lines = [f"### handoff-verify: {status}", "", f"Summary: {summary}", ""]
-        for finding in report.findings:
-            lines.append(f"- **[{finding.severity.upper()}] `{finding.code}`**: {finding.message}")
-            if finding.suggestion:
-                lines.append(f"  - Suggestion: {finding.suggestion}")
-        return "\n".join(lines)
-
-    # Plain text
-    if report.passed and not report.findings:
-        return f"{status}: {summary}"
-    lines = [f"{status}: {summary}"]
-    for finding in report.findings:
-        lines.append(f"  [{finding.severity.upper()}] {finding.code}: {finding.message}")
-        if finding.suggestion:
-            lines.append(f"    -> {finding.suggestion}")
-    return "\n".join(lines)
-
-
 def _load_transcript_arg(raw_arg: str, parser_hint: str) -> ParsedTranscript | None:
     if raw_arg == "-":
         return auto_parse(sys.stdin, format_hint=parser_hint, transcript_path="<stdin>")
@@ -182,10 +159,68 @@ def _cmd_check(args: argparse.Namespace) -> int:
 
     report = verify_transcript(transcript, repo_root=repo_root, strict=args.strict)
 
-    if not (report.passed and args.quiet_on_pass):
-        print(_format_check_output(report, args.format))
+    rendered = format_report(report, args.format, quiet_on_pass=args.quiet_on_pass)
+    if rendered:
+        print(rendered)
 
     return 0 if report.passed else 1
+
+
+def _cmd_hook_claude_code(args: argparse.Namespace) -> int:
+    fail_closed = bool(args.fail_closed)
+    try:
+        stdin_text = sys.stdin.read()
+        repo_root = Path(args.repo) if args.repo is not None else None
+        result = run_claude_code_hook(
+            stdin_text,
+            mode=args.mode,
+            strict=bool(args.strict),
+            repo_root=repo_root,
+            fail_closed=fail_closed,
+        )
+        if result.stdout:
+            print(result.stdout)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+        return result.exit_code
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            print(f"handoff-verify hook: internal error: {exc}", file=sys.stderr)
+        return 2 if fail_closed else 0
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    if not args.write:
+        snippet = build_claude_code_settings_snippet(
+            mode=args.mode,
+            strict=bool(args.strict),
+            command=args.command_override,
+        )
+        print(json.dumps(snippet, indent=2, ensure_ascii=False))
+        return 0
+
+    settings_path = Path(args.settings).expanduser()
+    hook_cmd = build_claude_code_hook_command(
+        mode=args.mode,
+        strict=bool(args.strict),
+        command=args.command_override,
+    )
+    try:
+        _, created = write_claude_code_settings(
+            settings_path,
+            mode=args.mode,
+            strict=bool(args.strict),
+            command=args.command_override,
+        )
+    except (SettingsError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    action = "Created" if created else "Updated"
+    print(
+        f"{action} Claude Code hooks in {settings_path} (SubagentStop, Stop; command={hook_cmd!r})."
+    )
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -254,7 +289,7 @@ def build_parser() -> argparse.ArgumentParser:
     check_parser.add_argument(
         "--quiet-on-pass",
         action="store_true",
-        help="Suppress output when verification passes.",
+        help="Suppress output when verification passes with zero findings.",
     )
     check_parser.add_argument(
         "--parser",
@@ -264,21 +299,111 @@ def build_parser() -> argparse.ArgumentParser:
     )
     check_parser.set_defaults(func=_cmd_check)
 
+    hook_parser = subparsers.add_parser(
+        "hook",
+        help="Run a deterministic verification hook adapter for an AI coding harness.",
+    )
+    hook_subparsers = hook_parser.add_subparsers(dest="hook_target", required=True)
+
+    claude_hook_parser = hook_subparsers.add_parser(
+        "claude-code",
+        help="Handle Claude Code Stop / SubagentStop hook JSON payloads on stdin.",
+        allow_abbrev=False,
+    )
+    claude_hook_parser.add_argument(
+        "--mode",
+        choices=("advise", "block"),
+        default="advise",
+        help="advise: exit 0 with feedback JSON (default); block: exit 2 with stderr receipt.",
+    )
+    claude_hook_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Treat warnings as verification failures.",
+    )
+    claude_hook_parser.add_argument(
+        "--repo",
+        default=None,
+        help="Optional repository root (defaults to hook payload cwd if valid).",
+    )
+    claude_hook_parser.add_argument(
+        "--fail-closed",
+        action="store_true",
+        help="Exit 2 on internal/parse/IO errors instead of failing open (exit 0).",
+    )
+    claude_hook_parser.set_defaults(func=_cmd_hook_claude_code)
+
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Print or install harness hook configuration (e.g., Claude Code settings.json).",
+    )
+    init_parser.add_argument(
+        "--claude-code",
+        action="store_true",
+        required=True,
+        help="Generate or install Claude Code Stop / SubagentStop hooks.",
+    )
+    init_parser.add_argument(
+        "--write",
+        action="store_true",
+        help="Safely create or merge hooks into the Claude settings.json file.",
+    )
+    init_parser.add_argument(
+        "--settings",
+        default=str(DEFAULT_CLAUDE_SETTINGS_PATH),
+        help="Target settings.json path for --write (default: .claude/settings.json).",
+    )
+    init_parser.add_argument(
+        "--mode",
+        choices=("advise", "block"),
+        default="advise",
+        help="Hook mode to configure (default: advise).",
+    )
+    init_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Include --strict in the configured hook command.",
+    )
+    init_parser.add_argument(
+        "--command",
+        dest="command_override",
+        default=None,
+        help=(
+            "Shell command fragment prefix (e.g. 'uvx handoff-verify') or full hook "
+            "command override containing 'hook claude-code' (default: handoff-verify)."
+        ),
+    )
+    init_parser.set_defaults(func=_cmd_init)
+
     return parser
+
+
+def _hook_argv_flags(argv: list[str] | None) -> tuple[bool, bool]:
+    """Return ``(is_hook_subcommand, fail_closed_requested)`` from raw CLI argv."""
+    tokens = sys.argv[1:] if argv is None else list(argv)
+    is_hook = bool(tokens) and tokens[0] == "hook"
+    fail_closed = "--fail-closed" in tokens
+    return is_hook, fail_closed
 
 
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point returning POSIX exit code (0=pass, 1=findings, 2=usage/internal error)."""
+    is_hook, fail_closed = _hook_argv_flags(argv)
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
-        code = exc.code
-        return code if isinstance(code, int) else 2
+        code = exc.code if isinstance(exc.code, int) else 2
+        if is_hook and code != 0 and not fail_closed:
+            return 0
+        return code
     try:
         return int(args.func(args))
     except Exception as exc:
-        print(f"Error: internal failure: {exc}", file=sys.stderr)
+        with contextlib.suppress(Exception):
+            print(f"Error: internal failure: {exc}", file=sys.stderr)
+        if is_hook and not fail_closed:
+            return 0
         return 2
 
 
