@@ -471,11 +471,28 @@ _PROSPECTIVE_PREFIX_RE = re.compile(
     r"please|consider|recommend|suggest|try|next\s+step\s*[:—–-]?|todo\s*[:—–-]?)\s+"
     r"(?:to\s+)?(?:create|creating|add|adding|write|writing|open|opening|edit|editing|"
     r"make|making|update|updating|review|reviewing|check|checking|see|modify|modifying|"
-    r"bump|bumping|delete|deleting|remove|removing)\s+(?:a\s+(?:new\s+)?)?|"
-    r"(?:should|could|would|will|to)\s+(?:create|add|write|update)\s+(?:a\s+(?:new\s+)?)?|"
-    r"(?:^|\b)(?:create|add)\s+(?:a\s+new\s+file\s+|the\s+file\s+)?|"
+    r"bump|bumping|delete|deleting|remove|removing|wire|wiring|document|documenting)\s+"
+    r"(?:a\s+(?:new\s+)?)?|"
+    r"(?:should|could|would|will|to)\s+(?:create|add|write|update|document|wire)\s+"
+    r"(?:a\s+(?:new\s+)?)?|"
+    r"(?:^|\b)(?:create|add|document|wire)\s+(?:a\s+new\s+file\s+|the\s+file\s+|it\s+in(?:to)?\s+|coverage\s+in\s+)?|"
     r"new\s+file\s+at\s+"
     r")$",
+    re.IGNORECASE,
+)
+
+_PROSPECTIVE_HEADING_RE = re.compile(
+    r"^(?:#{1,6}\s+)?(?:\*\*)?(?:follow[- ]?ups?|next\s+steps?|todos?|"
+    r"future\s+work|remaining\s+work|suggested\s+(?:changes?|follow[- ]?ups?))(?:\*\*)?\s*:?\s*$",
+    re.IGNORECASE,
+)
+_BULLET_LINE_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
+
+_PROSPECTIVE_SENTENCE_RE = re.compile(
+    r"(?:\b(?:follow[- ]?ups?|next\s+step|todo|you\s+(?:can|could|should)|"
+    r"we\s+(?:can|could|should)|consider\s+(?:adding|creating|updating|wiring|documenting)|"
+    r"recommend\s+(?:adding|creating|updating)|suggest\s+(?:adding|creating|updating))\b|"
+    r"\b(?:later|in\s+a\s+follow[- ]?up)\s*[.!?]?\s*$)",
     re.IGNORECASE,
 )
 
@@ -484,6 +501,11 @@ _NEGATED_READ_PREFIX_RE = re.compile(
     r"omitted|excluding)\s+"
     r"(?:read(?:ing)?|open(?:ing)?|inspect(?:ing)?|check(?:ing)?|edit(?:ing)?|"
     r"touch(?:ing)?|modif(?:y|ying)|view(?:ing)?|look(?:ing)?\s+at)\s+$",
+    re.IGNORECASE,
+)
+
+_UNTOUCHED_SUFFIX_RE = re.compile(
+    r"\b(?:untouched|unchanged|unmodified|as[- ]is|skipped|unread|unopened)\b",
     re.IGNORECASE,
 )
 
@@ -537,6 +559,20 @@ def _is_hypothetical_pointer(
         return True
 
     if not has_line:
+        # R2-9: coordinated prospective sentences ("... add `a.py` and document it in `b.md`")
+        if _PROSPECTIVE_SENTENCE_RE.search(sentence) and not re.search(
+            r"\b(?:I|we)\s+(?:checked|read|updated|edited|fixed|verified|modified|created|added)\b",
+            sentence[:match_start],
+            re.IGNORECASE,
+        ):
+            return True
+        if re.search(
+            r"\b(?:add|create)\s+\S+(?:\s+\S+){0,4}\s+and\s+(?:document|wire|update|add)\b",
+            sentence[:match_start],
+            re.IGNORECASE,
+        ):
+            return True
+
         # NB9: trim suffix at the first clause boundary so an unrelated later clause
         # ("`src/ghost.py` validates tokens; missing ones are not found errors") does not suppress.
         raw_suffix = sentence[match_end : min(len(sentence), match_end + 55)]
@@ -545,6 +581,8 @@ def _is_hypothetical_pointer(
             if idx != -1:
                 raw_suffix = raw_suffix[:idx]
         near_prefix = prefix[-40:]
+        if _UNTOUCHED_SUFFIX_RE.search(raw_suffix):
+            return True
         if _NONEXISTENT_AROUND_RE.search(raw_suffix) or re.search(
             r"\b(?:no|missing|without|cannot\s+find|could\s+not\s+find|couldn't\s+find)\s+$",
             near_prefix,
@@ -561,10 +599,10 @@ _BACKTICK_SPAN_RE = re.compile(r"`([^`\n]{1,320})`")
 _WHITESPACE_TOKEN_RE = re.compile(r"\S+")
 _AFTER_LINE_RE = re.compile(
     r"^(?:"
-    r"\s*\(\s*(?:(?:around|near)\s+)?(?:lines?|L)\s*(?P<pstart>\d{1,6})"
-    r"(?:\s*[-–]\s*L?(?P<pend>\d{1,6}))?\s*\)|"
-    r"(?:\s*,\s*|\s+(?:at|around|near)\s+|\s+)(?:lines?\s+|L)(?P<astart>\d{1,6})"
-    r"(?:\s*[-–]\s*L?(?P<aend>\d{1,6}))?(?!\s+(?:of|in)\b)"
+    r"\s*\(\s*(?:(?:around|near)\s+)?(?:lines?|L)\s*(?P<pstart>\d{1,6})\b"
+    r"(?:\s*[-–]\s*L?(?P<pend>\d{1,6})\b)?\s*\)|"
+    r"(?:\s*,\s*|\s+(?:at|around|near)\s+|\s+)(?:lines?\s+|L)(?P<astart>\d{1,6})\b"
+    r"(?:\s*[-–]\s*L?(?P<aend>\d{1,6})\b)?(?!\s+(?:of|in)\b)"
     r")",
     re.IGNORECASE,
 )
@@ -723,49 +761,92 @@ def extract_pointer_claims(
             bare_candidates.append(c)
 
     for chunk in prose_chunks:
-        for _, _, sentence in _iter_sentences(chunk.text):
-            occupied: list[tuple[int, int]] = []
+        in_prospective_list = False
+        for raw_line in chunk.text.splitlines():
+            stripped_line = raw_line.strip()
+            if not stripped_line:
+                in_prospective_list = False
+                continue
+            if _PROSPECTIVE_HEADING_RE.match(stripped_line):
+                in_prospective_list = True
+                continue
+            if in_prospective_list and _BULLET_LINE_RE.match(raw_line):
+                # R2-9: bullets under "Follow-ups:" / "Next steps:" are prospective tasks
+                continue
+            if in_prospective_list and not _BULLET_LINE_RE.match(raw_line):
+                in_prospective_list = False
 
-            # 0. Markdown links and external URLs
-            for m_link in _MARKDOWN_LINK_RE.finditer(sentence):
-                span = (m_link.start(), m_link.end())
-                parsed = _parse_pointer_from_link(
-                    m_link.group(1), m_link.group(2), base_dirs=base_dirs
-                )
-                if parsed is None:
-                    occupied.append(span)
-                    continue
-                norm_p, s_line, e_line = parsed
-                _record(m_link.group(0), norm_p, s_line, e_line, sentence, span, occupied)
+            for _, _, sentence in _iter_sentences(raw_line):
+                occupied: list[tuple[int, int]] = []
 
-            for m_url in _URL_RE.finditer(sentence):
-                occupied.append((m_url.start(), m_url.end()))
+                # 0. Markdown links and external URLs
+                for m_link in _MARKDOWN_LINK_RE.finditer(sentence):
+                    span = (m_link.start(), m_link.end())
+                    parsed = _parse_pointer_from_link(
+                        m_link.group(1), m_link.group(2), base_dirs=base_dirs
+                    )
+                    if parsed is None:
+                        occupied.append(span)
+                        continue
+                    norm_p, s_line, e_line = parsed
+                    _record(m_link.group(0), norm_p, s_line, e_line, sentence, span, occupied)
 
-            # 1. Backticked spans (handles `[id]`, `(auth)`, `+page`, `$id`, `:line`, `#Lline`,
-            #    as well as `` `file.py`:42 ``, `` `file.py` (line 42) ``, `line 42 of `file.py``)
-            for m_bt in _BACKTICK_SPAN_RE.finditer(sentence):
-                span = (m_bt.start(), m_bt.end())
-                if _span_overlaps_sorted(span, occupied):
-                    continue
-                inner = m_bt.group(1).strip()
-                if not inner or len(inner) > _MAX_PATH_LEN:
-                    occupied.append(span)
-                    continue
+                for m_url in _URL_RE.finditer(sentence):
+                    occupied.append((m_url.start(), m_url.end()))
 
-                path_part, s_line, e_line = _split_path_and_line_suffix(inner)
-                if s_line is not None and _is_valid_file_path(path_part, has_line_spec=True):
-                    _record(m_bt.group(0), path_part, s_line, e_line, sentence, span, occupied)
-                    continue
+                # 1. Backticked spans (`[id]`, `(auth)`, `+page`, `$id`, `:line`, `#Lline`,
+                #    `file.py`:42, `file.py` (line 42), `line 42 of file.py`)
+                for m_bt in _BACKTICK_SPAN_RE.finditer(sentence):
+                    span = (m_bt.start(), m_bt.end())
+                    if _span_overlaps_sorted(span, occupied):
+                        continue
+                    inner = m_bt.group(1).strip()
+                    if not inner or len(inner) > _MAX_PATH_LEN:
+                        occupied.append(span)
+                        continue
 
-                # Check if backticked path is immediately followed by `:42` or `#L42` or `(line 42)`
-                after_text = sentence[m_bt.end() :]
-                before_text = sentence[: m_bt.start()]
-                m_line_of = _LINE_OF_PREFIX_RE.search(before_text)
-                if m_line_of and _is_valid_file_path(inner, has_line_spec=True):
-                    bounds = _parse_line_bounds(m_line_of.group("start"), m_line_of.group("end"))
-                    if bounds is not None:
-                        full_span = (m_line_of.start(), m_bt.end())
-                        if not _span_overlaps_sorted(full_span, occupied):
+                    path_part, s_line, e_line = _split_path_and_line_suffix(inner)
+                    if s_line is not None and _is_valid_file_path(path_part, has_line_spec=True):
+                        _record(m_bt.group(0), path_part, s_line, e_line, sentence, span, occupied)
+                        continue
+
+                    # Bounded 60-char slices keep scanning strictly O(n) on huge lines
+                    after_text = sentence[m_bt.end() : m_bt.end() + 60]
+                    before_start = max(0, m_bt.start() - 60)
+                    before_text = sentence[before_start : m_bt.start()]
+                    m_line_of = _LINE_OF_PREFIX_RE.search(before_text)
+                    if m_line_of and _is_valid_file_path(inner, has_line_spec=True):
+                        bounds = _parse_line_bounds(
+                            m_line_of.group("start"), m_line_of.group("end")
+                        )
+                        if bounds is not None:
+                            full_span = (before_start + m_line_of.start(), m_bt.end())
+                            if not _span_overlaps_sorted(full_span, occupied):
+                                _record(
+                                    sentence[full_span[0] : full_span[1]],
+                                    inner,
+                                    bounds[0],
+                                    bounds[1],
+                                    sentence,
+                                    full_span,
+                                    occupied,
+                                )
+                                continue
+
+                    # Check `:42` / `#L42` right after closing backtick (`file.py`:42)
+                    m_adj_suffix = re.match(
+                        r"^(?:#L(?P<hstart>\d{1,6})(?:[-–]L?(?P<hend>\d{1,6}))?|"
+                        r":L?(?P<cstart>\d{1,6})(?:(?:\s*[-–]\s*L?|\.\.)(?P<cend>\d{1,6})|:(?P<col>\d{1,6}))?)"
+                        r"(?!\d|:\d)",
+                        after_text,
+                    )
+                    if m_adj_suffix and _is_valid_file_path(inner, has_line_spec=True):
+                        bounds = _parse_line_bounds(
+                            m_adj_suffix.group("hstart") or m_adj_suffix.group("cstart"),
+                            m_adj_suffix.group("hend") or m_adj_suffix.group("cend"),
+                        )
+                        if bounds is not None:
+                            full_span = (m_bt.start(), m_bt.end() + m_adj_suffix.end())
                             _record(
                                 sentence[full_span[0] : full_span[1]],
                                 inner,
@@ -777,87 +858,17 @@ def extract_pointer_claims(
                             )
                             continue
 
-                # Check `:42` / `#L42` right after closing backtick (`file.py`:42)
-                m_adj_suffix = re.match(
-                    r"^(?:#L(?P<hstart>\d{1,6})(?:[-–]L?(?P<hend>\d{1,6}))?|"
-                    r":L?(?P<cstart>\d{1,6})(?:(?:\s*[-–]\s*L?|\.\.)(?P<cend>\d{1,6})|:(?P<col>\d{1,6}))?)"
-                    r"(?!\d|:\d)",
-                    after_text,
-                )
-                if m_adj_suffix and _is_valid_file_path(inner, has_line_spec=True):
-                    bounds = _parse_line_bounds(
-                        m_adj_suffix.group("hstart") or m_adj_suffix.group("cstart"),
-                        m_adj_suffix.group("hend") or m_adj_suffix.group("cend"),
-                    )
-                    if bounds is not None:
-                        full_span = (m_bt.start(), m_bt.end() + m_adj_suffix.end())
-                        _record(
-                            sentence[full_span[0] : full_span[1]],
-                            inner,
-                            bounds[0],
-                            bounds[1],
-                            sentence,
-                            full_span,
-                            occupied,
+                    m_after = _AFTER_LINE_RE.match(after_text)
+                    if m_after and _is_valid_file_path(inner, has_line_spec=True):
+                        bounds = _parse_line_bounds(
+                            m_after.group("pstart") or m_after.group("astart"),
+                            m_after.group("pend") or m_after.group("aend"),
                         )
-                        continue
-
-                m_after = _AFTER_LINE_RE.match(after_text)
-                if m_after and _is_valid_file_path(inner, has_line_spec=True):
-                    bounds = _parse_line_bounds(
-                        m_after.group("pstart") or m_after.group("astart"),
-                        m_after.group("pend") or m_after.group("aend"),
-                    )
-                    if bounds is not None:
-                        full_span = (m_bt.start(), m_bt.end() + m_after.end())
-                        _record(
-                            sentence[full_span[0] : full_span[1]],
-                            inner,
-                            bounds[0],
-                            bounds[1],
-                            sentence,
-                            full_span,
-                            occupied,
-                        )
-                        continue
-
-                if _is_valid_file_path(inner, has_line_spec=False):
-                    _record(m_bt.group(0), inner, None, None, sentence, span, occupied)
-                else:
-                    # Mask non-path backticked code so bare token scanner doesn't pick inside it
-                    occupied.append(span)
-
-            # 2. Bare (unbackticked) line-numbered pointers via linear whitespace token scan
-            for m_tok in _WHITESPACE_TOKEN_RE.finditer(sentence):
-                raw_tok = m_tok.group(0)
-                if len(raw_tok) > _MAX_PATH_LEN + 30:
-                    continue
-                trimmed, l_trim, r_trim = _trim_bare_token(raw_tok)
-                if not trimmed:
-                    continue
-                tok_start = m_tok.start() + l_trim
-                tok_end = m_tok.end() - r_trim
-                span = (tok_start, tok_end)
-                if _span_overlaps_sorted(span, occupied):
-                    continue
-
-                # Check `path:42`, `path:10-25`, `path:L42`, `path#L10-L20`
-                path_part, s_line, e_line = _split_path_and_line_suffix(trimmed)
-                if s_line is not None and _is_valid_file_path(path_part, has_line_spec=True):
-                    _record(trimmed, path_part, s_line, e_line, sentence, span, occupied)
-                    continue
-
-                # Check `line 42 of path/to/file.py`
-                before_text = sentence[:tok_start]
-                m_line_of = _LINE_OF_PREFIX_RE.search(before_text)
-                if m_line_of and _is_valid_file_path(trimmed, has_line_spec=True):
-                    bounds = _parse_line_bounds(m_line_of.group("start"), m_line_of.group("end"))
-                    if bounds is not None:
-                        full_span = (m_line_of.start(), tok_end)
-                        if not _span_overlaps_sorted(full_span, occupied):
+                        if bounds is not None:
+                            full_span = (m_bt.start(), m_bt.end() + m_after.end())
                             _record(
                                 sentence[full_span[0] : full_span[1]],
-                                trimmed,
+                                inner,
                                 bounds[0],
                                 bounds[1],
                                 sentence,
@@ -866,26 +877,74 @@ def extract_pointer_claims(
                             )
                             continue
 
-                # Check `file.py (line 42)`, `file.py, line 42`, `file.py, L42`
-                after_text = sentence[tok_end:]
-                m_after = _AFTER_LINE_RE.match(after_text)
-                if m_after and _is_valid_file_path(trimmed, has_line_spec=True):
-                    bounds = _parse_line_bounds(
-                        m_after.group("pstart") or m_after.group("astart"),
-                        m_after.group("pend") or m_after.group("aend"),
-                    )
-                    if bounds is not None:
-                        full_span = (tok_start, tok_end + m_after.end())
-                        if not _span_overlaps_sorted(full_span, occupied):
-                            _record(
-                                sentence[full_span[0] : full_span[1]],
-                                trimmed,
-                                bounds[0],
-                                bounds[1],
-                                sentence,
-                                full_span,
-                                occupied,
-                            )
+                    if _is_valid_file_path(inner, has_line_spec=False):
+                        _record(m_bt.group(0), inner, None, None, sentence, span, occupied)
+                    else:
+                        # Mask non-path backticked code so bare token scanner doesn't pick inside it
+                        occupied.append(span)
+
+                # 2. Bare (unbackticked) line-numbered pointers via linear whitespace token scan
+                for m_tok in _WHITESPACE_TOKEN_RE.finditer(sentence):
+                    raw_tok = m_tok.group(0)
+                    if len(raw_tok) > _MAX_PATH_LEN + 30:
+                        continue
+                    trimmed, l_trim, r_trim = _trim_bare_token(raw_tok)
+                    if not trimmed:
+                        continue
+                    tok_start = m_tok.start() + l_trim
+                    tok_end = m_tok.end() - r_trim
+                    span = (tok_start, tok_end)
+                    if _span_overlaps_sorted(span, occupied):
+                        continue
+
+                    # Check `path:42`, `path:10-25`, `path:L42`, `path#L10-L20`
+                    path_part, s_line, e_line = _split_path_and_line_suffix(trimmed)
+                    if s_line is not None and _is_valid_file_path(path_part, has_line_spec=True):
+                        _record(trimmed, path_part, s_line, e_line, sentence, span, occupied)
+                        continue
+
+                    # Check `line 42 of path/to/file.py` (bounded 60-char slice for O(n) runtime)
+                    before_start = max(0, tok_start - 60)
+                    before_text = sentence[before_start:tok_start]
+                    m_line_of = _LINE_OF_PREFIX_RE.search(before_text)
+                    if m_line_of and _is_valid_file_path(trimmed, has_line_spec=True):
+                        bounds = _parse_line_bounds(
+                            m_line_of.group("start"), m_line_of.group("end")
+                        )
+                        if bounds is not None:
+                            full_span = (before_start + m_line_of.start(), tok_end)
+                            if not _span_overlaps_sorted(full_span, occupied):
+                                _record(
+                                    sentence[full_span[0] : full_span[1]],
+                                    trimmed,
+                                    bounds[0],
+                                    bounds[1],
+                                    sentence,
+                                    full_span,
+                                    occupied,
+                                )
+                                continue
+
+                    # Check `file.py (line 42)`, `file.py, line 42`, `file.py, L42`
+                    after_text = sentence[tok_end : tok_end + 60]
+                    m_after = _AFTER_LINE_RE.match(after_text)
+                    if m_after and _is_valid_file_path(trimmed, has_line_spec=True):
+                        bounds = _parse_line_bounds(
+                            m_after.group("pstart") or m_after.group("astart"),
+                            m_after.group("pend") or m_after.group("aend"),
+                        )
+                        if bounds is not None:
+                            full_span = (tok_start, tok_end + m_after.end())
+                            if not _span_overlaps_sorted(full_span, occupied):
+                                _record(
+                                    sentence[full_span[0] : full_span[1]],
+                                    trimmed,
+                                    bounds[0],
+                                    bounds[1],
+                                    sentence,
+                                    full_span,
+                                    occupied,
+                                )
 
     for bc in bare_candidates:
         if bc.file_path not in files_with_line_claims:
@@ -943,13 +1002,14 @@ _COMMAND_INVOCATION_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
-# B7 + B14: removed bare `returns` (matched "`fn(x)` returns a dict") and fixed colon cues!
+# B7 + B14 + R2-6: past-tense output cues (avoid present-tense feature descriptions like
+# "`cli.py` emits structured output:" matching example JSON schemas).
 _OUTPUT_ATTRIBUTION_RE = re.compile(
     r"(?:"
-    r"\b(?:stdout|stderr|printed|prints|logged|logs|emitted|emits|"
-    r"failed\s+with|error\s+message|traceback|reports|reported|produced|produces|"
+    r"\b(?:stdout|stderr|printed|logged|emitted|"
+    r"failed\s+with|error\s+message|traceback|reports|reported|produced|"
     r"output\s+(?:shows|is|contains|was))\b|"
-    r"\b(?:output|stdout|stderr|logs|shows|returned|printed|traceback)\s*:|"
+    r"(?<!structured\s)(?<!example\s)(?<!sample\s)(?<!json\s)\b(?:output|stdout|stderr|logs|shows|returned|printed|traceback)\s*:|"
     r"\breturned\s+`"
     r")",
     re.IGNORECASE,
@@ -975,6 +1035,15 @@ _CONTRAST_BETWEEN_RE = re.compile(
 
 _FENCE_SKIP_LANGS: frozenset[str] = frozenset({"diff", "patch"})
 _ELLIPSIS_PLACEHOLDER_RE = re.compile(r"(?:\.\.\.|<\w+>)")
+_TYPE_ANNOTATION_RE = re.compile(
+    r"^(?:dict|list|tuple|set|frozenset|Optional|Union|Callable|Sequence|Mapping|"
+    r"Iterable|Iterator|Literal|Type|ClassVar|Final|Annotated|Array|Record|Promise|"
+    r"Partial|Required|Readonly|Map|Set)\[[^\]]+\]$"
+)
+_SIMPLE_CALL_SHORTHAND_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*\([^()]*\)$")
+_SIMPLE_KWARG_ONLY_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*=(?:True|False|None|\d+|\"[^\"]*\"|'[^']*')$"
+)
 
 
 def _looks_like_diff_body(body: str) -> bool:
@@ -995,6 +1064,8 @@ def _is_multi_token_code_snippet(snippet: str) -> bool:
     if len(s) < 8 or len(s) > 400:
         return False
     if _SINGLE_IDENT_RE.fullmatch(s) or _CLI_FLAG_RE.fullmatch(s):
+        return False
+    if _TYPE_ANNOTATION_RE.fullmatch(s):
         return False
     if _is_valid_file_path(s, has_line_spec=False):
         return False
@@ -1029,19 +1100,30 @@ def _is_fenced_quote_candidate(
 
     if _SUGGESTION_OR_HYPOTHETICAL_QUOTE_RE.search(prev_context):
         return False, None, None, None
-    if block.lang in ("sh", "bash", "zsh", "shell", "console") and re.search(
-        r"\b(?:run|execute|install|usage|command)\s*:?\s*$", prev_context, re.IGNORECASE
-    ):
-        return False, None, None, None
+
+    has_output_attr = bool(_OUTPUT_ATTRIBUTION_RE.search(prev_context))
+    has_file_attr = bool(_FENCE_FILE_ATTRIBUTION_RE.search(prev_context))
+
+    # R2-6: Skip bash/shell CLI usage blocks unless explicitly introduced as command output
+    if block.lang in ("sh", "bash", "zsh", "shell", "console") and not has_output_attr:
+        first_nonempty = next(
+            (ln.strip().lstrip("$ ") for ln in body.splitlines() if ln.strip()), ""
+        )
+        if _SHELL_CMD_START_RE.match(first_nonempty) or re.search(
+            r"\b(?:run|execute|install|usage|command|flag|cli)\b", prev_context, re.IGNORECASE
+        ):
+            return False, None, None, None
 
     file_pointers = extract_pointer_claims(prev_context, base_dirs=base_dirs)
     if file_pointers:
         last_ptr = file_pointers[-1]
-        return True, last_ptr.file_path, last_ptr.start_line, last_ptr.end_line
+        # R2-6: Require either a line-numbered pointer OR explicit file/output attribution cue
+        # so "`src/cli.py` now supports a `--json` flag:\n```bash\n..." isn't treated as a quote.
+        if last_ptr.start_line is not None or has_file_attr or has_output_attr:
+            return True, last_ptr.file_path, last_ptr.start_line, last_ptr.end_line
+        return False, None, None, None
 
-    if _OUTPUT_ATTRIBUTION_RE.search(prev_context) or _FENCE_FILE_ATTRIBUTION_RE.search(
-        prev_context
-    ):
+    if has_output_attr or has_file_attr:
         return True, None, None, None
 
     return False, None, None, None
@@ -1152,6 +1234,13 @@ def extract_quote_claims(
                             assoc_start = chosen.start_line
                             assoc_end = chosen.end_line
                     elif not output_cue_before:
+                        # R2-5: Subject-position call/signature shorthand BEFORE the file pointer
+                        # ("`validate_token(token)` in `src/auth.py:3` checks the token.") is a
+                        # prose symbol reference, not a verbatim code quote.
+                        if _SIMPLE_CALL_SHORTHAND_RE.fullmatch(
+                            snippet
+                        ) or _SIMPLE_KWARG_ONLY_RE.fullmatch(snippet):
+                            continue
                         first_ptr = sentence_pointers[0]
                         ptr_pos = sentence.find(first_ptr.text)
                         between = sentence[m_bt.end() : ptr_pos] if ptr_pos != -1 else ""
@@ -1159,6 +1248,11 @@ def extract_quote_claims(
                             assoc_file = first_ptr.file_path
                             assoc_start = first_ptr.start_line
                             assoc_end = first_ptr.end_line
+                # R2-5: Skip bare `flag=True` / `strict=True` unless introduced by `sets`/`assigns`
+                if _SIMPLE_KWARG_ONLY_RE.fullmatch(snippet) and not re.search(
+                    r"\b(?:sets?|assigns?|uses?|with|from|to)\s+$", prefix, re.IGNORECASE
+                ):
+                    continue
 
                 key = (assoc_file, snippet)
                 if key not in seen:
@@ -1208,13 +1302,20 @@ def extract_quote_claims(
 _ABSENCE_STRONG_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"\bno\s+(?:other\s+|remaining\s+|further\s+|additional\s+|more\s+)?"
-        r"(?:callers?|references?|usages?|uses|occurrences?|instances?|hits|"
-        r"consumers?|importers?|implementations?|definitions?|entries)\b",
+        r"(?:callers?|usages?|uses|occurrences?|hits|importers?|implementations?|definitions?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bno\s+(?:other|remaining|further|additional|more)\s+references?\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bno\s+references?\b(?!\s+to\s+(?:global|local|external|internal|shared|mutable)\b)",
         re.IGNORECASE,
     ),
     re.compile(
         r"\b(?:zero|0)\s+(?:other\s+|remaining\s+)?"
-        r"(?:callers?|references?|usages?|matches|occurrences?|instances?|hits|results?)\b",
+        r"(?:callers?|references?|usages?|matches|occurrences?|hits|results?)\b",
         re.IGNORECASE,
     ),
     re.compile(
@@ -1248,10 +1349,9 @@ _ABSENCE_STRONG_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"(?:uses|calls|references|imports)\b",
         re.IGNORECASE,
     ),
-    re.compile(r"\bno\s+(?:todos?|fixmes?)\b", re.IGNORECASE),
 )
 
-# Contextual absence patterns (require absence of ordinary non-search prose continuations)
+# Contextual absence patterns (require genuine search/pagination/scope framing — never self-match)
 _ABSENCE_CONTEXTUAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"\bno\s+(?:other\s+|remaining\s+|further\s+|additional\s+|more\s+)?"
@@ -1263,6 +1363,7 @@ _ABSENCE_CONTEXTUAL_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"(?:issues?|items?|files?|prs?|pull\s+requests?|records?|pages?|tickets?|todos?)\b",
         re.IGNORECASE,
     ),
+    re.compile(r"\bno\s+(?:todos?|fixmes?)\b", re.IGNORECASE),
     re.compile(r"\bnone\s+found\b", re.IGNORECASE),
 )
 
@@ -1277,11 +1378,14 @@ _NON_SEARCH_ABSENCE_AFTER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# R2-4: Removed self-satisfying words ("found", "remaining", "there are", "exist") so ordinary
+# closing prose ("All tests pass and there are no remaining issues", "No further issues found")
+# is NOT mistaken for an unverified search/pagination absence claim.
 _SEARCH_OR_LISTING_VERB_RE = re.compile(
-    r"\b(?:found|find|search(?:ed|ing)?|grep(?:ped|ping)?|rg|list(?:ed|ing)?|"
-    r"checked|reviewed|inspected|scanned|audited|returned|shows?|showed|matching|"
-    r"exist|exists|remain|remains|remaining|there\s+(?:are|were)|repo|repository|"
-    r"codebase|project|anywhere|pages?|cursors?|gh\s+issue|gh\s+pr|tickets?)\b",
+    r"\b(?:search(?:ed|ing)?|grep(?:ped|ping)?|rg|list(?:ed|ing)?|"
+    r"reviewed\s+all|checked\s+all|scanned|audited|returned|shows?|showed|matching|"
+    r"repo|repository|codebase|project|anywhere|elsewhere|pages?|cursors?|"
+    r"gh\s+issue|gh\s+pr|tickets?|prs?|pull\s+requests?)\b",
     re.IGNORECASE,
 )
 
@@ -1293,7 +1397,8 @@ _COMPLETENESS_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"(?:(?:open|remaining|matching|active|\d+)\s+)?"
         r"(?:files?|pages?|results?|items?|matches|callers?|references?|usages?|issues?|"
         r"tickets?|prs?|pull\s+requests?|records?|entries|occurrences?|modules?|packages?|"
-        r"directories|folders?|endpoints?|handlers?|logs?|commits?|branches?|comments?)\b",
+        r"directories|folders?|endpoints?|handlers?|logs?|commits?|branches?|comments?)\b"
+        r"(?!\s+(?:you\s+(?:listed|mentioned|named|asked|specified|provided)|requested|specified))",
         re.IGNORECASE,
     ),
     re.compile(
@@ -1342,13 +1447,21 @@ _HEDGING_AFTER_RE = re.compile(
     re.IGNORECASE,
 )
 
-# B11: Explicit repo-wide wording overrides incidental path mentions ("besides `src/a.py`")
-_EXPLICIT_REPO_WIDE_RE = re.compile(
+# B11 + R2-3: Explicit repo-wide wording overrides incidental path mentions,
+# EXCEPT when "anywhere/elsewhere" is directly qualified by a specific dir/file.
+_EXPLICIT_REPO_WIDE_NOUN_RE = re.compile(
     r"\b(?:"
-    r"anywhere(?:\s+else)?|elsewhere|nowhere\s+else|"
     r"(?:in|across)\s+(?:the\s+)?(?:entire\s+|whole\s+|full\s+)?(?:repo|repository|codebase|project|workspace)|"
     r"(?:entire|whole|full)\s+(?:repo|repository|codebase|project|workspace)"
     r")\b",
+    re.IGNORECASE,
+)
+_ANYWHERE_RE = re.compile(r"\b(?:anywhere(?:\s+else)?|elsewhere|nowhere\s+else)\b", re.IGNORECASE)
+_SCOPED_AFTER_ANYWHERE_RE = re.compile(
+    r"^\s+(?:in|under|within|inside|across)\s+(?:the\s+)?"
+    r"(?!(?:entire\s+|whole\s+|full\s+)?(?:repo|repository|codebase|project|workspace)\b)"
+    r"(?:`[^`\n]+`|(?:[A-Za-z0-9_@.~-]+/)+[A-Za-z0-9_@.~-]*|[A-Za-z0-9_@.~-]+\.[A-Za-z0-9]+|"
+    r"[A-Za-z0-9_.-]+\s+(?:directory|dir|folder|package|module|file))",
     re.IGNORECASE,
 )
 
@@ -1466,7 +1579,13 @@ def _is_plausible_scope_path(candidate: str, *, allow_any_dir_name: bool = False
 
 def has_explicit_repo_wide_wording(sentence: str) -> bool:
     """Return True if the sentence explicitly claims repo-wide/codebase-wide coverage."""
-    return bool(_EXPLICIT_REPO_WIDE_RE.search(sentence))
+    if _EXPLICIT_REPO_WIDE_NOUN_RE.search(sentence):
+        return True
+    for m in _ANYWHERE_RE.finditer(sentence):
+        after = sentence[m.end() : m.end() + 80]
+        if not _SCOPED_AFTER_ANYWHERE_RE.match(after):
+            return True
+    return False
 
 
 def extract_scope_qualifiers(
@@ -1590,9 +1709,9 @@ def extract_scope_claims(
                     after = sentence[m.end() : m.end() + 45]
                     if _NON_SEARCH_ABSENCE_AFTER_RE.match(after):
                         continue
-                    # B8: contextual patterns ("no open issues", "no results", "no other files")
-                    # require search/listing/existence framing in the sentence.
-                    if not _SEARCH_OR_LISTING_VERB_RE.search(sentence):
+                    # B8 + R2-4: contextual patterns require search/listing/pagination framing
+                    # OR an explicit file/directory scope qualifier ("no TODOs in `src/a.py`").
+                    if not (qualifiers or _SEARCH_OR_LISTING_VERB_RE.search(sentence)):
                         continue
                     key = ("absence", sentence)
                     if key not in seen:

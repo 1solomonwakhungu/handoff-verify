@@ -34,16 +34,19 @@ from handoff_verify.verifiers._paths import (
 _T = TypeVar("_T")
 
 _GREP_CONTENT_LINE_RE = re.compile(r"^([^\s:][^:\n]*):(\d+)[:-]")
+_BARE_LINENUM_LINE_RE = re.compile(r"^(\d+)[:-]")
 _SIMPLE_COLON_LINE_END_RE = re.compile(r":(\d{1,6})$")
 _PY_TRACEBACK_FILE_RE = re.compile(r'File\s+"([^"]+)",\s+line\s+(\d+)')
 _EDIT_SNIPPET_LINE_RE = re.compile(r"^\s*(\d+)[→\t]")
 _EDIT_SUMMARY_VERB_RE = re.compile(
     r"\b(?:updated?|edited?|modif(?:y|ied)|fixed?|changed?|patched?|"
-    r"added?|removed?|deleted?|refactored?|wrote|written|created?|applied?|replaced?)\b",
+    r"added?|removed?|deleted?|refactored?|wrote|written|created?|applied?|replaced?|"
+    r"renamed?|moved?|migrated?|relocated?)\b",
     re.IGNORECASE,
 )
 _DELETE_SUMMARY_VERB_RE = re.compile(
-    r"\b(?:removed?|deleted?|dropped?|cleaned\s+up|unlinked?|rm)\b",
+    r"\b(?:removed?|deleted?|dropped?|cleaned\s+up|unlinked?|rm|"
+    r"renamed?|moved?|migrated?|relocated?|replaced?|now\s+live(?:s)?\s+in)\b",
     re.IGNORECASE,
 )
 
@@ -230,6 +233,17 @@ class _OutputLineIndex:
                 continue
             indexed_ev.add(search.event_index)
             self._scan_text(search.output, search.event_index)
+            # R2-7: single-file `grep -n` / `rg -n` prints `42:...` without a filename prefix
+            roots = search.search_paths or ([search.search_path] if search.search_path else [])
+            if len(roots) == 1:
+                target = roots[0]
+                base = posixpath.basename(target.rstrip("/"))
+                if "." in base and not base.startswith("."):
+                    for ln in split_lf_lines(search.output):
+                        m_num = _BARE_LINENUM_LINE_RE.match(ln)
+                        if m_num:
+                            with contextlib.suppress(ValueError):
+                                self._add(target, int(m_num.group(1)), search.event_index)
 
         for cmd in transcript.commands:
             if not cmd.has_result:
@@ -359,22 +373,60 @@ def _file_in_path_set(
     return any(paths_match(norm_c, obs, base_dirs=base_dirs) for obs in observed_paths)
 
 
-def _file_mentioned_in_commands(
+def _collect_moved_paths(
     commands: list[CommandEvent],
+    base_dirs: tuple[str, ...],
+) -> tuple[set[str], set[str]]:
+    """Collect (moved_sources, moved_destinations) from completed `mv` / `git mv` commands."""
+    sources: set[str] = set()
+    dests: set[str] = set()
+    for cmd in commands:
+        if not cmd.has_result or cmd.is_error or not cmd.command:
+            continue
+        try:
+            tokens = shlex.split(cmd.command)
+        except ValueError:
+            continue
+        if not tokens:
+            continue
+        prog = posixpath.basename(tokens[0])
+        if prog == "git" and len(tokens) >= 4 and tokens[1] == "mv":
+            args = [t for t in tokens[2:] if not t.startswith("-")]
+        elif prog == "mv" and len(tokens) >= 3:
+            args = [t for t in tokens[1:] if not t.startswith("-")]
+        else:
+            continue
+        if len(args) >= 2:
+            for src in args[:-1]:
+                norm_s = normalize_path(src, base_dirs=base_dirs)
+                if norm_s:
+                    sources.add(norm_s)
+            norm_d = normalize_path(args[-1], base_dirs=base_dirs)
+            if norm_d:
+                dests.add(norm_d)
+    return sources, dests
+
+
+def _file_mentioned_in_commands_or_tools(
+    transcript: ParsedTranscript,
     claimed_path: str,
     base_dirs: tuple[str, ...],
 ) -> bool:
-    """Return True if a completed command's stdout or invocation mentions the file path."""
+    """Return True if a completed command or tool output mentions the file path."""
     norm_c = normalize_path(claimed_path, base_dirs=base_dirs)
     if not norm_c:
         return False
     pattern = re.compile(r"(?:^|[\s`'\"(/:=])" + re.escape(norm_c) + r"(?:$|[\s`'\"):,;\r\n])")
-    for cmd in commands:
+    for cmd in transcript.commands:
         if not cmd.has_result:
             continue
         if not cmd.is_error and cmd.command and pattern.search(cmd.command):
             return True
         if not cmd.is_error and cmd.stdout and pattern.search(cmd.stdout):
+            return True
+    # NB: also check completed non-errored tool outputs (e.g., Task/subagent relaying file path)
+    for ev in transcript.events:
+        if ev.has_result and not ev.is_error and ev.raw_output and pattern.search(ev.raw_output):
             return True
     return False
 
@@ -537,7 +589,8 @@ def verify_pointers(
     output_line_index = _OutputLineIndex(transcript, base_dirs)
     search_observed_paths = _collect_search_observed_paths(valid_searches, base_dirs)
     ls_observed_paths = _collect_ls_joined_paths(transcript.commands, base_dirs)
-    all_listed_paths = search_observed_paths | ls_observed_paths
+    moved_sources, moved_dests = _collect_moved_paths(transcript.commands, base_dirs)
+    all_listed_paths = search_observed_paths | ls_observed_paths | moved_sources | moved_dests
 
     findings: list[Finding] = []
     live_file_cache: dict[Path, list[str] | None] = {}
@@ -584,7 +637,7 @@ def verify_pointers(
             and not reads
             and not edits
             and not in_searches
-            and not _file_mentioned_in_commands(transcript.commands, claimed_path, base_dirs)
+            and not _file_mentioned_in_commands_or_tools(transcript, claimed_path, base_dirs)
         ):
             if repo_root is None:
                 continue
@@ -629,7 +682,7 @@ def verify_pointers(
             in_commands = (
                 False
                 if (reads or edits or in_searches)
-                else _file_mentioned_in_commands(transcript.commands, claimed_path, base_dirs)
+                else _file_mentioned_in_commands_or_tools(transcript, claimed_path, base_dirs)
             )
             if not reads and not edits and not in_searches and not in_commands:
                 unread_fired = True
@@ -655,7 +708,9 @@ def verify_pointers(
         stale_fired = False
         last_edit = edits[-1] if edits else None
         last_read = reads[-1] if reads else None
-        is_deleted_in_transcript = last_edit is not None and last_edit.operation == "delete"
+        is_deleted_in_transcript = (
+            last_edit is not None and last_edit.operation == "delete"
+        ) or _file_in_path_set(claimed_path, moved_sources, base_dirs)
 
         if not unread_fired:
             # NB7: include same-event-index `bash_modify` (`cat f && sed -i ... f`)
@@ -798,31 +853,52 @@ def verify_pointers(
                     if not unknown_untruncated_read and not _window_covers(
                         merged_post, c_start, c_end
                     ):
-                        pre_windows = [w for r in reads if (w := _read_event_window(r)) is not None]
+                        pre_reads = [r for r in reads if r.event_index <= last_edit.event_index]
+                        pre_windows = [
+                            w for r in pre_reads if (w := _read_event_window(r)) is not None
+                        ]
                         merged_pre = _merge_windows(pre_windows)
-                        if _window_covers(merged_pre, c_start, c_end) and not stale_fired:
-                            stale_fired = True
-                            findings.append(
-                                Finding(
-                                    severity="error",
-                                    code="STALE_FILE_READ",
-                                    claim=claim,
-                                    evidence={
-                                        "file_path": norm_path,
-                                        "claimed_range": [c_start, c_end],
-                                        "last_edit_event_index": last_edit.event_index,
-                                        "post_edit_windows": [[s, e] for s, e in merged_post],
-                                    },
-                                    message=(
-                                        f"Cited `{norm_path}` lines {c_start}-{c_end}, which were "
-                                        f"only read before event #{last_edit.event_index} "
-                                        f"and not re-read afterward."
-                                    ),
-                                    suggestion=_format_uncovered_suggestion(
-                                        norm_path, c_start, c_end, merged_post
-                                    ),
+                        if _window_covers(merged_pre, c_start, c_end):
+                            # R2-1: Simulate edits from the last pre-edit read so unshifted lines
+                            # above the edit (or same-line-count edits) stay valid even after a
+                            # partial post-edit re-read of another region!
+                            last_pre_read = pre_reads[-1] if pre_reads else None
+                            intervening_edits = [
+                                e
+                                for e in edits
+                                if last_pre_read is None
+                                or e.event_index > last_pre_read.event_index
+                                or (
+                                    e.event_index == last_pre_read.event_index
+                                    and e.operation == "bash_modify"
                                 )
+                            ]
+                            pre_sim = _simulate_edits_after_read(
+                                last_pre_read, intervening_edits, set()
                             )
+                            if _is_line_range_stale(pre_sim, c_start, c_end) and not stale_fired:
+                                stale_fired = True
+                                findings.append(
+                                    Finding(
+                                        severity="error",
+                                        code="STALE_FILE_READ",
+                                        claim=claim,
+                                        evidence={
+                                            "file_path": norm_path,
+                                            "claimed_range": [c_start, c_end],
+                                            "last_edit_event_index": last_edit.event_index,
+                                            "post_edit_windows": [[s, e] for s, e in merged_post],
+                                        },
+                                        message=(
+                                            f"Cited `{norm_path}` lines {c_start}-{c_end}, which "
+                                            f"were only read before event #{last_edit.event_index} "
+                                            f"and not re-read afterward."
+                                        ),
+                                        suggestion=_format_uncovered_suggestion(
+                                            norm_path, c_start, c_end, merged_post
+                                        ),
+                                    )
+                                )
                         else:
                             win_post = ", ".join(f"{s}-{e}" for s, e in merged_post) or "none"
                             findings.append(

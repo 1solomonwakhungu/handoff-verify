@@ -137,23 +137,50 @@ def _extract_claim_query_terms(
     claim: Claim,
     claimed_scopes: list[str],
     base_dirs: tuple[str, ...],
+    excluded_dirs: set[str] | None = None,
 ) -> list[str]:
-    """Extract backticked symbol/query terms from a claim (excluding scope paths and commands)."""
-    scope_set = {normalize_path(s, base_dirs=base_dirs) for s in claimed_scopes}
+    """Extract backticked symbol/query terms from a claim (excluding scope/excluded paths)."""
+    scope_set = {normalize_path(s, base_dirs=base_dirs).lower() for s in claimed_scopes}
+    excl_set = {d.lower() for d in (excluded_dirs or set())}
+    ctx = claim.context or ""
     terms: list[str] = []
     seen: set[str] = set()
-    for m in _BACKTICK_TERM_RE.finditer(claim.context or ""):
+    for m in _BACKTICK_TERM_RE.finditer(ctx):
         raw = m.group(1).strip()
         if not raw or " " in raw or "/" in raw:
             continue
-        norm = normalize_path(raw, base_dirs=base_dirs)
-        if norm in scope_set:
+        # Skip terms immediately preceded by exclusion/location prepositions ("outside `legacy`")
+        pre = ctx[max(0, m.start() - 25) : m.start()]
+        if re.search(
+            r"\b(?:outside(?:\s+of)?|excluding|except|apart\s+from|other\s+than|"
+            r"in|under|within|inside)\s+$",
+            pre,
+            re.IGNORECASE,
+        ):
+            continue
+        norm = normalize_path(raw, base_dirs=base_dirs).lower()
+        if norm in scope_set or norm in excl_set:
             continue
         low = raw.lower()
         if low not in seen:
             seen.add(low)
             terms.append(raw)
     return terms
+
+
+def _is_listing_only_search(search: SearchEvent) -> bool:
+    """Return True if a SearchEvent only listed filenames (Glob/LS/find/fd without content grep)."""
+    tool_low = search.tool_name.lower()
+    base_tool = tool_low.rsplit(":", 1)[-1]
+    if base_tool not in _LISTING_ONLY_TOOLS:
+        return False
+    # R2-8 caveat: `find ... | xargs grep` / `find ... -exec grep` IS a content search
+    raw_cmd = ""
+    if isinstance(search.raw_input, dict):
+        cmd_val = search.raw_input.get("command") or search.raw_input.get("cmd")
+        if isinstance(cmd_val, str):
+            raw_cmd = cmd_val
+    return not (raw_cmd and re.search(r"\b(?:grep|rg|ripgrep|ag|ack|git\s+grep)\b", raw_cmd))
 
 
 def _search_matches_terms(search: SearchEvent, terms: list[str]) -> bool:
@@ -165,6 +192,12 @@ def _search_matches_terms(search: SearchEvent, terms: list[str]) -> bool:
         t_low = term.lower()
         if t_low in q_low or (len(q_low) >= 3 and q_low in t_low):
             return True
+        # Also support regex queries like `legacy_(auth|login)` matching `legacy_auth`
+        try:
+            if re.search(search.query, term, re.IGNORECASE):
+                return True
+        except re.error:
+            pass
     return False
 
 
@@ -342,7 +375,7 @@ def verify_scope(
     ]
     valid_paginations = [p for p in transcript.paginations if p.has_result and not p.is_error]
 
-    content_searches = [s for s in valid_searches if s.tool_name.lower() not in _LISTING_ONLY_TOOLS]
+    content_searches = [s for s in valid_searches if not _is_listing_only_search(s)]
     has_listing_cmd = _has_listing_command_evidence(transcript.commands)
 
     findings: list[Finding] = []
@@ -536,12 +569,41 @@ def verify_scope(
 
         relevant_searches = content_searches if prefers_content_search else valid_searches
 
-        # B10 + B12: Tie evidence to the claimed symbol/query term when present!
-        claim_terms = _extract_claim_query_terms(claim, claimed_scopes, base_dirs)
+        # B10 + B12 + R2-8: Tie evidence to the claimed symbol/query term when present!
+        all_excl_names = {
+            _normalize_excluded_dir(d) for s in relevant_searches for d in s.excluded_dirs
+        }
+        claim_terms = _extract_claim_query_terms(
+            claim, claimed_scopes, base_dirs, excluded_dirs=all_excl_names
+        )
         if claim_terms:
             query_matched = [s for s in relevant_searches if _search_matches_terms(s, claim_terms)]
             if query_matched:
                 relevant_searches = query_matched
+            elif prefers_content_search and all(bool(s.query) for s in relevant_searches):
+                # R2-8: An unrelated root Grep (e.g. `import os`) cannot verify
+                # "no callers of `legacy_auth` anywhere in the repo".
+                _emit(
+                    "no_matching_query:" + ",".join(sorted(t.lower() for t in claim_terms)),
+                    Finding(
+                        severity="error",
+                        code="NO_SEARCH_EVIDENCE",
+                        claim=claim,
+                        evidence={
+                            "claimed_terms": claim_terms,
+                            "observed_queries": [s.query for s in relevant_searches],
+                        },
+                        message=(
+                            f"Claimed `{claim.text}` for `{', '.join(claim_terms)}`, but no "
+                            f"search in the transcript queried that term."
+                        ),
+                        suggestion=(
+                            f"Run a repository-wide search for `{claim_terms[0]}` before "
+                            f"claiming absence."
+                        ),
+                    ),
+                )
+                continue
 
         # --- 4. Truncated search / output check ---
         unresolved_truncated = [
