@@ -154,6 +154,8 @@ def test_cli_hook_claude_code_advise_and_block(
 
 
 def test_cli_hook_claude_code_subprocess_clean_and_fail_open(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "src" / "app.py").write_text("def run():\n    return 1\n", encoding="utf-8")
     transcript = _write_sample_claude_transcript(tmp_path / "session.jsonl")
     clean_payload = json.dumps(
         {
