@@ -47,6 +47,10 @@ _CODEX_ERROR_PREFIXES = (
     "patch rejected by user",
     "command aborted by user",
     "aborted by user",
+    "aborted before dispatch",
+    "approval policy",
+    "unsupported call:",
+    "failed to parse function arguments:",
     "command timed out",
     "execution timed out",
     "rejected by user",
@@ -361,7 +365,7 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
         # parse errors, and still-running sessions (`Process running with session ID N`).
         cmd_is_error = is_error or (
             exit_code is None
-            and not clean_out.lstrip().lower().startswith("process running with session id")
+            and not call.raw_output.lstrip().lower().startswith("process running with session id")
         )
 
         ev_cmd = CommandEvent(
@@ -522,7 +526,10 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
         lines = [
             line.strip()
             for line in split_lf_lines(clean_out)
-            if line.strip() and not is_truncation_banner_line(line)[0]
+            if line.strip()
+            and line.strip().lower().rstrip(".")
+            not in ("no matches found", "no files found", "no matching files found")
+            and not is_truncation_banner_line(line)[0]
         ]
         matched_files: list[str] = []
         seen: set[str] = set()

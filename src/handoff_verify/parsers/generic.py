@@ -287,6 +287,7 @@ def parse_generic(
                 derived = analyze_shell_command(
                     command=command,
                     stdout=stdout,
+                    stderr=stderr,
                     event_id=event_id,
                     event_index=event_index,
                     tool_name=ev_cmd.tool_name,

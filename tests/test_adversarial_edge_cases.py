@@ -1785,3 +1785,163 @@ def test_rereview3_2_piped_shell_errors_and_non_direct_failures_and_polish() -> 
     assert detect_truncation("(output omitted)")[0] is True
     assert detect_truncation("(rest omitted)")[0] is True
     assert detect_truncation("File exceeded token budget")[0] is True
+
+
+# --- Re-review #4 regression tests ---
+
+
+def test_rereview4_shell_cd_path_qualified_find_stderr_and_glued_flags() -> None:
+    # 1. Path-qualified shell / (eval): failures, find/fd failures, and stderr-only errors
+    failed_lines = _jsonl(
+        [
+            {
+                "type": "command",
+                "command": "cd srcc && rg foo",
+                "stdout": "(eval):cd:1: no such file or directory: srcc\n",
+                "exit_code": 1,
+            },
+            {
+                "type": "command",
+                "command": "cd srcc && grep -rn foo .",
+                "stdout": "/bin/bash: line 0: cd: srcc: No such file or directory\n",
+                "exit_code": 1,
+            },
+            {
+                "type": "command",
+                "command": "rg foo src | head",
+                "stdout": "/bin/sh: 1: rg: not found\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "find srcc -name '*.py' | wc -l",
+                "stdout": "find: srcc: No such file or directory\n0\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "fd -e py src | head",
+                "stdout": "zsh:1: command not found: fd\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "rg foo srcc | head -20",
+                "stdout": "",
+                "stderr": "rg: srcc: IO error: No such file or directory\n",
+                "exit_code": 0,
+            },
+        ]
+    )
+    p_fail = parse_generic(failed_lines)
+    assert p_fail.searches == []
+    assert build_scope_receipt(p_fail).searched_roots == []
+
+    # 2. Glued short-flag values (`-trust`, `-g!vendor`), non-over-suppressed matches,
+    #    and dot-directory preservation (`./.git` -> `.git`)
+    ok_lines = _jsonl(
+        [
+            {
+                "type": "command",
+                "command": "rg -trust foo src",
+                "stdout": "src/a.rs:1:foo\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "rg -g!vendor foo src",
+                "stdout": "src/a.py:1:foo\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "rg 'command not found' docs",
+                "stdout": "docs/faq.md:5:If you see command not found, install uv.\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "grep fatal app.log",
+                "stdout": "fatal: disk 90% full\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "find . -path ./.git -prune -o -name '*.py'",
+                "stdout": "./a.py\n",
+                "exit_code": 0,
+            },
+        ]
+    )
+    p_ok = parse_generic(ok_lines)
+    assert (p_ok.searches[0].query, p_ok.searches[0].search_paths) == ("foo", ["src"])
+    assert (p_ok.searches[1].query, p_ok.searches[1].search_paths) == ("foo", ["src"])
+    assert p_ok.searches[1].excluded_dirs == ["vendor"]
+    assert p_ok.searches[2].match_count == 1
+    assert p_ok.searches[2].truncated is False
+    assert p_ok.searches[3].match_count == 1
+    assert p_ok.searches[4].excluded_dirs == [".git"]
+
+    # 3. Codex non-shell tools reject `aborted before dispatch`, `grep_files` handles
+    #    `No matches found.`, and still-running session keeps `is_error=False`
+    codex_misc = _jsonl(
+        [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "rf_ab",
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "secret.py"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "rf_ab",
+                    "output": "aborted before dispatch",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "gf_none",
+                    "name": "grep_files",
+                    "arguments": json.dumps({"pattern": "nope", "path": "src"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "gf_none",
+                    "output": "No matches found.",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "run_sess",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "rg foo /"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "run_sess",
+                    "output": "Process running with session ID 42\nOutput:\n",
+                },
+            },
+        ]
+    )
+    p_cx = parse_codex(codex_misc)
+    assert p_cx.file_reads == []
+    assert len(p_cx.searches) == 1
+    assert p_cx.searches[0].match_count == 0
+    assert p_cx.searches[0].matched_files == []
+    assert p_cx.commands[0].is_error is False

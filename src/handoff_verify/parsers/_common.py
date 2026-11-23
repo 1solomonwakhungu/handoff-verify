@@ -1333,9 +1333,10 @@ _GREP_TOOL_ERROR_RE = re.compile(
 )
 _BINARY_MATCH_RE = re.compile(r"\bbinary\s+file\s+matches\b", re.IGNORECASE)
 _SHELL_ERROR_LINE_RE = re.compile(
-    r"^(?:fatal:\s+|(?:zsh|bash|sh|dash|ksh|fish)(?::[^:\n]+)*:\s*"
-    r".*(?:command not found|not found|no such file or directory|permission denied)"
-    r"|.*\bcommand not found\b)",
+    r"^(?:fatal:\s+(?:not a git repository|ambiguous argument|bad revision|"
+    r"unable to|cannot |invalid )"
+    r"|(?:(?:/[^\s:]+/)?(?:zsh|bash|sh|dash|ksh|fish)|\(eval\))(?::[^:\n]+)*:\s*"
+    r".*(?:command not found|not found|no such file or directory|permission denied))",
     re.IGNORECASE,
 )
 _FATAL_TOOL_ERROR_DETAIL_RE = re.compile(
@@ -1477,6 +1478,7 @@ def analyze_shell_command(
     *,
     command: str,
     stdout: str,
+    stderr: str = "",
     event_id: str,
     event_index: int,
     tool_name: str,
@@ -1594,6 +1596,7 @@ def analyze_shell_command(
                 active_subdir=active_subdir,
                 sole_command=sole_command,
                 stdout=stdout,
+                stderr=stderr,
                 event_id=event_id,
                 event_index=event_index,
                 tool_name=tool_name,
@@ -1635,6 +1638,7 @@ def analyze_shell_command(
                 active_subdir=active_subdir,
                 sole_command=sole_command,
                 stdout=stdout,
+                stderr=stderr,
                 event_id=event_id,
                 event_index=event_index,
                 tool_name=tool_name,
@@ -1657,6 +1661,7 @@ def analyze_shell_command(
                 active_subdir=active_subdir,
                 sole_command=sole_command,
                 stdout=stdout,
+                stderr=stderr,
                 event_id=event_id,
                 event_index=event_index,
                 tool_name=tool_name,
@@ -1942,6 +1947,7 @@ def _analyze_search_tokens(
     active_subdir: str | None,
     sole_command: bool,
     stdout: str,
+    stderr: str = "",
     event_id: str,
     event_index: int,
     tool_name: str,
@@ -1954,15 +1960,20 @@ def _analyze_search_tokens(
     truncation_reason: str | None,
 ) -> None:
     # Only treat an errored search as "no matches" when exit_code is explicitly 1
-    # (never when exit_code is None from user rejection / timeout / aborted execution).
+    # AND stdout/stderr carry no error text (e.g. failed `cd` or missing path).
+    combined_err_stream = f"{stdout}\n{stderr}" if stderr else stdout
     if is_error:
         if exit_code != 1:
             return
-        cleaned_err = _strip_exit_code_lines(stdout).strip()
-        if cleaned_err and any(_is_search_error_line(line) for line in split_lf_lines(cleaned_err)):
+        cleaned_err = _strip_exit_code_lines(combined_err_stream).strip()
+        if cleaned_err:
             return
     elif exit_code not in (0, 1, None):
         return
+    elif exit_code == 1:
+        cleaned_err = _strip_exit_code_lines(combined_err_stream).strip()
+        if cleaned_err and any(_is_search_error_line(line) for line in split_lf_lines(cleaned_err)):
+            return
 
     if search_cmd == "rg":
         value_flags = _COMMON_SEARCH_VALUE_FLAGS | _RG_ONLY_VALUE_FLAGS
@@ -2062,19 +2073,49 @@ def _analyze_search_tokens(
             if tok in value_flags and i + 1 < len(tokens):
                 i += 2
                 continue
-            # Combined short flags like `-rnq`, `-rnc`, `-rnA 3`
+            # Combined short flags: walk left to right; the first value-taking char ends
+            # the cluster (remainder is its glued value, e.g. `-trust`, `-g!vendor`).
+            # Only consume `tokens[i + 1]` if the value char is last (e.g. `-rnA 3`).
             if not tok.startswith("--") and len(tok) > 2:
                 short_non_match = ("q", "c", "v") if search_cmd == "rg" else ("q", "c", "v", "L")
-                if any(ch in tok[1:] for ch in short_non_match):
-                    count_unknown = True
-                if "l" in tok[1:]:
-                    files_only_mode = True
-                # If the trailing short flag takes a value (e.g. `-rnA 3`), consume next token
-                if tok[-1] in short_value_chars and i + 1 < len(tokens):
-                    if tok[-1] == "e":
-                        query = tokens[i + 1]
-                    i += 2
-                    continue
+                flags_body = tok[1:]
+                consumed_next = False
+                for idx_c, ch in enumerate(flags_body):
+                    if ch in short_value_chars:
+                        glued = flags_body[idx_c + 1 :]
+                        if glued:
+                            if ch == "e":
+                                query = glued
+                            elif ch == "g":
+                                if glued.startswith("!"):
+                                    excluded_dirs.append(glued[1:].strip("/").removesuffix("/**"))
+                                else:
+                                    glob_pattern = glued
+                            elif ch == "m" and glued.isdigit() and result_limit is None:
+                                val_m = int(glued)
+                                if val_m > 0:
+                                    result_limit = val_m
+                        elif i + 1 < len(tokens):
+                            if ch == "e":
+                                query = tokens[i + 1]
+                            elif ch == "g":
+                                nxt = tokens[i + 1]
+                                if nxt.startswith("!"):
+                                    excluded_dirs.append(nxt[1:].strip("/").removesuffix("/**"))
+                                else:
+                                    glob_pattern = nxt
+                            elif ch == "m" and result_limit is None:
+                                val_m_opt = safe_int(tokens[i + 1])
+                                if val_m_opt is not None and val_m_opt > 0:
+                                    result_limit = val_m_opt
+                            consumed_next = True
+                        break
+                    if ch in short_non_match:
+                        count_unknown = True
+                    if ch == "l":
+                        files_only_mode = True
+                i += 2 if consumed_next else 1
+                continue
             i += 1
             continue
 
@@ -2108,6 +2149,8 @@ def _analyze_search_tokens(
             files_only_mode=files_only_mode,
             single_target_path=single_target,
         )
+        if stderr and any(_is_search_error_line(line) for line in split_lf_lines(stderr)):
+            saw_tool_error = True
         if saw_tool_error and parsed_count == 0:
             # Complete failure (e.g. missing path, command not found, git fatal error):
             # never record a failed search as a clean zero-match search.
@@ -2115,8 +2158,8 @@ def _analyze_search_tokens(
         match_count = None if saw_tool_error else parsed_count
     else:
         # Even on non-direct pipes (`| wc -l`, `|| true`, `; echo done`, `-rc | head`),
-        # abort if stdout carries a fatal command/path error so missing roots aren't recorded.
-        if any(_is_fatal_search_error_line(line) for line in split_lf_lines(stdout)):
+        # abort if stdout/stderr has a fatal command/path error so missing roots aren't recorded.
+        if any(_is_fatal_search_error_line(line) for line in split_lf_lines(combined_err_stream)):
             return
         matched_files = []
         match_count = None
@@ -2167,6 +2210,7 @@ def _analyze_find_tokens(
     active_subdir: str | None,
     sole_command: bool,
     stdout: str,
+    stderr: str = "",
     event_id: str,
     event_index: int,
     tool_name: str,
@@ -2237,7 +2281,7 @@ def _analyze_find_tokens(
                     i + 2 < len(tokens) and tokens[i + 2] == "-prune"
                 )
                 if negated or is_pruned:
-                    cleaned_pat = tokens[i + 1].lstrip("./").strip("*/")
+                    cleaned_pat = tokens[i + 1].removeprefix("./").strip("*/")
                     if cleaned_pat:
                         excluded_dirs.append(cleaned_pat)
                 negated = False
@@ -2300,8 +2344,11 @@ def _analyze_find_tokens(
 
     direct_output = sole_command and not _has_transforming_pipe(pipe_segments)
     cleaned_stdout = _strip_exit_code_lines(stdout)
+    combined_err_stream = f"{cleaned_stdout}\n{stderr}" if stderr else cleaned_stdout
     lines: list[str] = []
-    saw_find_error = False
+    saw_find_error = bool(
+        stderr and any(_is_search_error_line(line) for line in split_lf_lines(stderr))
+    )
     if direct_output:
         for line in split_lf_lines(cleaned_stdout):
             s = line.strip()
@@ -2309,11 +2356,13 @@ def _analyze_find_tokens(
                 continue
             if is_truncation_banner_line(s)[0]:
                 continue
-            if _GREP_TOOL_ERROR_RE.match(s):
+            if _is_search_error_line(s):
                 saw_find_error = True
                 continue
             lines.append(s)
-    if saw_find_error and not lines:
+        if saw_find_error and not lines:
+            return
+    elif any(_is_fatal_search_error_line(line) for line in split_lf_lines(combined_err_stream)):
         return
     match_count: int | None = len(lines) if (direct_output and not saw_find_error) else None
 

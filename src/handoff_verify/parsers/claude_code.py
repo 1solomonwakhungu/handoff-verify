@@ -552,6 +552,7 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
         derived = analyze_shell_command(
             command=command,
             stdout=stdout,
+            stderr=stderr,
             event_id=call.event_id,
             event_index=call.event_index,
             tool_name=name,
