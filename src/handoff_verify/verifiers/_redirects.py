@@ -530,19 +530,20 @@ def collect_redirected_reads(
                     end_line = parsed.end_line
                     content = parsed.content
                     line_count = parsed.line_count
-            elif (
-                src.exact_line_mapping
-                and src.start_line is not None
-                and read.start_line is not None
-                and read.end_line is not None
-            ):
-                eff_start = src.start_line + read.start_line - 1
-                eff_end = src.start_line + read.end_line - 1
-                if src.end_line is not None:
-                    eff_end = min(eff_end, src.end_line)
-                if eff_end >= eff_start >= 1:
-                    start_line = eff_start
-                    end_line = eff_end
+            elif src.exact_line_mapping and src.start_line is not None:
+                if read.start_line is not None and read.end_line is not None:
+                    eff_start = src.start_line + read.start_line - 1
+                    eff_end = src.start_line + read.end_line - 1
+                    if src.end_line is not None:
+                        eff_end = min(eff_end, src.end_line)
+                    if eff_end >= eff_start >= 1:
+                        start_line = eff_start
+                        end_line = eff_end
+                elif not is_partial_unknown and not read.truncated:
+                    # Full compound read-back (`sed -n '10,12p' a.py > /tmp/s && cat /tmp/s`):
+                    # bound the read window to the redirected sed/head slice rather than unbounded.
+                    start_line = src.start_line
+                    end_line = src.end_line
 
             # Never synthesize an untruncated unknown-window read from a truncated/tail partial
             # read-back (which would falsely accept every line in the file).

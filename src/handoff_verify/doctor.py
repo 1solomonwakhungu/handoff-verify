@@ -90,6 +90,10 @@ def _extract_hook_executable(command: str) -> str | None:
 
     target_seg: list[str] | None = None
     for seg in segments:
+        # Skip `cd /path/to/handoff-verify` segments even though the path contains the name.
+        first_cmd = next((t for t in seg if not _ENV_ASSIGN_RE.match(t)), "")
+        if first_cmd == "cd":
+            continue
         if any("handoff-verify" in t.lower() or "handoff_verify" in t.lower() for t in seg):
             target_seg = seg
             break

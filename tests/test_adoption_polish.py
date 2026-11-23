@@ -214,6 +214,17 @@ def test_redirected_sed_and_tee_readback_ground_pointers_and_quotes(tmp_path: Pa
     ]
     assert ("error", "UNREAD_FILE") in _codes(tmp_path, tail_readback)
 
+    # 11. Compound `sed -n '10,12p' ... > /tmp/s.log && cat /tmp/s.log` stays bounded to 10-12
+    compound_cat_oob = [
+        *_bash(
+            "b1",
+            "sed -n '10,12p' src/tax.py > /tmp/s.log && cat /tmp/s.log",
+            "line10\nline11\nline12\n",
+        ),
+        _final("`src/tax.py:300` computes discounts."),
+    ]
+    assert ("error", "LINE_OUT_OF_READ_WINDOW") in _codes(tmp_path, compound_cat_oob)
+
 
 # --- 1B: grep -n / rg -n context & adjacent lines ---
 
@@ -378,14 +389,15 @@ def test_negated_mentions_ignored_while_passive_unread_still_caught(tmp_path: Pa
         *_read("r1", "/repo/src/app.py", "     1→def main():\n     2→    return 0\n"),
         _final(
             "Checked `src/app.py:1-2`. "
-            "`src/app.py:99` does not exist, there is no `foo.py:42`, "
-            "`bar.py` wasn't found, and `baz.py:10` doesn't exist."
+            "`src/app.py:99` does not exist, the file at `src/other.py:5` does not exist, "
+            "there is no `foo.py:42`, `bar.py` wasn't found, and `baz.py:10` doesn't exist."
         ),
     ]
     assert _codes(tmp_path, clean_negated) == []
 
     # Code-review findings with "is missing <X>", ": missing <X>", "are missing <X>",
-    # "missing: path:line", "without path:line", or later-clause "not found" MUST STILL FAIL!
+    # prepositional locatives ("The null check at `file:42` is missing."), "missing: path:line",
+    # "without path:line", or later-clause "not found" MUST STILL FAIL!
     for fabricated in (
         "In `src/api/handler.py:42`, missing keys return 404 not found.",
         "`src/api/handler.py:42` is missing a null check.",
@@ -393,12 +405,19 @@ def test_negated_mentions_ignored_while_passive_unread_still_caught(tmp_path: Pa
         "`a.py:10` and `b.py:20` are missing validation.",
         "The guard was missing: `src/x.py:42`.",
         "Without `src/config.py:12` the fallback breaks.",
+        "The null check at `src/api/handler.py:42` is missing.",
+        "Validation in `src/x.py:42` was not found.",
+        "The import at `src/app.py:3` no longer exists.",
     ):
         still_caught = [
             *_read("r1", "/repo/src/app.py", "     1→def main():\n     2→    return 0\n"),
             _final(fabricated),
         ]
-        assert ("error", "UNREAD_FILE") in _codes(tmp_path, still_caught), fabricated
+        found = _codes(tmp_path, still_caught)
+        assert any(
+            sev == "error" and code in ("UNREAD_FILE", "LINE_OUT_OF_READ_WINDOW")
+            for sev, code in found
+        ), f"{fabricated!r} -> {found}"
 
 
 # --- 1E: Non-code absence phrases ---
@@ -409,8 +428,9 @@ def test_noncode_absence_phrases_ignored_while_code_usage_caught(tmp_path: Path)
         *_read("r1", "/repo/src/app.py", "     1→def main():\n     2→    return 0\n"),
         _final(
             "Verified `src/app.py:1-2`. "
-            "There is no usage limit, no usage docs needed, no open issue for this, "
-            "no open PRs blocking merge, no errors, no warnings, and no changes elsewhere."
+            "There is no usage limit, no usage docs needed, no usage in production yet, "
+            "no open issue for this, no open PRs blocking merge, no errors, no warnings, "
+            "and no changes elsewhere."
         ),
     ]
     assert _codes(tmp_path, clean_prose) == []
@@ -592,7 +612,8 @@ def test_doctor_checks_all_states_and_json_cli(
     assert rep_old_py.has_errors is True
     assert "[ERROR] python_version" in format_doctor_text(rep_old_py)
 
-    # 6. Env-prefixed and compound shell hook commands resolve executable properly (not FOO=1 / cd)
+    # 6. Env-prefixed and compound shell hook commands resolve executable properly
+    #    (even when `cd` targets a directory named `handoff-verify`).
     settings.write_text(
         json.dumps(
             {
@@ -602,7 +623,10 @@ def test_doctor_checks_all_states_and_json_cli(
                             "hooks": [
                                 {
                                     "type": "command",
-                                    "command": "cd /tmp && FOO=1 handoff-verify hook claude-code",
+                                    "command": (
+                                        "cd ~/Projects/handoff-verify && "
+                                        "FOO=1 handoff-verify hook claude-code"
+                                    ),
                                 }
                             ]
                         }

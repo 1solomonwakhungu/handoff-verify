@@ -568,6 +568,18 @@ _NONEXISTENT_BARE_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Locative prepositions before a pointer indicate the pointer is a location modifier
+# ("The null check at `src/api/handler.py:42` is missing"), NOT the subject of the
+# negation—unless the head noun is explicitly file/path/line/entry/module.
+_LOCATIVE_PREP_BEFORE_RE = re.compile(
+    r"\b(?:in|at|on|from|inside|within|of)\s+$",
+    re.IGNORECASE,
+)
+_FILE_NOUN_LOCATIVE_BEFORE_RE = re.compile(
+    r"\b(?:file|path|line|entry|module)\s+(?:at|in|on)\s+$",
+    re.IGNORECASE,
+)
+
 _COMMAND_FLAG_PREFIX_RE = re.compile(r"(?:--[a-zA-Z0-9_-]+|-[a-zA-Z])\s+$")
 
 _EXAMPLE_CLAUSE_RE = re.compile(
@@ -625,9 +637,12 @@ def _is_hypothetical_pointer(
         if idx != -1:
             raw_suffix = raw_suffix[:idx]
     near_prefix = prefix[-50:]
-    if _NONEXISTENT_SUBJECT_SUFFIX_RE.match(raw_suffix) or _NONEXISTENT_LINE_PREFIX_RE.search(
-        near_prefix
-    ):
+    if _NONEXISTENT_LINE_PREFIX_RE.search(near_prefix):
+        return True
+    is_locative_modifier = bool(_LOCATIVE_PREP_BEFORE_RE.search(near_prefix)) and not bool(
+        _FILE_NOUN_LOCATIVE_BEFORE_RE.search(near_prefix)
+    )
+    if not is_locative_modifier and _NONEXISTENT_SUBJECT_SUFFIX_RE.match(raw_suffix):
         return True
 
     if not has_line:
@@ -1370,7 +1385,8 @@ _ABSENCE_STRONG_PATTERNS: tuple[re.Pattern[str], ...] = (
         re.IGNORECASE,
     ),
     re.compile(
-        r"\bno\s+usage\s+(?:of\b|found\b|(?:in|under|within|across)\s+|"
+        r"\bno\s+usage\s+(?:of\b|found\b|"
+        r"(?:in|under|within|across)\s+(?:(?:the\s+)?(?:codebase|repo|repository|project|module|file|dir|directory|package)\b|`|[A-Za-z0-9_@.~-]+/)|"
         r"anywhere\b|elsewhere\b)",
         re.IGNORECASE,
     ),
