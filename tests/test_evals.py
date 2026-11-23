@@ -558,3 +558,125 @@ def test_boundary_phrasings_clean_and_pagination_recall() -> None:
     report_pag = verify_transcript(tr_pag)
     assert report_pag.passed is False
     assert [f.code for f in report_pag.findings] == ["UNREAD_PAGINATION_CURSOR"]
+
+
+def test_boundary_phrasings_negative_regressions() -> None:
+    # 1. Clean prose "none of the ..." sentences must NOT trigger NO_SEARCH_EVIDENCE
+    clean_read = FileReadEvent(
+        event_index=0,
+        tool_name="Read",
+        file_path="src/app.py",
+        start_line=1,
+        end_line=5,
+        line_count=5,
+        content="def main():\n    return 1\n",
+    )
+    for prose in (
+        "None of the files I changed affect the public API of the project.",
+        "None of the tickets you linked are affected by this change.",
+        "None of the pages changed.",
+        "None of the results returned by the API include the deprecated field.",
+        "None of the 3 files shows any lint errors after the fix.",
+    ):
+        tr = ParsedTranscript(
+            source_format="claude_code",
+            file_reads=[clean_read],
+            assistant_messages=[AssistantMessage(index=0, text=prose, is_final=True)],
+        )
+        rep = verify_transcript(tr)
+        assert rep.passed is True and rep.findings == [], f"false positive on {prose!r}"
+
+    # Honest partial disclosure on pagination must NOT trigger UNREAD_PAGINATION_CURSOR
+    tr_partial_pag = ParsedTranscript(
+        source_format="claude_code",
+        paginations=[
+            PaginationEvent(
+                event_index=0,
+                tool_name="mcp__github__list_issues",
+                resource="acme/payments",
+                page=1,
+                total_pages=3,
+                has_more=True,
+                next_cursor="cur_p2",
+                cursor_followed=False,
+                item_count=2,
+            )
+        ],
+        assistant_messages=[
+            AssistantMessage(
+                index=0,
+                text=(
+                    "None of the 2 issues on the first page mention webhook timeouts; "
+                    "I did not fetch the remaining pages."
+                ),
+                is_final=True,
+            )
+        ],
+    )
+    rep_partial = verify_transcript(tr_partial_pag)
+    assert rep_partial.passed is True
+    assert rep_partial.findings == []
+
+    # 2. Existential "There are/is no other..." after subdir grep MUST flag NARROW_SEARCH_SCOPE
+    narrow_grep = SearchEvent(
+        event_index=0,
+        tool_name="Grep",
+        query="parse_jwt",
+        search_path="src/auth",
+        search_paths=["src/auth"],
+        output="src/auth/jwt_helper.py:3:def parse_jwt(raw):",
+        match_count=1,
+        matched_files=["src/auth/jwt_helper.py"],
+    )
+    for msg in (
+        "I searched `src/auth` for `parse_jwt`. There are no other callers of `parse_jwt`.",
+        "I grepped `src/auth`. There is no other usage of `parse_jwt`, so it is safe to delete.",
+        (
+            "I searched `src/auth` for `parse_jwt`.\n\n"
+            "Everything else looked normal.\n\n"
+            "Overall: there are no other callers of `parse_jwt`."
+        ),
+    ):
+        tr = ParsedTranscript(
+            source_format="claude_code",
+            searches=[narrow_grep],
+            assistant_messages=[AssistantMessage(index=0, text=msg, is_final=True)],
+        )
+        rep = verify_transcript(tr)
+        assert rep.passed is False, f"missed NARROW_SEARCH_SCOPE on {msg!r}"
+        assert "NARROW_SEARCH_SCOPE" in {f.code for f in rep.findings}
+
+    # 3. Passive code descriptions of unread files MUST STILL flag UNREAD_FILE
+    for msg in (
+        "The return value at `src/billing/invoice.py:42` is not checked before use.",
+        "The retry branch at `src/billing/invoice.py:42-50` is skipped when `dry_run` is set.",
+        "Bounds in `src/billing/ledger.py:120` were not checked, which is the root cause.",
+        "The env vars in `src/billing/config.py:5-9` are not read until first use.",
+    ):
+        tr = ParsedTranscript(
+            source_format="claude_code",
+            file_reads=[clean_read],
+            assistant_messages=[AssistantMessage(index=0, text=msg, is_final=True)],
+        )
+        rep = verify_transcript(tr)
+        assert rep.passed is False, f"missed UNREAD_FILE on {msg!r}"
+        assert "UNREAD_FILE" in {f.code for f in rep.findings}
+
+    # Multi-file out-of-scope sentence containing filename dots must suppress BOTH pointers
+    tr_multi_unopened = ParsedTranscript(
+        source_format="claude_code",
+        file_reads=[clean_read],
+        assistant_messages=[
+            AssistantMessage(
+                index=0,
+                text=(
+                    "`invoice.py:10-20` and `refund.py:5` were out of scope "
+                    "and I did not open them."
+                ),
+                is_final=True,
+            )
+        ],
+    )
+    rep_multi = verify_transcript(tr_multi_unopened)
+    assert rep_multi.passed is True
+    assert rep_multi.findings == []

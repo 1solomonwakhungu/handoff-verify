@@ -125,6 +125,7 @@ class EvalSummary:
     recall: float
     false_positive_rate: float
     expected_code_match_rate: float
+    format_mismatches: int
     median_ms: float
     p95_ms: float
     max_ms: float
@@ -155,6 +156,7 @@ class EvalSummary:
                 "recall": self.recall,
                 "false_positive_rate": self.false_positive_rate,
                 "expected_code_match_rate": self.expected_code_match_rate,
+                "format_mismatches": self.format_mismatches,
                 "median_ms": self.median_ms,
                 "p95_ms": self.p95_ms,
                 "max_ms": self.max_ms,
@@ -452,6 +454,7 @@ def run_eval_suite(
         recall=recall,
         false_positive_rate=false_positive_rate,
         expected_code_match_rate=expected_code_match_rate,
+        format_mismatches=format_mismatches,
         median_ms=median_ms,
         p95_ms=p95_ms,
         max_ms=max_ms,

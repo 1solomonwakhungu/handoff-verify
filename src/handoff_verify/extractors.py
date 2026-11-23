@@ -506,13 +506,13 @@ _NEGATED_READ_PREFIX_RE = re.compile(
 
 _NEGATED_READ_SUFFIX_RE = re.compile(
     r"\b(?:"
-    r"(?:was|is|were|are)\s+(?:out\s+of\s+scope|not\s+(?:read|opened|inspected|checked)|"
-    r"left\s+unread|skipped|untouched)|"
+    r"(?:was|is|were|are)\s+out\s+of\s+scope|"
     r"(?:I|we)\s+(?:did\s+not|didn't|have\s+not|haven't)\s+"
-    r"(?:read|open|inspect|check|look\s+at)\s+(?:it|that\s+file|them)"
+    r"(?:read|open|inspect|check|look\s+at)\s+(?:it|that\s+file|them|those\s+files)"
     r")\b",
     re.IGNORECASE,
 )
+_CLAUSE_BOUNDARY_RE = re.compile(r"(?:;|\s—\s|\n|\.(?:\s|$))")
 
 _UNTOUCHED_SUFFIX_RE = re.compile(
     r"\b(?:untouched|unchanged|unmodified|as[- ]is|skipped|unread|unopened)\b",
@@ -561,11 +561,10 @@ def _is_hypothetical_pointer(
     if _NEGATED_READ_PREFIX_RE.search(prefix):
         return True
 
-    clause_suffix = sentence[match_end : min(len(sentence), match_end + 90)]
-    for sep in (";", ".", " — ", "\n"):
-        idx = clause_suffix.find(sep)
-        if idx != -1:
-            clause_suffix = clause_suffix[:idx]
+    clause_suffix = sentence[match_end : min(len(sentence), match_end + 110)]
+    m_bound = _CLAUSE_BOUNDARY_RE.search(clause_suffix)
+    if m_bound is not None:
+        clause_suffix = clause_suffix[: m_bound.start()]
     if _NEGATED_READ_SUFFIX_RE.search(clause_suffix):
         return True
 
@@ -1367,6 +1366,13 @@ _ABSENCE_STRONG_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"(?:uses|calls|references|imports)\b",
         re.IGNORECASE,
     ),
+    re.compile(
+        r"\bnone\s+of\s+(?:the\s+)?(?:(?:open|remaining|matching|active)\s+)?"
+        r"(?:issues?|tickets?|prs?|pull\s+requests?)\s+"
+        r"(?:mention(?:s|ed)?|contain(?:s|ed)?|reference(?:s|d)?|report(?:s|ed)?|"
+        r"include(?:s|d)?|describe(?:s|d)?|match(?:es|ed)?|have|has)\b",
+        re.IGNORECASE,
+    ),
 )
 
 # Contextual absence patterns (require genuine search/pagination/scope framing — never self-match)
@@ -1383,12 +1389,6 @@ _ABSENCE_CONTEXTUAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     ),
     re.compile(r"\bno\s+(?:todos?|fixmes?)\b", re.IGNORECASE),
     re.compile(r"\bnone\s+found\b", re.IGNORECASE),
-    re.compile(
-        r"\bnone\s+of\s+(?:the\s+)?(?:(?:open|remaining|matching|active|returned|\d+)\s+)?"
-        r"(?:issues?|items?|files?|prs?|pull\s+requests?|records?|pages?|tickets?|"
-        r"results?|matches|callers?|references?|entries)\b",
-        re.IGNORECASE,
-    ),
 )
 
 _NON_SEARCH_ABSENCE_AFTER_RE = re.compile(
@@ -1409,7 +1409,7 @@ _SEARCH_OR_LISTING_VERB_RE = re.compile(
     r"\b(?:search(?:ed|ing)?|grep(?:ped|ping)?|rg|list(?:ed|ing)?|"
     r"reviewed\s+all|checked\s+all|scanned|audited|returned|shows?|showed|matching|"
     r"repo|repository|codebase|project|anywhere|elsewhere|pages?|cursors?|"
-    r"gh\s+issue|gh\s+pr|open\s+issues?|tickets?|prs?|pull\s+requests?)\b",
+    r"gh\s+issue|gh\s+pr|tickets?|prs?|pull\s+requests?)\b",
     re.IGNORECASE,
 )
 
@@ -1465,7 +1465,8 @@ _HEDGING_AFTER_RE = re.compile(
     r"\b(?:"
     r"(?:but|however|though|although)\s+(?:I\s+)?only\s+(?:searched|checked|grepped|scanned|reviewed)|"
     r"treat\s+this\s+as\s+partial|partial\s+(?:search|check|result)|"
-    r"(?:did\s+not|didn't|haven't|have\s+not)\s+(?:search|check|review)\s+(?:the\s+)?(?:rest|other)|"
+    r"(?:did\s+not|didn't|haven't|have\s+not)\s+(?:search|check|review|fetch|read|load)\s+"
+    r"(?:the\s+)?(?:rest|other|remaining|next)|"
     r"may\s+(?:still\s+)?(?:exist|be)\s+elsewhere"
     r")\b",
     re.IGNORECASE,
@@ -1682,9 +1683,12 @@ def _has_hedging(sentence: str, match_start: int, match_end: int) -> bool:
 
 
 _ANAPHORIC_SCOPE_RE = re.compile(
-    r"\b(?:there|in\s+that\s+(?:dir|directory|folder|package|module|subdir|subdirectory|path)|"
-    r"within\s+that\s+(?:dir|directory|folder|package|module)|"
-    r"in\s+those\s+(?:files|dirs|directories|folders|packages|modules))\b",
+    r"\b(?:"
+    r"(?:found|present|exist(?:s|ed)?|appear(?:s|ed)?|occur(?:s|red)?|"
+    r"used|called|referenced|imported|defined|located|seen|matched)\s+there\b|"
+    r"(?:in|under|within)\s+that\s+(?:dir|directory|folder|package|module|subdir|subdirectory|path)\b|"
+    r"(?:in|under|within)\s+those\s+(?:files|dirs|directories|folders|packages|modules)\b"
+    r")",
     re.IGNORECASE,
 )
 _THIS_FILE_REF_RE = re.compile(r"\b(?:in|within)\s+this\s+file\b", re.IGNORECASE)
@@ -1700,24 +1704,29 @@ def extract_scope_claims(
     prose_chunks, _ = _segment_markdown(text)
     claims: list[Claim] = []
     seen: set[tuple[str, str]] = set()
-    last_qualifiers: list[str] = []
     last_file_path: str | None = None
 
     for chunk in prose_chunks:
+        prev_sentence_qualifiers: list[str] = []
         for _, _, sentence in _iter_sentences(chunk.text):
             sent_ptrs = extract_pointer_claims(sentence, base_dirs=base_dirs)
             for ptr in sent_ptrs:
                 if ptr.file_path:
                     last_file_path = ptr.file_path
 
-            qualifiers = extract_scope_qualifiers(sentence, base_dirs=base_dirs)
-            if qualifiers:
-                last_qualifiers = qualifiers
+            raw_qualifiers = extract_scope_qualifiers(sentence, base_dirs=base_dirs)
+            if raw_qualifiers:
+                qualifiers = raw_qualifiers
             elif not has_explicit_repo_wide_wording(sentence):
                 if _THIS_FILE_REF_RE.search(sentence) and last_file_path:
                     qualifiers = [last_file_path]
-                elif _ANAPHORIC_SCOPE_RE.search(sentence) and last_qualifiers:
-                    qualifiers = list(last_qualifiers)
+                elif _ANAPHORIC_SCOPE_RE.search(sentence) and prev_sentence_qualifiers:
+                    qualifiers = list(prev_sentence_qualifiers)
+                else:
+                    qualifiers = []
+            else:
+                qualifiers = []
+            prev_sentence_qualifiers = list(raw_qualifiers)
             primary_scope = qualifiers[0] if qualifiers else None
 
             # Absence claims: strong patterns first, then contextual patterns
