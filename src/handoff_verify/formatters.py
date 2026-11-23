@@ -7,6 +7,7 @@ Markdown, machine-readable JSON, and compact hook feedback formats.
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from handoff_verify.models import Claim, Finding, ScopeReceipt, VerificationReport
@@ -18,8 +19,11 @@ _SEVERITY_ORDER: dict[str, int] = {
 }
 
 _MAX_INLINE_LEN = 180
+_MAX_MESSAGE_LEN = 320
+_MAX_SUGGESTION_LEN = 240
 _MAX_EVIDENCE_ITEMS = 6
 _MAX_EVIDENCE_LIST_ITEMS = 5
+_DEFAULT_HOOK_MAX_CHARS = 8000
 
 
 def _plural(count: int, singular: str, plural: str | None = None) -> str:
@@ -28,7 +32,7 @@ def _plural(count: int, singular: str, plural: str | None = None) -> str:
 
 
 def _truncate_inline(text: str, max_len: int = _MAX_INLINE_LEN) -> str:
-    """Collapse whitespace to a single line and truncate cleanly if long."""
+    """Collapse whitespace/newlines to a single line and truncate cleanly if long."""
     collapsed = " ".join(text.split())
     if len(collapsed) <= max_len:
         return collapsed
@@ -38,6 +42,8 @@ def _truncate_inline(text: str, max_len: int = _MAX_INLINE_LEN) -> str:
 def _md_code(text: str, max_len: int = _MAX_INLINE_LEN) -> str:
     """Wrap text safely in Markdown inline code backticks."""
     clean = _truncate_inline(text, max_len=max_len)
+    if not clean:
+        return "`(empty)`"
     # Choose a backtick fence longer than any consecutive backticks inside clean.
     longest_run = 0
     current_run = 0
@@ -78,6 +84,16 @@ def _severity_breakdown(findings: list[Finding]) -> str:
     return ", ".join(parts)
 
 
+def _pass_status_label(report: VerificationReport, *, hook: bool = False) -> str:
+    """Return an accurate status label reflecting whether warnings or only info notes exist."""
+    if not report.passed:
+        return "FAIL"
+    _, warnings, _ = _count_severities(report.findings)
+    if warnings > 0:
+        return "WARN" if hook else "PASS (warnings)"
+    return "INFO" if hook else "PASS (notes)"
+
+
 def _format_evidence_value(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -110,7 +126,7 @@ def _format_evidence_value(value: Any) -> str:
 
 
 def _format_evidence_summary(evidence: dict[str, Any]) -> str:
-    """Format a finding's evidence dictionary as a concise, deterministic string."""
+    """Format a finding's evidence dictionary as a concise, deterministic single-line string."""
     if not evidence:
         return ""
     parts: list[str] = []
@@ -120,7 +136,7 @@ def _format_evidence_summary(evidence: dict[str, Any]) -> str:
             continue
         rendered = _format_evidence_value(val)
         if rendered:
-            parts.append(f"{key}={rendered}")
+            parts.append(f"{_truncate_inline(str(key), 40)}={rendered}")
     if len(items) > _MAX_EVIDENCE_ITEMS:
         parts.append(f"+{len(items) - _MAX_EVIDENCE_ITEMS} more")
     return "; ".join(parts)
@@ -138,6 +154,14 @@ def _format_claim_location(claim: Claim) -> str:
     return claim.file_path
 
 
+def _location_in_text(loc: str, text: str) -> bool:
+    """Return True if ``loc`` appears as a bounded token in ``text`` (not a substring match)."""
+    if not loc:
+        return False
+    pattern = rf"(?<![A-Za-z0-9_./:-]){re.escape(loc)}(?![A-Za-z0-9_./:-])"
+    return re.search(pattern, text) is not None
+
+
 def _has_relevant_scope_receipt(scope: ScopeReceipt) -> bool:
     return bool(
         scope.searched_roots
@@ -149,17 +173,17 @@ def _has_relevant_scope_receipt(scope: ScopeReceipt) -> bool:
 
 
 def _format_truncated_item(item: dict[str, Any], *, markdown: bool) -> str:
-    idx = item.get("event_index", "?")
-    tool = item.get("tool_name") or "tool"
-    reason = item.get("reason") or "truncated"
+    idx = _truncate_inline(str(item.get("event_index", "?")), 20)
+    tool = _truncate_inline(str(item.get("tool_name") or "tool"), 60)
+    reason = _truncate_inline(str(item.get("reason") or "truncated"), 80)
     if markdown:
-        return f"`[{idx}] {tool}` ({_truncate_inline(str(reason), 80)})"
-    return f"[{idx}] {tool} ({_truncate_inline(str(reason), 80)})"
+        return f"{_md_code(f'[{idx}] {tool}', 90)} ({reason})"
+    return f"[{idx}] {tool} ({reason})"
 
 
 def _format_cursor_item(item: dict[str, Any], *, markdown: bool) -> str:
-    idx = item.get("event_index", "?")
-    tool = item.get("tool_name") or "tool"
+    idx = _truncate_inline(str(item.get("event_index", "?")), 20)
+    tool = _truncate_inline(str(item.get("tool_name") or "tool"), 60)
     resource = item.get("resource") or ""
     page = item.get("page")
     total_pages = item.get("total_pages")
@@ -167,15 +191,21 @@ def _format_cursor_item(item: dict[str, Any], *, markdown: bool) -> str:
 
     details: list[str] = []
     if resource:
-        details.append(_md_code(str(resource), 60) if markdown else str(resource))
+        details.append(
+            _md_code(str(resource), 60) if markdown else _truncate_inline(str(resource), 60)
+        )
     if page is not None and total_pages is not None:
         details.append(f"page {page}/{total_pages}")
     elif page is not None:
         details.append(f"page {page}")
     if cursor:
-        details.append(f"cursor {_md_code(str(cursor), 40)}" if markdown else f"cursor={cursor}")
+        details.append(
+            f"cursor {_md_code(str(cursor), 40)}"
+            if markdown
+            else f"cursor={_truncate_inline(str(cursor), 40)}"
+        )
 
-    head = f"`[{idx}] {tool}`" if markdown else f"[{idx}] {tool}"
+    head = _md_code(f"[{idx}] {tool}", 90) if markdown else f"[{idx}] {tool}"
     if details:
         return f"{head} ({', '.join(details)})"
     return head
@@ -188,13 +218,19 @@ def _scope_receipt_lines(scope: ScopeReceipt, *, markdown: bool) -> list[str]:
 
     lines: list[str] = []
     if scope.searched_roots:
-        roots = ", ".join(_md_code(r, 80) if markdown else r for r in scope.searched_roots[:10])
+        roots = ", ".join(
+            _md_code(r, 80) if markdown else _truncate_inline(r, 80)
+            for r in scope.searched_roots[:10]
+        )
         if len(scope.searched_roots) > 10:
             roots += f", +{len(scope.searched_roots) - 10} more"
         lines.append(f"- **Searched roots:** {roots}" if markdown else f"  Searched roots: {roots}")
 
     if scope.excluded_dirs:
-        excluded = ", ".join(_md_code(d, 80) if markdown else d for d in scope.excluded_dirs[:10])
+        excluded = ", ".join(
+            _md_code(d, 80) if markdown else _truncate_inline(d, 80)
+            for d in scope.excluded_dirs[:10]
+        )
         if len(scope.excluded_dirs) > 10:
             excluded += f", +{len(scope.excluded_dirs) - 10} more"
         lines.append(
@@ -228,7 +264,10 @@ def _scope_receipt_lines(scope: ScopeReceipt, *, markdown: bool) -> list[str]:
         )
 
     if scope.files_edited:
-        edited = ", ".join(_md_code(f, 80) if markdown else f for f in scope.files_edited[:10])
+        edited = ", ".join(
+            _md_code(f, 80) if markdown else _truncate_inline(f, 80)
+            for f in scope.files_edited[:10]
+        )
         if len(scope.files_edited) > 10:
             edited += f", +{len(scope.files_edited) - 10} more"
         lines.append(f"- **Files edited:** {edited}" if markdown else f"  Files edited: {edited}")
@@ -284,7 +323,7 @@ def format_text(report: VerificationReport, *, quiet_on_pass: bool = False) -> s
             return ""
         return f"PASS: {_clean_summary(report)}"
 
-    status = "PASS (warnings)" if report.passed else "FAIL"
+    status = _pass_status_label(report, hook=False)
     breakdown = _severity_breakdown(report.findings)
     breakdown_segment = f"{breakdown}; " if breakdown else ""
     header = (
@@ -297,17 +336,21 @@ def format_text(report: VerificationReport, *, quiet_on_pass: bool = False) -> s
 
     lines = [header]
     for finding in _sort_findings(report.findings):
-        lines.append(f"  [{finding.severity.upper()}] {finding.code}: {finding.message}")
+        code = _truncate_inline(finding.code, 80)
+        message = _truncate_inline(finding.message, _MAX_MESSAGE_LEN)
+        lines.append(f"  [{finding.severity.upper()}] {code}: {message}")
         if finding.claim is not None:
             claim_text = _truncate_inline(finding.claim.text)
             loc = _format_claim_location(finding.claim)
-            loc_suffix = f" ({loc})" if loc and loc not in claim_text else ""
+            loc_suffix = f" ({loc})" if loc and not _location_in_text(loc, claim_text) else ""
             lines.append(f"    Claim ({finding.claim.kind}): {claim_text}{loc_suffix}")
         evidence_text = _format_evidence_summary(finding.evidence)
         if evidence_text:
             lines.append(f"    Evidence: {evidence_text}")
         if finding.suggestion:
-            lines.append(f"    Next step: {finding.suggestion}")
+            lines.append(
+                f"    Next step: {_truncate_inline(finding.suggestion, _MAX_SUGGESTION_LEN)}"
+            )
 
     scope_lines = _scope_receipt_lines(report.scope_receipt, markdown=False)
     if scope_lines:
@@ -325,7 +368,7 @@ def format_markdown(report: VerificationReport, *, quiet_on_pass: bool = False) 
             return ""
         return f"**handoff-verify:** PASS — {_clean_summary(report)}"
 
-    status = "PASS (warnings)" if report.passed else "FAIL"
+    status = _pass_status_label(report, hook=False)
     breakdown = _severity_breakdown(report.findings)
     breakdown_part = f" ({breakdown})" if breakdown else ""
     summary_line = (
@@ -345,17 +388,27 @@ def format_markdown(report: VerificationReport, *, quiet_on_pass: bool = False) 
     ]
 
     for finding in _sort_findings(report.findings):
-        lines.append(f"- **[{finding.severity.upper()}] `{finding.code}`** — {finding.message}")
+        code_md = _md_code(finding.code, 80)
+        message = _truncate_inline(finding.message, _MAX_MESSAGE_LEN)
+        lines.append(f"- **[{finding.severity.upper()}] {code_md}** — {message}")
         if finding.claim is not None:
             claim_code = _md_code(finding.claim.text)
             loc = _format_claim_location(finding.claim)
-            loc_suffix = f" ({_md_code(loc)})" if loc and loc not in finding.claim.text else ""
-            lines.append(f"  - **Claim (`{finding.claim.kind}`):** {claim_code}{loc_suffix}")
+            loc_suffix = (
+                f" ({_md_code(loc)})"
+                if loc and not _location_in_text(loc, finding.claim.text)
+                else ""
+            )
+            lines.append(
+                f"  - **Claim ({_md_code(finding.claim.kind, 40)}):** {claim_code}{loc_suffix}"
+            )
         evidence_text = _format_evidence_summary(finding.evidence)
         if evidence_text:
             lines.append(f"  - **Evidence:** {evidence_text}")
         if finding.suggestion:
-            lines.append(f"  - **Next step:** {finding.suggestion}")
+            lines.append(
+                f"  - **Next step:** {_truncate_inline(finding.suggestion, _MAX_SUGGESTION_LEN)}"
+            )
 
     scope_lines = _scope_receipt_lines(report.scope_receipt, markdown=True)
     if scope_lines:
@@ -365,15 +418,23 @@ def format_markdown(report: VerificationReport, *, quiet_on_pass: bool = False) 
     return "\n".join(lines)
 
 
-def format_hook_feedback(report: VerificationReport, *, max_findings: int = 10) -> str:
-    """Format a compact, high-signal Markdown receipt for hook stderr / agent context.
+def format_hook_feedback(
+    report: VerificationReport,
+    *,
+    max_findings: int = 10,
+    max_chars: int = _DEFAULT_HOOK_MAX_CHARS,
+) -> str:
+    """Format a compact, bounded Markdown receipt for hook stderr / agent context.
 
     Returns an empty string when verification is clean (passed with zero findings).
+    All finding messages and suggestions are flattened to single lines and bounded
+    so hostile transcript content cannot inject forged Markdown headings or exceed
+    Claude Code hook payload limits.
     """
     if report.passed and not report.findings:
         return ""
 
-    status = "WARN" if report.passed else "FAIL"
+    status = _pass_status_label(report, hook=True)
     breakdown = _severity_breakdown(report.findings)
     breakdown_part = f" ({breakdown})" if breakdown else ""
     lines = [
@@ -388,14 +449,16 @@ def format_hook_feedback(report: VerificationReport, *, max_findings: int = 10) 
         claim_part = ""
         if finding.claim is not None:
             claim_part = f" ({_md_code(finding.claim.text, max_len=100)})"
-        lines.append(
-            f"- **[{finding.severity.upper()}] `{finding.code}`**{claim_part}: {finding.message}"
-        )
+        code_md = _md_code(finding.code, 80)
+        message = _truncate_inline(finding.message, _MAX_MESSAGE_LEN)
+        lines.append(f"- **[{finding.severity.upper()}] {code_md}**{claim_part}: {message}")
         evidence_text = _format_evidence_summary(finding.evidence)
         if evidence_text:
             lines.append(f"  - Evidence: {evidence_text}")
         if finding.suggestion:
-            lines.append(f"  - Next step: {finding.suggestion}")
+            lines.append(
+                f"  - Next step: {_truncate_inline(finding.suggestion, _MAX_SUGGESTION_LEN)}"
+            )
 
     hidden_count = len(sorted_findings) - len(shown)
     if hidden_count > 0:
@@ -407,7 +470,12 @@ def format_hook_feedback(report: VerificationReport, *, max_findings: int = 10) 
         lines.append("**Scope receipt:**")
         lines.extend(scope_lines)
 
-    return "\n".join(lines)
+    rendered = "\n".join(lines)
+    if max_chars > 0 and len(rendered) > max_chars:
+        suffix = "\n... (truncated)"
+        cutoff = max(0, max_chars - len(suffix))
+        rendered = rendered[:cutoff].rstrip() + suffix
+    return rendered
 
 
 def format_report(

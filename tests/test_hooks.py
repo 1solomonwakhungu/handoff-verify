@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 
 import pytest
@@ -114,7 +115,7 @@ def _warning_only_report(strict: bool) -> VerificationReport:
     )
 
 
-def test_parse_claude_hook_input_fields() -> None:
+def test_parse_claude_hook_input_fields_and_bool_coercion() -> None:
     raw = json.dumps(
         {
             "hook_event_name": "SubagentStop",
@@ -123,6 +124,7 @@ def test_parse_claude_hook_input_fields() -> None:
             "cwd": "/tmp/repo",
             "transcript_path": "/tmp/parent.jsonl",
             "agent_transcript_path": "/tmp/subagent.jsonl",
+            "last_assistant_message": "All done.",
             "stop_hook_active": True,
         }
     )
@@ -133,7 +135,20 @@ def test_parse_claude_hook_input_fields() -> None:
     assert parsed.cwd == "/tmp/repo"
     assert parsed.transcript_path == "/tmp/parent.jsonl"
     assert parsed.agent_transcript_path == "/tmp/subagent.jsonl"
+    assert parsed.last_assistant_message == "All done."
     assert parsed.stop_hook_active is True
+
+    # Conservative loop-guard string parsing: explicit falsy strings -> False, others -> True.
+    for falsy in ("", "false", "FALSE", "0", "no", "off"):
+        assert (
+            parse_claude_hook_input(json.dumps({"stop_hook_active": falsy})).stop_hook_active
+            is False
+        )
+    for truthy in ("true", "1", "yes", "on", "active"):
+        assert (
+            parse_claude_hook_input(json.dumps({"stop_hook_active": truthy})).stop_hook_active
+            is True
+        )
 
 
 def test_hook_clean_pass_is_silent_in_advise_and_block(tmp_path: Path) -> None:
@@ -160,7 +175,7 @@ def test_hook_clean_pass_is_silent_in_advise_and_block(tmp_path: Path) -> None:
     assert res_block.blocked is False
 
 
-def test_hook_subagent_stop_prefers_agent_transcript_path(
+def test_hook_subagent_stop_uses_agent_transcript_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     parent_transcript = _write_claude_transcript(tmp_path / "parent.jsonl", final_text="Parent ok.")
@@ -203,10 +218,46 @@ def test_hook_subagent_stop_prefers_agent_transcript_path(
     assert "src/secret.py:42" in out_json["hookSpecificOutput"]["additionalContext"]
 
 
-def test_hook_subagent_stop_falls_back_to_transcript_path_when_agent_path_absent(
+def test_hook_subagent_stop_never_falls_back_to_parent_transcript(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     parent_transcript = _write_claude_transcript(tmp_path / "parent.jsonl")
+    called = False
+
+    def fake_verify(transcript, *, repo_root=None, strict=False):
+        nonlocal called
+        called = True
+        return _failing_report(transcript.transcript_path)
+
+    monkeypatch.setattr(hooks_mod, "verify_transcript", fake_verify)
+
+    for extra in ({}, {"agent_transcript_path": ""}, {"agent_transcript_path": "   "}):
+        payload = json.dumps(
+            {
+                "hook_event_name": "SubagentStop",
+                "transcript_path": str(parent_transcript),
+                "cwd": str(tmp_path),
+                **extra,
+            }
+        )
+        res_open = run_claude_code_hook(payload, mode="block", fail_closed=False)
+        assert res_open.exit_code == 0
+        assert res_open.blocked is False
+        assert "missing agent_transcript_path" in res_open.stderr
+        assert called is False
+
+        res_closed = run_claude_code_hook(payload, mode="block", fail_closed=True)
+        assert res_closed.exit_code == 2
+        assert called is False
+
+
+def test_hook_stop_uses_transcript_path_and_supports_tilde_and_cwd_relative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sub = tmp_path / "sessions"
+    sub.mkdir()
+    main_transcript = _write_claude_transcript(sub / "main.jsonl")
+    other_transcript = _write_claude_transcript(sub / "other.jsonl")
     seen_paths: list[str | None] = []
 
     def fake_verify(transcript, *, repo_root=None, strict=False):
@@ -215,39 +266,30 @@ def test_hook_subagent_stop_falls_back_to_transcript_path_when_agent_path_absent
 
     monkeypatch.setattr(hooks_mod, "verify_transcript", fake_verify)
 
-    payload = json.dumps(
+    # Stop uses transcript_path (relative to cwd) and ignores agent_transcript_path.
+    payload_rel = json.dumps(
         {
-            "hook_event_name": "SubagentStop",
-            "transcript_path": str(parent_transcript),
+            "hook_event_name": "Stop",
+            "transcript_path": "sessions/main.jsonl",
+            "agent_transcript_path": str(other_transcript),
             "cwd": str(tmp_path),
         }
     )
-    res = run_claude_code_hook(payload, mode="advise")
-    assert res.exit_code == 0
-    assert seen_paths == [str(parent_transcript)]
+    res_rel = run_claude_code_hook(payload_rel, mode="advise")
+    assert res_rel.exit_code == 0
+    assert seen_paths == [str(main_transcript)]
 
-
-def test_hook_stop_prefers_transcript_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    main_transcript = _write_claude_transcript(tmp_path / "main.jsonl")
-    other_transcript = _write_claude_transcript(tmp_path / "other.jsonl")
-    seen_paths: list[str | None] = []
-
-    def fake_verify(transcript, *, repo_root=None, strict=False):
-        seen_paths.append(transcript.transcript_path)
-        return VerificationReport(passed=True)
-
-    monkeypatch.setattr(hooks_mod, "verify_transcript", fake_verify)
-
-    payload = json.dumps(
+    # Tilde expansion in transcript_path.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    payload_tilde = json.dumps(
         {
             "hook_event_name": "Stop",
-            "transcript_path": str(main_transcript),
-            "agent_transcript_path": str(other_transcript),
+            "transcript_path": "~/sessions/main.jsonl",
         }
     )
-    res = run_claude_code_hook(payload, mode="advise")
-    assert res.exit_code == 0
-    assert seen_paths == [str(main_transcript)]
+    res_tilde = run_claude_code_hook(payload_tilde, mode="advise")
+    assert res_tilde.exit_code == 0
+    assert seen_paths[-1] == str(main_transcript)
 
 
 def test_hook_advise_omits_hook_specific_output_when_event_name_missing(
@@ -293,7 +335,7 @@ def test_hook_block_mode_exits_2_with_stderr_receipt(
     assert "Read src/secret.py around line 42" in res.stderr
 
 
-def test_hook_block_mode_never_blocks_when_stop_hook_active_true(
+def test_hook_stop_hook_active_prevents_continuation_and_blocking_in_both_modes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     transcript = _write_claude_transcript(tmp_path / "session.jsonl")
@@ -310,18 +352,22 @@ def test_hook_block_mode_never_blocks_when_stop_hook_active_true(
             "stop_hook_active": True,
         }
     )
-    res = run_claude_code_hook(payload, mode="block")
-    assert res.exit_code == 0
-    assert res.blocked is False
-    assert res.stderr == ""
 
-    data = json.loads(res.stdout)
-    assert "stop_hook_active" in data["systemMessage"]
-    assert "not blocking again" in data["systemMessage"]
-    assert data["hookSpecificOutput"]["hookEventName"] == "Stop"
+    for mode in ("block", "advise"):
+        res = run_claude_code_hook(payload, mode=mode)
+        assert res.exit_code == 0
+        assert res.blocked is False
+        assert res.stderr == ""
+
+        data = json.loads(res.stdout)
+        assert "stop_hook_active" in data["systemMessage"]
+        assert "not continuing or blocking again" in data["systemMessage"]
+        # Critical loop-guard invariant: NEVER emit hookSpecificOutput.additionalContext
+        # when stop_hook_active is true, as Claude Code continues the turn on it.
+        assert "hookSpecificOutput" not in data
 
 
-def test_hook_block_mode_respects_strict_for_warnings(
+def test_hook_warning_and_info_only_passes_emit_system_message_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     transcript = _write_claude_transcript(tmp_path / "session.jsonl")
@@ -339,17 +385,25 @@ def test_hook_block_mode_respects_strict_for_warnings(
         }
     )
 
-    # Without --strict: warning-only report passes, so block mode advises instead of blocking.
-    res_non_strict = run_claude_code_hook(payload, mode="block", strict=False)
-    assert res_non_strict.exit_code == 0
-    assert res_non_strict.blocked is False
-    assert "scope_truncated_search" in json.loads(res_non_strict.stdout)["systemMessage"]
+    # Without --strict: neither advise nor block should continue or block on non-failing warnings.
+    for mode in ("advise", "block"):
+        res = run_claude_code_hook(payload, mode=mode, strict=False)
+        assert res.exit_code == 0
+        assert res.blocked is False
+        data = json.loads(res.stdout)
+        assert "scope_truncated_search" in data["systemMessage"]
+        assert "hookSpecificOutput" not in data
 
-    # With --strict: warning fails verification, so block mode exits 2.
-    res_strict = run_claude_code_hook(payload, mode="block", strict=True)
-    assert res_strict.exit_code == 2
-    assert res_strict.blocked is True
-    assert "scope_truncated_search" in res_strict.stderr
+    # With --strict: warning fails verification, so block exits 2 and advise emits context once.
+    res_block_strict = run_claude_code_hook(payload, mode="block", strict=True)
+    assert res_block_strict.exit_code == 2
+    assert res_block_strict.blocked is True
+    assert "scope_truncated_search" in res_block_strict.stderr
+
+    res_advise_strict = run_claude_code_hook(payload, mode="advise", strict=True)
+    assert res_advise_strict.exit_code == 0
+    advise_data = json.loads(res_advise_strict.stdout)
+    assert advise_data["hookSpecificOutput"]["hookEventName"] == "Stop"
 
 
 def test_hook_repo_override_takes_precedence_over_payload_cwd(
@@ -384,11 +438,12 @@ def test_hook_repo_override_takes_precedence_over_payload_cwd(
 def test_hook_fail_open_vs_fail_closed_on_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # 1. Invalid JSON on stdin
+    # 1. Invalid JSON on stdin (no misleading "internal error:" prefix)
     res_open = run_claude_code_hook("{not valid json", fail_closed=False)
     assert res_open.exit_code == 0
     assert res_open.stdout == ""
     assert "malformed JSON" in res_open.stderr
+    assert "internal error:" not in res_open.stderr
 
     res_closed = run_claude_code_hook("{not valid json", fail_closed=True)
     assert res_closed.exit_code == 2
@@ -491,7 +546,6 @@ def test_merge_claude_code_settings_preserves_existing_and_is_idempotent() -> No
     }
 
     first = merge_claude_code_settings(existing, mode="advise")
-    # Unrelated keys and hooks preserved.
     assert first["permissions"] == {"allow": ["Bash(pytest:*)"]}
     assert first["hooks"]["PreToolUse"] == existing["hooks"]["PreToolUse"]
     assert first["hooks"]["Stop"][0]["hooks"] == [{"type": "command", "command": "notify-done"}]
@@ -516,7 +570,69 @@ def test_merge_claude_code_settings_preserves_existing_and_is_idempotent() -> No
     )
 
 
-def test_merge_deduplicates_preexisting_duplicate_handoff_verify_entries() -> None:
+def test_merge_preserves_matcher_scoped_groups_and_compound_commands() -> None:
+    existing = {
+        "hooks": {
+            "SubagentStop": [
+                {
+                    "matcher": "Explore",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "handoff-verify hook claude-code --mode advise",
+                        }
+                    ],
+                },
+                {
+                    "matcher": "general-purpose",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "handoff-verify hook claude-code --mode block --fail-closed",
+                        }
+                    ],
+                },
+            ],
+            "Stop": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": (
+                                'cd "$CLAUDE_PROJECT_DIR" && uv run handoff-verify hook '
+                                "claude-code --mode block --fail-closed ; notify-send done"
+                            ),
+                        }
+                    ]
+                }
+            ],
+        }
+    }
+
+    merged = merge_claude_code_settings(existing, mode="advise")
+
+    # Both matcher-scoped SubagentStop entries remain completely untouched, plus 1 global entry.
+    assert len(merged["hooks"]["SubagentStop"]) == 3
+    assert merged["hooks"]["SubagentStop"][0] == existing["hooks"]["SubagentStop"][0]
+    assert merged["hooks"]["SubagentStop"][1] == existing["hooks"]["SubagentStop"][1]
+    assert (
+        merged["hooks"]["SubagentStop"][2]["hooks"][0]["command"]
+        == "handoff-verify hook claude-code --mode advise"
+    )
+
+    # Compound shell command in Stop is preserved untouched, plus 1 global entry.
+    assert len(merged["hooks"]["Stop"]) == 2
+    assert merged["hooks"]["Stop"][0] == existing["hooks"]["Stop"][0]
+    assert (
+        merged["hooks"]["Stop"][1]["hooks"][0]["command"]
+        == "handoff-verify hook claude-code --mode advise"
+    )
+
+    # Second run is strictly idempotent.
+    assert merge_claude_code_settings(merged, mode="advise") == merged
+
+
+def test_merge_deduplicates_preexisting_duplicate_global_entries() -> None:
     duplicated = {
         "hooks": {
             "Stop": [
@@ -547,31 +663,56 @@ def test_merge_deduplicates_preexisting_duplicate_handoff_verify_entries() -> No
     assert handler["timeout"] == 15
 
 
-def test_write_claude_code_settings_creates_and_refuses_malformed(tmp_path: Path) -> None:
+def test_write_claude_code_settings_permissions_symlinks_utf8_and_errors(tmp_path: Path) -> None:
+    # 1. Newly created file gets readable 0o644 permissions (not 0o600).
     settings_path = tmp_path / ".claude" / "settings.json"
     merged, created = write_claude_code_settings(settings_path, mode="advise")
     assert created is True
     assert settings_path.is_file()
+    assert stat.S_IMODE(settings_path.stat().st_mode) == 0o644
     assert json.loads(settings_path.read_text(encoding="utf-8")) == merged
 
-    # Second write updates in place.
+    # 2. Existing custom mode (0o640) and non-ASCII UTF-8 characters are preserved.
+    settings_path.write_text(
+        json.dumps({"label": "café → ok"}, ensure_ascii=False), encoding="utf-8"
+    )
+    settings_path.chmod(0o640)
     merged2, created2 = write_claude_code_settings(settings_path, mode="block")
     assert created2 is False
-    assert (
-        merged2["hooks"]["Stop"][0]["hooks"][0]["command"]
-        == "handoff-verify hook claude-code --mode block"
-    )
+    assert stat.S_IMODE(settings_path.stat().st_mode) == 0o640
+    raw_written = settings_path.read_text(encoding="utf-8")
+    assert "café → ok" in raw_written
+    assert json.loads(raw_written) == merged2
 
-    # Malformed JSON is refused without modifying disk.
+    # 3. Symlinked settings.json stays a symlink and updates the real target file.
+    real_target = tmp_path / "dotfiles_settings.json"
+    real_target.write_text('{"keep": true}\n', encoding="utf-8")
+    symlink_path = tmp_path / "linked_settings.json"
+    symlink_path.symlink_to(real_target)
+    write_claude_code_settings(symlink_path, mode="advise")
+    assert symlink_path.is_symlink()
+    assert symlink_path.resolve() == real_target.resolve()
+    target_data = json.loads(real_target.read_text(encoding="utf-8"))
+    assert target_data["keep"] is True
+    assert "Stop" in target_data["hooks"]
+
+    # 4. Malformed JSON is refused without modifying disk.
     bad_path = tmp_path / "bad.json"
     bad_path.write_text("{broken json", encoding="utf-8")
     with pytest.raises(SettingsError, match="malformed JSON"):
         write_claude_code_settings(bad_path, mode="advise")
     assert bad_path.read_text(encoding="utf-8") == "{broken json"
 
-    # Non-object root is refused without modifying disk.
+    # 5. Non-object root is refused without modifying disk.
     list_path = tmp_path / "list.json"
     list_path.write_text("[]", encoding="utf-8")
     with pytest.raises(SettingsError, match="must be an object"):
         write_claude_code_settings(list_path, mode="advise")
     assert list_path.read_text(encoding="utf-8") == "[]"
+
+    # 6. Invalid UTF-8 bytes raise SettingsError (not raw UnicodeDecodeError).
+    bin_path = tmp_path / "invalid_utf8.json"
+    bin_path.write_bytes(b"\xff\xfe\xfd")
+    with pytest.raises(SettingsError, match="failed to read"):
+        write_claude_code_settings(bin_path, mode="advise")
+    assert bin_path.read_bytes() == b"\xff\xfe\xfd"

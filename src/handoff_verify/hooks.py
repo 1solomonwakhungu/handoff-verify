@@ -22,6 +22,7 @@ HookMode = Literal["advise", "block"]
 
 CLAUDE_CODE_EVENTS: tuple[str, ...] = ("SubagentStop", "Stop")
 DEFAULT_CLAUDE_SETTINGS_PATH = Path(".claude/settings.json")
+_SHELL_COMPOUND_OPERATORS = frozenset({"&&", "||", ";", "|", "&", "\n"})
 
 
 class SettingsError(ValueError):
@@ -39,6 +40,7 @@ class ClaudeHookInput:
     stop_hook_active: bool = False
     session_id: str | None = None
     agent_id: str | None = None
+    last_assistant_message: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -60,11 +62,15 @@ def _non_empty_str(value: Any) -> str | None:
     return None
 
 
-def _parse_bool_flag(value: Any) -> bool:
+def _parse_stop_hook_active(value: Any) -> bool:
+    """Parse ``stop_hook_active`` conservatively (unknown non-empty strings count as active)."""
+    if value is None:
+        return False
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
-        return value.strip().lower() in ("true", "1", "yes")
+        normalized = value.strip().lower()
+        return normalized not in ("", "false", "0", "no", "off")
     return bool(value)
 
 
@@ -87,40 +93,67 @@ def parse_claude_hook_input(stdin_text: str) -> ClaudeHookInput:
         transcript_path=_non_empty_str(payload.get("transcript_path")),
         agent_transcript_path=_non_empty_str(payload.get("agent_transcript_path")),
         cwd=_non_empty_str(payload.get("cwd")),
-        stop_hook_active=_parse_bool_flag(payload.get("stop_hook_active", False)),
+        stop_hook_active=_parse_stop_hook_active(payload.get("stop_hook_active", False)),
         session_id=_non_empty_str(payload.get("session_id")),
         agent_id=_non_empty_str(payload.get("agent_id")),
+        last_assistant_message=_non_empty_str(payload.get("last_assistant_message")),
         raw=payload,
     )
 
 
-def _select_transcript_path(hook_input: ClaudeHookInput, cwd_dir: Path | None) -> Path | None:
+def _select_transcript_path(
+    hook_input: ClaudeHookInput,
+    cwd_dir: Path | None,
+) -> tuple[Path | None, str | None]:
     """Select the appropriate transcript path for Stop vs SubagentStop events.
 
-    For ``SubagentStop`` (or unknown events), prefers ``agent_transcript_path`` when
-    present and falls back to ``transcript_path``. For ``Stop``, prefers
-    ``transcript_path``.
+    Returns ``(resolved_path, missing_reason)``.
+
+    On ``SubagentStop``, ``transcript_path`` belongs to the parent session, so we
+    MUST use ``agent_transcript_path`` and never fall back to the parent session's
+    transcript (which would verify or block a subagent for parent claims).
+    On ``Stop``, we use ``transcript_path``.
+    On unknown/omitted event names, we prefer ``agent_transcript_path`` or
+    fall back to ``transcript_path``.
     """
-    if hook_input.hook_event_name == "Stop":
-        raw_path = hook_input.transcript_path or hook_input.agent_transcript_path
+    if hook_input.hook_event_name == "SubagentStop":
+        raw_path = hook_input.agent_transcript_path
+        if raw_path is None:
+            return None, "missing agent_transcript_path in SubagentStop hook payload"
+    elif hook_input.hook_event_name == "Stop":
+        raw_path = hook_input.transcript_path
+        if raw_path is None:
+            return None, "missing transcript_path in Stop hook payload"
     else:
         raw_path = hook_input.agent_transcript_path or hook_input.transcript_path
-
-    if raw_path is None:
-        return None
+        if raw_path is None:
+            return None, "missing transcript_path in hook payload"
 
     candidate = Path(raw_path).expanduser()
     if not candidate.is_absolute() and not candidate.is_file() and cwd_dir is not None:
         cwd_candidate = cwd_dir / candidate
         if cwd_candidate.is_file():
-            return cwd_candidate
-    return candidate
+            return cwd_candidate, None
+    return candidate, None
 
 
-def _build_advise_json(feedback: str, hook_event_name: str | None) -> str:
-    """Build Claude Code structured advisory hook JSON for stdout."""
+def _build_hook_json(
+    feedback: str,
+    hook_event_name: str | None,
+    *,
+    include_additional_context: bool,
+) -> str:
+    """Build Claude Code hook JSON for stdout.
+
+    Note: On Claude Code ``Stop`` and ``SubagentStop`` hooks, emitting
+    ``hookSpecificOutput.additionalContext`` continues the turn so the model can
+    act on the feedback (subject to loop protection), whereas ``systemMessage``
+    alone notifies the user without continuing the turn. Requires a Claude Code
+    version supporting ``hookSpecificOutput`` on Stop/SubagentStop when
+    ``include_additional_context=True``.
+    """
     payload: dict[str, Any] = {"systemMessage": feedback}
-    if hook_event_name:
+    if include_additional_context and hook_event_name:
         payload["hookSpecificOutput"] = {
             "hookEventName": hook_event_name,
             "additionalContext": feedback,
@@ -152,15 +185,22 @@ def run_claude_code_hook(
 
     Behavior:
     - Clean verification (``report.passed`` with zero findings): exits ``0`` silently.
-    - ``mode="advise"`` (default): on anomalies, emits Claude Code hook JSON
-      (``systemMessage`` + ``hookSpecificOutput.additionalContext`` when
-      ``hook_event_name`` is known) to stdout and exits ``0``.
-    - ``mode="block"``: on verification failure (``not report.passed``) when
-      ``stop_hook_active`` is ``False``, writes a concise actionable receipt to
-      stderr and exits ``2`` to block stopping. When ``stop_hook_active`` is
-      ``True``, NEVER blocks again (exits ``0`` with advisory JSON noting the
-      loop guard) to prevent infinite stop loops. If ``report.passed`` is ``True``
-      but warnings exist (non-strict mode), emits advisory JSON and exits ``0``.
+    - Loop guard (``stop_hook_active=True``): NEVER exits ``2`` and NEVER emits
+      ``hookSpecificOutput.additionalContext`` (which continues the turn in Claude
+      Code). Emits ``{"systemMessage": ...}`` only and exits ``0`` in BOTH
+      ``advise`` and ``block`` modes so the agent can always stop cleanly.
+    - ``mode="advise"`` (default, ``stop_hook_active=False``):
+      - On verification failure (``not report.passed``): exits ``0`` with
+        ``systemMessage`` (and ``hookSpecificOutput.additionalContext`` when
+        ``hook_event_name`` is known for a single bounded soft continuation).
+      - On non-failing warnings/notes (``report.passed=True`` with findings):
+        exits ``0`` with ``systemMessage`` only (no turn continuation).
+    - ``mode="block"`` (``stop_hook_active=False``):
+      - On verification failure (``not report.passed``): writes concise actionable
+        receipt to stderr and exits ``2`` to block stopping (max 1 block via
+        ``stop_hook_active``).
+      - On non-failing warnings/notes (``report.passed=True`` with findings):
+        exits ``0`` with ``systemMessage`` only.
     - Fail-open default (``fail_closed=False``): any parse, I/O, missing file,
       unrecognized transcript, or internal error emits a single concise
       diagnostic line to stderr and exits ``0``. With ``fail_closed=True``,
@@ -170,7 +210,10 @@ def run_claude_code_hook(
         if mode not in ("advise", "block"):
             return _fail_result(f"unsupported hook mode: {mode!r}", fail_closed=fail_closed)
 
-        hook_input = parse_claude_hook_input(stdin_text)
+        try:
+            hook_input = parse_claude_hook_input(stdin_text)
+        except ValueError as exc:
+            return _fail_result(str(exc), fail_closed=fail_closed)
 
         cwd_dir: Path | None = None
         if hook_input.cwd is not None:
@@ -190,10 +233,10 @@ def run_claude_code_hook(
         else:
             effective_repo_root = cwd_dir
 
-        transcript_path = _select_transcript_path(hook_input, cwd_dir)
+        transcript_path, missing_reason = _select_transcript_path(hook_input, cwd_dir)
         if transcript_path is None:
             return _fail_result(
-                "missing transcript_path in hook payload",
+                missing_reason or "missing transcript_path in hook payload",
                 fail_closed=fail_closed,
             )
         if not transcript_path.is_file():
@@ -223,19 +266,27 @@ def run_claude_code_hook(
 
         feedback = format_hook_feedback(report)
 
+        # Loop guard: when stop_hook_active is true, NEVER block (exit 2) and NEVER
+        # emit additionalContext (which continues the turn in Claude Code).
+        if hook_input.stop_hook_active:
+            loop_guarded_feedback = (
+                f"{feedback}\n\n"
+                "_Note: `stop_hook_active` is true; not continuing or blocking again "
+                "to prevent a stop loop._"
+            )
+            return HookResult(
+                exit_code=0,
+                stdout=_build_hook_json(
+                    loop_guarded_feedback,
+                    hook_input.hook_event_name,
+                    include_additional_context=False,
+                ),
+                stderr="",
+                blocked=False,
+                report=report,
+            )
+
         if mode == "block" and not report.passed:
-            if hook_input.stop_hook_active:
-                loop_guarded_feedback = (
-                    f"{feedback}\n\n"
-                    "_Note: `stop_hook_active` is true; not blocking again to prevent a stop loop._"
-                )
-                return HookResult(
-                    exit_code=0,
-                    stdout=_build_advise_json(loop_guarded_feedback, hook_input.hook_event_name),
-                    stderr="",
-                    blocked=False,
-                    report=report,
-                )
             return HookResult(
                 exit_code=2,
                 stdout="",
@@ -244,10 +295,16 @@ def run_claude_code_hook(
                 report=report,
             )
 
-        # Advise mode (or non-strict warning-only report in block mode).
+        # Advise mode on failing report: emit systemMessage + additionalContext (when event known).
+        # Non-failing warning/info-only reports emit systemMessage only (no turn continuation).
+        include_ctx = mode == "advise" and not report.passed
         return HookResult(
             exit_code=0,
-            stdout=_build_advise_json(feedback, hook_input.hook_event_name),
+            stdout=_build_hook_json(
+                feedback,
+                hook_input.hook_event_name,
+                include_additional_context=include_ctx,
+            ),
             stderr="",
             blocked=False,
             report=report,
@@ -262,14 +319,17 @@ def build_claude_code_hook_command(
     strict: bool = False,
     command: str | None = None,
 ) -> str:
-    """Build the shell command invoked by Claude Code hooks."""
+    """Build the shell command invoked by Claude Code hooks.
+
+    ``command`` is treated as a shell command fragment (e.g. ``"handoff-verify"``
+    or ``"uvx handoff-verify"``). If it already contains ``hook claude-code``,
+    it is returned verbatim.
+    """
     if mode not in ("advise", "block"):
         raise ValueError(f"Unsupported hook mode: {mode!r}")
 
     base = (command.strip() if command is not None else "") or "handoff-verify"
 
-    # If the user supplied a complete hook invocation already containing
-    # "hook claude-code", respect it verbatim rather than duplicating subcommands.
     tokens = _tokenize_command(base)
     if _contains_subsequence(tokens, ("hook", "claude-code")):
         return base
@@ -287,6 +347,17 @@ def _tokenize_command(command: str) -> list[str]:
         return command.split()
 
 
+def _is_compound_shell_command(command: str) -> bool:
+    """Return True if a command contains unquoted shell control operators (&&, ||, ;, |, &)."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return any(op in command for op in ("&&", "||", ";", "|", "\n"))
+    return any(tok in _SHELL_COMPOUND_OPERATORS for tok in tokens)
+
+
 def _contains_subsequence(tokens: list[str], subseq: tuple[str, ...]) -> bool:
     if len(tokens) < len(subseq):
         return False
@@ -297,7 +368,9 @@ def _contains_subsequence(tokens: list[str], subseq: tuple[str, ...]) -> bool:
 
 
 def _is_handoff_verify_hook_command(command: str) -> bool:
-    """Return True if a hook command string invokes handoff-verify's claude-code hook."""
+    """Return True if a simple command invokes handoff-verify's claude-code hook."""
+    if _is_compound_shell_command(command):
+        return False
     tokens = _tokenize_command(command)
     if not _contains_subsequence(tokens, ("hook", "claude-code")):
         return False
@@ -312,6 +385,8 @@ def _matches_managed_hook(existing_command: str, target_command: str) -> bool:
     """Return True if an existing hook command should be updated in place."""
     if existing_command.strip() == target_command.strip():
         return True
+    if _is_compound_shell_command(existing_command):
+        return False
     if _is_handoff_verify_hook_command(existing_command):
         return True
     existing_tokens = _tokenize_command(existing_command)
@@ -324,6 +399,12 @@ def _matches_managed_hook(existing_command: str, target_command: str) -> bool:
         if existing_prefix and existing_prefix == target_prefix:
             return True
     return False
+
+
+def _is_global_matcher_group(entry: dict[str, Any]) -> bool:
+    """Return True if a hook matcher group has no scoped matcher (global / catch-all)."""
+    matcher = entry.get("matcher")
+    return matcher is None or (isinstance(matcher, str) and not matcher.strip())
 
 
 def build_claude_code_settings_snippet(
@@ -360,9 +441,10 @@ def merge_claude_code_settings(
 ) -> dict[str, Any]:
     """Merge handoff-verify Stop/SubagentStop hooks into a Claude settings dict.
 
-    Preserves all unrelated keys and hooks. Updates existing handoff-verify
-    hook entries in place (idempotent across repeated runs) and removes any
-    duplicate handoff-verify entries for the managed events.
+    Preserves all unrelated keys, unrelated hooks, compound shell wrapper hooks,
+    and matcher-scoped hook groups (e.g. ``{"matcher": "Explore", ...}``).
+    Updates existing global (un-matchered) handoff-verify hook entries in place
+    (idempotent across repeated runs) and removes duplicate global entries.
     """
     if not isinstance(existing, dict):
         raise SettingsError("settings.json root must be a JSON object")
@@ -389,7 +471,12 @@ def merge_claude_code_settings(
         new_event_entries: list[Any] = []
 
         for entry in event_entries:
-            if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+            if (
+                not isinstance(entry, dict)
+                or not isinstance(entry.get("hooks"), list)
+                or not _is_global_matcher_group(entry)
+            ):
+                # Preserve non-standard entries and matcher-scoped groups untouched.
                 new_event_entries.append(entry)
                 continue
 
@@ -410,12 +497,12 @@ def merge_claude_code_settings(
                         updated_handler["command"] = hook_cmd
                         new_handler_list.append(updated_handler)
                         updated_existing = True
-                    # Drop duplicate handoff-verify handlers for this event.
+                    # Drop duplicate global handoff-verify handlers for this event.
                 else:
                     new_handler_list.append(handler)
 
             if entry_had_match and not new_handler_list:
-                # All handlers in this matcher group were duplicate handoff-verify entries.
+                # All handlers in this global group were duplicate handoff-verify entries.
                 continue
 
             updated_entry = dict(entry)
@@ -448,21 +535,28 @@ def write_claude_code_settings(
 ) -> tuple[dict[str, Any], bool]:
     """Create or safely merge handoff-verify hooks into ``settings_path`` atomically.
 
+    Follows symlinks when writing so dotfile-managed ``settings.json`` symlinks are
+    preserved rather than replaced by regular files. Preserves UTF-8 characters and
+    existing file permissions (defaulting to ``0o644`` for newly created files).
+
     Returns ``(merged_settings, created_new)``.
     Raises ``SettingsError`` without modifying disk if existing JSON is malformed
     or has an incompatible structure.
     """
-    existed = settings_path.exists()
+    target_path = (
+        settings_path.resolve(strict=False) if settings_path.is_symlink() else settings_path
+    )
+    existed = target_path.exists()
     existing_mode: int | None = None
     existing_data: dict[str, Any] = {}
 
     if existed:
-        if not settings_path.is_file():
+        if not target_path.is_file():
             raise SettingsError(f"settings path exists and is not a file: {settings_path}")
         try:
-            existing_mode = stat.S_IMODE(settings_path.stat().st_mode)
-            raw_text = settings_path.read_text(encoding="utf-8")
-        except OSError as exc:
+            existing_mode = stat.S_IMODE(target_path.stat().st_mode)
+            raw_text = target_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
             raise SettingsError(f"failed to read {settings_path}: {exc}") from exc
 
         try:
@@ -486,16 +580,16 @@ def write_claude_code_settings(
         command=command,
     )
 
-    serialized = json.dumps(merged, indent=2) + "\n"
-    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(merged, indent=2, ensure_ascii=False) + "\n"
+    target_path.parent.mkdir(parents=True, exist_ok=True)
 
     tmp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
             mode="w",
             encoding="utf-8",
-            dir=settings_path.parent,
-            prefix=f".{settings_path.name}.",
+            dir=target_path.parent,
+            prefix=f".{target_path.name}.",
             suffix=".tmp",
             delete=False,
         ) as handle:
@@ -504,9 +598,8 @@ def write_claude_code_settings(
             handle.flush()
             os.fsync(handle.fileno())
 
-        if existing_mode is not None:
-            os.chmod(tmp_path, existing_mode)
-        os.replace(tmp_path, settings_path)
+        os.chmod(tmp_path, existing_mode if existing_mode is not None else 0o644)
+        os.replace(tmp_path, target_path)
     except Exception:
         if tmp_path is not None:
             with contextlib.suppress(OSError):

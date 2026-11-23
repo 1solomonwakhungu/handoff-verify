@@ -299,3 +299,59 @@ def test_cli_init_claude_code_refuses_malformed_settings(
 
 def test_cli_init_requires_target_flag() -> None:
     assert main(["init"]) == 2
+
+
+def test_cli_hook_usage_errors_fail_open_by_default_and_fail_closed_with_flag(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Typo / unsupported flag / unknown hook target MUST NOT exit 2 without --fail-closed
+    # (exit 2 blocks every Stop in Claude Code!).
+    assert main(["hook", "claude-code", "--mode", "advise", "--timeout", "5"]) == 0
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+    assert main(["hook", "claude-code", "--mode", "warn"]) == 0
+    assert "invalid choice" in capsys.readouterr().err
+
+    assert main(["hook", "claude_code"]) == 0
+    assert "invalid choice" in capsys.readouterr().err
+
+    # With --fail-closed, hook usage errors exit 2.
+    assert main(["hook", "claude-code", "--fail-closed", "--timeout", "5"]) == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+    # Non-hook usage errors still exit 2.
+    assert main(["check", "--unknown-flag"]) == 2
+    capsys.readouterr()
+
+
+def test_cli_init_reports_actual_written_command_and_refuses_invalid_utf8(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings_path = tmp_path / "settings.json"
+    rc = main(
+        [
+            "init",
+            "--claude-code",
+            "--write",
+            "--settings",
+            str(settings_path),
+            "--mode",
+            "block",
+            "--strict",
+            "--command",
+            "uvx handoff-verify hook claude-code",
+        ]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "command='uvx handoff-verify hook claude-code'" in out
+    assert "mode=block" not in out
+
+    # Invalid UTF-8 settings.json exits 2 with clean Error message (not "internal failure").
+    bad_utf8 = tmp_path / "bad_utf8.json"
+    bad_utf8.write_bytes(b"\xff\xfe\x00")
+    rc_bad = main(["init", "--claude-code", "--write", "--settings", str(bad_utf8)])
+    assert rc_bad == 2
+    err = capsys.readouterr().err
+    assert "Error: failed to read" in err
+    assert "internal failure" not in err

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -13,6 +14,7 @@ from handoff_verify.formatters import format_report
 from handoff_verify.hooks import (
     DEFAULT_CLAUDE_SETTINGS_PATH,
     SettingsError,
+    build_claude_code_hook_command,
     build_claude_code_settings_snippet,
     run_claude_code_hook,
     write_claude_code_settings,
@@ -176,32 +178,33 @@ def _cmd_hook_claude_code(args: argparse.Namespace) -> int:
             repo_root=repo_root,
             fail_closed=fail_closed,
         )
+        if result.stdout:
+            print(result.stdout)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+        return result.exit_code
     except Exception as exc:
-        print(f"handoff-verify hook: internal error: {exc}", file=sys.stderr)
+        with contextlib.suppress(Exception):
+            print(f"handoff-verify hook: internal error: {exc}", file=sys.stderr)
         return 2 if fail_closed else 0
-
-    if result.stdout:
-        print(result.stdout)
-    if result.stderr:
-        print(result.stderr, file=sys.stderr)
-    return result.exit_code
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
-    if not args.claude_code:
-        print("Error: specify a target harness (e.g., --claude-code).", file=sys.stderr)
-        return 2
-
     if not args.write:
         snippet = build_claude_code_settings_snippet(
             mode=args.mode,
             strict=bool(args.strict),
             command=args.command_override,
         )
-        print(json.dumps(snippet, indent=2))
+        print(json.dumps(snippet, indent=2, ensure_ascii=False))
         return 0
 
     settings_path = Path(args.settings).expanduser()
+    hook_cmd = build_claude_code_hook_command(
+        mode=args.mode,
+        strict=bool(args.strict),
+        command=args.command_override,
+    )
     try:
         _, created = write_claude_code_settings(
             settings_path,
@@ -214,10 +217,8 @@ def _cmd_init(args: argparse.Namespace) -> int:
         return 2
 
     action = "Created" if created else "Updated"
-    strict_suffix = ", strict" if args.strict else ""
     print(
-        f"{action} Claude Code hooks in {settings_path} "
-        f"(SubagentStop, Stop; mode={args.mode}{strict_suffix})."
+        f"{action} Claude Code hooks in {settings_path} (SubagentStop, Stop; command={hook_cmd!r})."
     )
     return 0
 
@@ -288,7 +289,7 @@ def build_parser() -> argparse.ArgumentParser:
     check_parser.add_argument(
         "--quiet-on-pass",
         action="store_true",
-        help="Suppress output when verification passes.",
+        help="Suppress output when verification passes with zero findings.",
     )
     check_parser.add_argument(
         "--parser",
@@ -366,25 +367,42 @@ def build_parser() -> argparse.ArgumentParser:
         "--command",
         dest="command_override",
         default=None,
-        help=("Executable prefix or full hook command override (default: handoff-verify)."),
+        help=(
+            "Shell command fragment prefix (e.g. 'uvx handoff-verify') or full hook "
+            "command override containing 'hook claude-code' (default: handoff-verify)."
+        ),
     )
     init_parser.set_defaults(func=_cmd_init)
 
     return parser
 
 
+def _hook_argv_flags(argv: list[str] | None) -> tuple[bool, bool]:
+    """Return ``(is_hook_subcommand, fail_closed_requested)`` from raw CLI argv."""
+    tokens = sys.argv[1:] if argv is None else list(argv)
+    is_hook = bool(tokens) and tokens[0] == "hook"
+    fail_closed = "--fail-closed" in tokens
+    return is_hook, fail_closed
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entry point returning POSIX exit code (0=pass, 1=findings, 2=usage/internal error)."""
+    is_hook, fail_closed = _hook_argv_flags(argv)
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
-        code = exc.code
-        return code if isinstance(code, int) else 2
+        code = exc.code if isinstance(exc.code, int) else 2
+        if is_hook and code != 0 and not fail_closed:
+            return 0
+        return code
     try:
         return int(args.func(args))
     except Exception as exc:
-        print(f"Error: internal failure: {exc}", file=sys.stderr)
+        with contextlib.suppress(Exception):
+            print(f"Error: internal failure: {exc}", file=sys.stderr)
+        if is_hook and not fail_closed:
+            return 0
         return 2
 
 
