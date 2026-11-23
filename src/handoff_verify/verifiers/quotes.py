@@ -28,7 +28,7 @@ _WS_RUN_RE = re.compile(r"[ \t]+")
 _PUNCT_OPEN_SPACE_RE = re.compile(r"([(\[{])\s+")
 _PUNCT_CLOSE_SPACE_RE = re.compile(r"\s+([)\]},;])")
 _TRAILING_COMMA_RE = re.compile(r",([)\]}])")
-_OP_SPACE_RE = re.compile(r"\s*(==|!=|<=|>=|=>|->|:=|\+=|-=|\*=|/=|=|:|,)\s*")
+_OP_SPACE_RE = re.compile(r"\s*(==|!=|<=|>=|=>|->|:=|\+=|-=|\*=|/=|=|<|>|:|,)\s*")
 # R2-2: recognize before/after edit descriptions (`from \`a\` to \`b\``, `\`a\` -> \`b\``, `is now`)
 _PAST_TENSE_QUOTE_RE = re.compile(
     r"(?:\b(?:previously|before|used\s+to|formerly|originally|was|had|old|removed|replaced|"
