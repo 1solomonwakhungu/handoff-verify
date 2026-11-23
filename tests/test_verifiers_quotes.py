@@ -175,3 +175,45 @@ def test_quote_fabricated_command_output_flagged() -> None:
     assert len(findings) == 1
     assert findings[0].code == "QUOTE_NOT_FOUND"
     assert findings[0].severity == "error"
+
+
+def test_quote_operator_spacing_normalization_for_comparisons_and_shifts() -> None:
+    content = (
+        "def check(cost: float, cap: float, bits: int) -> bool:\n"
+        "    if cost <= 0 or cost > cap:\n"
+        "        return False\n"
+        "    return (bits << 2) >= 8\n"
+    )
+
+    def _run(quote: str) -> list:
+        tr = _make_transcript(
+            f"In `src/bucket.py:1-4`, the code has `{quote}`.",
+            file_reads=[
+                FileReadEvent(
+                    event_index=0,
+                    tool_name="Read",
+                    file_path="src/bucket.py",
+                    start_line=1,
+                    end_line=4,
+                    content=content,
+                )
+            ],
+        )
+        return verify_quotes(extract_claims(tr), tr)
+
+    # Matching spacing variants pass
+    assert _run("if cost<=0 or cost>cap:") == []
+    assert _run("def check(cost:float, cap:float, bits:int)->bool:") == []
+    assert _run("return (bits<<2)>=8") == []
+
+    # Distinct operators / inversions MUST fail
+    for bad in (
+        "if cost < 0 or cost > cap:",
+        "if cost <= 0 or cost >= cap:",
+        "if cost >= 0 or cost < cap:",
+        "return (bits < 2) >= 8",
+        "return (bits >> 2) >= 8",
+    ):
+        findings = _run(bad)
+        assert len(findings) == 1, f"expected failure for {bad!r}"
+        assert findings[0].code == "QUOTE_NOT_FOUND"

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from handoff_verify import __version__
+from handoff_verify.evals import EvalSuiteError, format_eval_summary, run_eval_suite
 from handoff_verify.formatters import format_report
 from handoff_verify.hooks import (
     DEFAULT_CLAUDE_SETTINGS_PATH,
@@ -223,6 +224,18 @@ def _cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_eval(args: argparse.Namespace) -> int:
+    cases_dir = Path(args.cases_dir) if args.cases_dir is not None else None
+    try:
+        summary = run_eval_suite(cases_dir=cases_dir, strict=bool(args.strict))
+    except (EvalSuiteError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    print(format_eval_summary(summary, args.format, verbose=bool(args.verbose)))
+    return 0 if summary.passed_targets else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level argparse parser for handoff-verify."""
     parser = argparse.ArgumentParser(
@@ -374,6 +387,33 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     init_parser.set_defaults(func=_cmd_init)
+
+    eval_parser = subparsers.add_parser(
+        "eval",
+        help="Run the seeded evaluation suite and report precision, recall, and latency.",
+    )
+    eval_parser.add_argument(
+        "--cases-dir",
+        default=None,
+        help="Path to the evals directory containing manifest.json (auto-discovered if omitted).",
+    )
+    eval_parser.add_argument(
+        "--format",
+        choices=("text", "markdown", "json"),
+        default="text",
+        help="Output format (default: text).",
+    )
+    eval_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Treat warnings as verification failures during eval.",
+    )
+    eval_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show per-case outcomes and timings for every eval case.",
+    )
+    eval_parser.set_defaults(func=_cmd_eval)
 
     return parser
 

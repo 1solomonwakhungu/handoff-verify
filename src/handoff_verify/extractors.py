@@ -504,6 +504,16 @@ _NEGATED_READ_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
+_NEGATED_READ_SUFFIX_RE = re.compile(
+    r"\b(?:"
+    r"(?:was|is|were|are)\s+out\s+of\s+scope|"
+    r"(?:I|we)\s+(?:did\s+not|didn't|have\s+not|haven't)\s+"
+    r"(?:read|open|inspect|check|look\s+at)\s+(?:it|that\s+file|them|those\s+files)"
+    r")\b",
+    re.IGNORECASE,
+)
+_CLAUSE_BOUNDARY_RE = re.compile(r"(?:;|\s—\s|\n|\.(?:\s|$))")
+
 _UNTOUCHED_SUFFIX_RE = re.compile(
     r"\b(?:untouched|unchanged|unmodified|as[- ]is|skipped|unread|unopened)\b",
     re.IGNORECASE,
@@ -549,6 +559,13 @@ def _is_hypothetical_pointer(
         return True
 
     if _NEGATED_READ_PREFIX_RE.search(prefix):
+        return True
+
+    clause_suffix = sentence[match_end : min(len(sentence), match_end + 110)]
+    m_bound = _CLAUSE_BOUNDARY_RE.search(clause_suffix)
+    if m_bound is not None:
+        clause_suffix = clause_suffix[: m_bound.start()]
+    if _NEGATED_READ_SUFFIX_RE.search(clause_suffix):
         return True
 
     if _PROSPECTIVE_PREFIX_RE.search(prefix) and not re.search(
@@ -1349,6 +1366,13 @@ _ABSENCE_STRONG_PATTERNS: tuple[re.Pattern[str], ...] = (
         r"(?:uses|calls|references|imports)\b",
         re.IGNORECASE,
     ),
+    re.compile(
+        r"\bnone\s+of\s+(?:the\s+)?(?:(?:open|remaining|matching|active)\s+)?"
+        r"(?:issues?|tickets?|prs?|pull\s+requests?)\s+"
+        r"(?:mention(?:s|ed)?|contain(?:s|ed)?|reference(?:s|d)?|report(?:s|ed)?|"
+        r"include(?:s|d)?|describe(?:s|d)?|match(?:es|ed)?|have|has)\b",
+        re.IGNORECASE,
+    ),
 )
 
 # Contextual absence patterns (require genuine search/pagination/scope framing — never self-match)
@@ -1441,7 +1465,8 @@ _HEDGING_AFTER_RE = re.compile(
     r"\b(?:"
     r"(?:but|however|though|although)\s+(?:I\s+)?only\s+(?:searched|checked|grepped|scanned|reviewed)|"
     r"treat\s+this\s+as\s+partial|partial\s+(?:search|check|result)|"
-    r"(?:did\s+not|didn't|haven't|have\s+not)\s+(?:search|check|review)\s+(?:the\s+)?(?:rest|other)|"
+    r"(?:did\s+not|didn't|haven't|have\s+not)\s+(?:search|check|review|fetch|read|load)\s+"
+    r"(?:the\s+)?(?:rest|other|remaining|next)|"
     r"may\s+(?:still\s+)?(?:exist|be)\s+elsewhere"
     r")\b",
     re.IGNORECASE,
@@ -1657,6 +1682,18 @@ def _has_hedging(sentence: str, match_start: int, match_end: int) -> bool:
     return bool(_HEDGING_AFTER_RE.search(suffix))
 
 
+_ANAPHORIC_SCOPE_RE = re.compile(
+    r"\b(?:"
+    r"(?:found|present|exist(?:s|ed)?|appear(?:s|ed)?|occur(?:s|red)?|"
+    r"used|called|referenced|imported|defined|located|seen|matched)\s+there\b|"
+    r"(?:in|under|within)\s+that\s+(?:dir|directory|folder|package|module|subdir|subdirectory|path)\b|"
+    r"(?:in|under|within)\s+those\s+(?:files|dirs|directories|folders|packages|modules)\b"
+    r")",
+    re.IGNORECASE,
+)
+_THIS_FILE_REF_RE = re.compile(r"\b(?:in|within)\s+this\s+file\b", re.IGNORECASE)
+
+
 def extract_scope_claims(
     text: str,
     *,
@@ -1667,10 +1704,29 @@ def extract_scope_claims(
     prose_chunks, _ = _segment_markdown(text)
     claims: list[Claim] = []
     seen: set[tuple[str, str]] = set()
+    last_file_path: str | None = None
 
     for chunk in prose_chunks:
+        prev_sentence_qualifiers: list[str] = []
         for _, _, sentence in _iter_sentences(chunk.text):
-            qualifiers = extract_scope_qualifiers(sentence, base_dirs=base_dirs)
+            sent_ptrs = extract_pointer_claims(sentence, base_dirs=base_dirs)
+            for ptr in sent_ptrs:
+                if ptr.file_path:
+                    last_file_path = ptr.file_path
+
+            raw_qualifiers = extract_scope_qualifiers(sentence, base_dirs=base_dirs)
+            if raw_qualifiers:
+                qualifiers = raw_qualifiers
+            elif not has_explicit_repo_wide_wording(sentence):
+                if _THIS_FILE_REF_RE.search(sentence) and last_file_path:
+                    qualifiers = [last_file_path]
+                elif _ANAPHORIC_SCOPE_RE.search(sentence) and prev_sentence_qualifiers:
+                    qualifiers = list(prev_sentence_qualifiers)
+                else:
+                    qualifiers = []
+            else:
+                qualifiers = []
+            prev_sentence_qualifiers = list(raw_qualifiers)
             primary_scope = qualifiers[0] if qualifiers else None
 
             # Absence claims: strong patterns first, then contextual patterns

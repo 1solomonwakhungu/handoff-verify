@@ -23,6 +23,9 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/handoff_verify"]
 
+[tool.hatch.build.targets.wheel.force-include]
+"evals" = "handoff_verify/_evals"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
