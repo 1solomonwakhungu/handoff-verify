@@ -355,7 +355,9 @@ _BANNER_TRUNCATION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (
         re.compile(
-            r"^\([^()\n]{0,160}(?:\btruncated\b|\d+\s+[^()\n]{0,40}\bomitted\b|\.\.\.[^()\n]{0,80}\bomitted\b)[^()\n]{0,160}\)\.?$",
+            r"^\([^()\n]{0,160}(?:\btruncated\b|\d+\s+[^()\n]{0,40}\bomitted\b|"
+            r"\.\.\.[^()\n]{0,80}\bomitted\b|"
+            r"\b(?:output|rest|remaining|content|lines?)\s+omitted\b)[^()\n]{0,160}\)\.?$",
             re.IGNORECASE,
         ),
         "truncated",
@@ -370,7 +372,7 @@ _BANNER_TRUNCATION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (
         re.compile(
-            r"^(?:\.\.\.\s*)?truncated\s+(?:(?:to|after)\s+\d+|\d+\s+(?:lines?|chars?|characters?|bytes?|matches?|results?))\b",
+            r"^(?:\.\.\.\s*)?truncated\s+(?:(?:to|after|at)\s+\d+|\d+\s+(?:lines?|chars?|characters?|bytes?|matches?|results?))\b",
             re.IGNORECASE,
         ),
         "output truncated",
@@ -378,7 +380,7 @@ _BANNER_TRUNCATION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(
             r"^(?:\.\.\.\s*)?(?:output|response|content|file)\s+"
-            r"(?:exceeded\s+(?:the\s+)?(?:max|maximum|limit|size|\d+)|"
+            r"(?:exceeded\s+(?:the\s+)?(?:max|maximum|limit|size|budget|token\s+budget|\d+)|"
             r"is\s+longer\s+than\s+(?:the\s+)?(?:max|maximum|\d+))\b",
             re.IGNORECASE,
         ),
@@ -849,13 +851,13 @@ _COMMON_SEARCH_VALUE_FLAGS = frozenset(
         "--file",
         "--label",
         "--exclude-from",
+        "--max-depth",
     }
 )
 _RG_ONLY_VALUE_FLAGS = frozenset(
     {
         "--context-separator",
         "--colors",
-        "--max-depth",
         "-E",
         "--engine",
         "--encoding",
@@ -876,6 +878,16 @@ _RG_ONLY_VALUE_FLAGS = frozenset(
         "--type",
         "-T",
         "--type-not",
+    }
+)
+_AG_ACK_VALUE_FLAGS = frozenset(
+    {
+        "-G",
+        "--file-search-regex",
+        "--depth",
+        "--ignore-dir",
+        "--type",
+        "-t",
     }
 )
 _PATCH_HEADER_RE = re.compile(
@@ -1319,6 +1331,36 @@ _GREP_TOOL_ERROR_RE = re.compile(
     r"^(?:rg|grep|egrep|fgrep|ag|ack|git|find|fd)\s*:\s*",
     re.IGNORECASE,
 )
+_BINARY_MATCH_RE = re.compile(r"\bbinary\s+file\s+matches\b", re.IGNORECASE)
+_SHELL_ERROR_LINE_RE = re.compile(
+    r"^(?:fatal:\s+|(?:zsh|bash|sh|dash|ksh|fish)(?::[^:\n]+)*:\s*"
+    r".*(?:command not found|not found|no such file or directory|permission denied)"
+    r"|.*\bcommand not found\b)",
+    re.IGNORECASE,
+)
+_FATAL_TOOL_ERROR_DETAIL_RE = re.compile(
+    r"(?:no such file or directory|cannot open|is not a directory|"
+    r"unrecognized option|invalid option|not a git repository|command not found|:\s*not found\s*$)",
+    re.IGNORECASE,
+)
+
+
+def _is_search_error_line(line: str) -> bool:
+    """Return True if a line is a tool/shell error (excluding grep binary-file match notices)."""
+    s = line.strip()
+    if not s or _BINARY_MATCH_RE.search(s):
+        return False
+    return bool(_GREP_TOOL_ERROR_RE.match(s) or _SHELL_ERROR_LINE_RE.match(s))
+
+
+def _is_fatal_search_error_line(line: str) -> bool:
+    """Return True if a line indicates a search command failed to execute or target was missing."""
+    s = line.strip()
+    if not s or _BINARY_MATCH_RE.search(s):
+        return False
+    if _SHELL_ERROR_LINE_RE.match(s):
+        return True
+    return bool(_GREP_TOOL_ERROR_RE.match(s) and _FATAL_TOOL_ERROR_DETAIL_RE.search(s))
 
 
 def _parse_matched_files_from_grep_output(
@@ -1345,10 +1387,18 @@ def _parse_matched_files_from_grep_output(
             continue
         if _EXIT_CODE_LINE_RE.match(s):
             continue
-        if _GREP_TOOL_ERROR_RE.match(s):
+        if _is_search_error_line(s):
             saw_tool_error = True
             continue
         match_lines += 1
+        # Handle `grep: path/to/x.pyc: binary file matches` cleanly as a match
+        if _BINARY_MATCH_RE.search(s):
+            stripped_bin = _GREP_TOOL_ERROR_RE.sub("", s, count=1)
+            bin_path = stripped_bin.split(":", 1)[0].strip()
+            if bin_path and " " not in bin_path and bin_path not in seen:
+                seen.add(bin_path)
+                files.append(bin_path)
+            continue
         if ":" in s:
             prefix = s.split(":", 1)[0].strip()
             looks_like_path = (
@@ -1909,17 +1959,29 @@ def _analyze_search_tokens(
         if exit_code != 1:
             return
         cleaned_err = _strip_exit_code_lines(stdout).strip()
-        if cleaned_err and any(
-            _GREP_TOOL_ERROR_RE.match(line.strip()) for line in split_lf_lines(cleaned_err)
-        ):
+        if cleaned_err and any(_is_search_error_line(line) for line in split_lf_lines(cleaned_err)):
             return
     elif exit_code not in (0, 1, None):
         return
 
-    value_flags = (
-        _COMMON_SEARCH_VALUE_FLAGS | _RG_ONLY_VALUE_FLAGS
-        if search_cmd in ("rg", "ag", "ack")
-        else _COMMON_SEARCH_VALUE_FLAGS
+    if search_cmd == "rg":
+        value_flags = _COMMON_SEARCH_VALUE_FLAGS | _RG_ONLY_VALUE_FLAGS
+    elif search_cmd in ("ag", "ack"):
+        value_flags = _COMMON_SEARCH_VALUE_FLAGS | _AG_ACK_VALUE_FLAGS
+    else:
+        value_flags = _COMMON_SEARCH_VALUE_FLAGS
+
+    short_value_chars = {f[1] for f in value_flags if len(f) == 2 and f.startswith("-")} | {
+        "e",
+        "m",
+    }
+    if search_cmd == "rg":
+        short_value_chars.add("g")
+
+    non_match_flags = (
+        _SEARCH_NON_MATCH_OUTPUT_FLAGS - {"-L"}
+        if search_cmd == "rg"
+        else _SEARCH_NON_MATCH_OUTPUT_FLAGS
     )
 
     query: str | None = None
@@ -1939,7 +2001,7 @@ def _analyze_search_tokens(
             i += 1
             continue
         if not end_of_flags and tok.startswith("-"):
-            if tok in _SEARCH_NON_MATCH_OUTPUT_FLAGS:
+            if tok in non_match_flags:
                 count_unknown = True
                 i += 1
                 continue
@@ -2000,12 +2062,19 @@ def _analyze_search_tokens(
             if tok in value_flags and i + 1 < len(tokens):
                 i += 2
                 continue
-            # Combined short flags like `-rnq`, `-rnc`, `-rnv`, `-rnL`
+            # Combined short flags like `-rnq`, `-rnc`, `-rnA 3`
             if not tok.startswith("--") and len(tok) > 2:
-                if any(ch in tok[1:] for ch in ("q", "c", "v", "L")):
+                short_non_match = ("q", "c", "v") if search_cmd == "rg" else ("q", "c", "v", "L")
+                if any(ch in tok[1:] for ch in short_non_match):
                     count_unknown = True
                 if "l" in tok[1:]:
                     files_only_mode = True
+                # If the trailing short flag takes a value (e.g. `-rnA 3`), consume next token
+                if tok[-1] in short_value_chars and i + 1 < len(tokens):
+                    if tok[-1] == "e":
+                        query = tokens[i + 1]
+                    i += 2
+                    continue
             i += 1
             continue
 
@@ -2040,11 +2109,15 @@ def _analyze_search_tokens(
             single_target_path=single_target,
         )
         if saw_tool_error and parsed_count == 0:
-            # Complete failure (e.g. `grep: srcc/: No such file or directory | head -20`):
+            # Complete failure (e.g. missing path, command not found, git fatal error):
             # never record a failed search as a clean zero-match search.
             return
         match_count = None if saw_tool_error else parsed_count
     else:
+        # Even on non-direct pipes (`| wc -l`, `|| true`, `; echo done`, `-rc | head`),
+        # abort if stdout carries a fatal command/path error so missing roots aren't recorded.
+        if any(_is_fatal_search_error_line(line) for line in split_lf_lines(stdout)):
+            return
         matched_files = []
         match_count = None
 
@@ -2126,6 +2199,17 @@ def _analyze_find_tokens(
             raw_paths.append(tok)
             i += 1
 
+        # Pre-compute which parenthesized groups are followed by `-prune`
+        pruned_indices: set[int] = set()
+        paren_stack: list[int] = []
+        for idx, t in enumerate(tokens):
+            if t == "(":
+                paren_stack.append(idx)
+            elif t == ")" and paren_stack:
+                start_p = paren_stack.pop()
+                if idx + 1 < len(tokens) and tokens[idx + 1] == "-prune":
+                    pruned_indices.update(range(start_p, idx + 1))
+
         negated = False
         while i < len(tokens):
             tok = tokens[i]
@@ -2136,17 +2220,24 @@ def _analyze_find_tokens(
                 i += 1
                 continue
             if tok in ("-name", "-iname") and i + 1 < len(tokens):
-                is_pruned = i + 2 < len(tokens) and tokens[i + 2] == "-prune"
+                is_pruned = (i in pruned_indices) or (
+                    i + 2 < len(tokens) and tokens[i + 2] == "-prune"
+                )
                 if negated or is_pruned:
-                    excluded_dirs.append(tokens[i + 1].strip("*/"))
+                    cleaned = tokens[i + 1].strip("*/")
+                    if cleaned:
+                        excluded_dirs.append(cleaned)
                 else:
                     glob_pattern = tokens[i + 1]
                 negated = False
                 i += 2
                 continue
             if tok in ("-path", "-ipath", "-wholename", "-iwholename") and i + 1 < len(tokens):
-                if negated:
-                    cleaned_pat = tokens[i + 1].strip("*/")
+                is_pruned = (i in pruned_indices) or (
+                    i + 2 < len(tokens) and tokens[i + 2] == "-prune"
+                )
+                if negated or is_pruned:
+                    cleaned_pat = tokens[i + 1].lstrip("./").strip("*/")
                     if cleaned_pat:
                         excluded_dirs.append(cleaned_pat)
                 negated = False

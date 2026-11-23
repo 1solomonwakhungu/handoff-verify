@@ -1526,3 +1526,262 @@ def test_rereview2_4_grep_boolean_r_and_E_flags_and_nonblocking_polish() -> None
         "... 3 more items\n"
     )
     assert detect_truncation(prose) == (False, None)
+
+
+# --- Re-review #3 blocking & non-blocking regression tests ---
+
+
+def test_rereview3_1_codex_missing_envelope_exit_code_never_becomes_evidence() -> None:
+    lines = _jsonl(
+        [
+            # 0.170.0 real abort format: `Wall time: 0.2 seconds\naborted by user`
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "ab_read",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "cat src/auth.py"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "ab_read",
+                    "output": "Wall time: 0.2 seconds\naborted by user",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "ab_rg",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "rg foo src"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "ab_rg",
+                    "output": "Wall time: 0.2 seconds\naborted by user",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "ab_edit",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "python gen.py > out.json"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "ab_edit",
+                    "output": "aborted before dispatch",
+                },
+            },
+            # Still-running session with empty body must NOT record a zero-match search
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "running_rg",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "rg foo /"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "running_rg",
+                    "output": "Process running with session ID 42\nOutput:\n",
+                },
+            },
+            # Policy rejection / parse error / unsupported call
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "pol_rej",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "cat secret.txt"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "pol_rej",
+                    "output": "approval policy is on-request; reject command",
+                },
+            },
+            # `apply_patch` with `aborted before dispatch` must NOT record an edit
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "call_id": "ab_patch",
+                    "name": "apply_patch",
+                    "input": "*** Begin Patch\n*** Update File: a.py\n*** End Patch",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "ab_patch",
+                    "output": "aborted before dispatch",
+                },
+            },
+            # Explicit exit 0 with output starting with `error:` MUST keep its FileReadEvent!
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": "ok_log",
+                    "name": "exec_command",
+                    "arguments": json.dumps({"cmd": "cat app.log"}),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "ok_log",
+                    "output": "Process exited with code 0\nOutput:\nerror: something happened\n",
+                },
+            },
+        ]
+    )
+
+    parsed = parse_codex(lines)
+    assert [r.file_path for r in parsed.file_reads] == ["app.log"]
+    assert parsed.searches == []
+    assert parsed.file_edits == []
+    receipt = build_scope_receipt(parsed)
+    assert receipt.files_read == ["app.log"]
+    assert receipt.searched_roots == []
+    assert receipt.files_edited == []
+
+
+def test_rereview3_2_piped_shell_errors_and_non_direct_failures_and_polish() -> None:
+    # Failed piped searches (command not found, fatal git error, non-direct pipes)
+    bad_lines = _jsonl(
+        [
+            {
+                "type": "command",
+                "command": "rg foo src | head -20",
+                "stdout": "zsh:1: command not found: rg\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "git grep -n foo | head",
+                "stdout": "fatal: not a git repository (or any of the parent directories): .git\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "grep -rn foo srcc/ | wc -l",
+                "stdout": "grep: srcc/: No such file or directory\n0\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "grep -rn foo srcc/ || true",
+                "stdout": "grep: srcc/: No such file or directory\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "grep -rn foo srcc/ | head -20; echo done",
+                "stdout": "grep: srcc/: No such file or directory\ndone\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "grep -rc foo srcc/ | head",
+                "stdout": "grep: srcc/: No such file or directory\n",
+                "exit_code": 0,
+            },
+        ]
+    )
+    p_bad = parse_generic(bad_lines)
+    assert p_bad.searches == []
+    assert build_scope_receipt(p_bad).searched_roots == []
+
+    # Non-blocking polish: binary match, combined `-rnA 3`, git grep --max-depth,
+    # ag/ack `-r`, rg `-L`, grouped find prune, restored truncation banners
+    good_lines = _jsonl(
+        [
+            {
+                "type": "command",
+                "command": "grep -rn foo src",
+                "stdout": "grep: x.pyc: binary file matches\nsrc/a.py:1:foo\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "grep -rnA 3 foo src",
+                "stdout": "",
+                "exit_code": 1,
+            },
+            {
+                "type": "command",
+                "command": "git grep --max-depth 1 foo src",
+                "stdout": "",
+                "exit_code": 1,
+            },
+            {
+                "type": "command",
+                "command": "ag -r foo src",
+                "stdout": "",
+                "exit_code": 1,
+            },
+            {
+                "type": "command",
+                "command": "rg -L foo src",
+                "stdout": "src/a.py:1:foo\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": (
+                    "find . \\( -name .git -o -name node_modules \\) -prune -o -name '*.py' -print"
+                ),
+                "stdout": "./a.py\n",
+                "exit_code": 0,
+            },
+            {
+                "type": "command",
+                "command": "find . -path ./vendor -prune -o -name '*.py'",
+                "stdout": "./a.py\n",
+                "exit_code": 0,
+            },
+        ]
+    )
+    p_good = parse_generic(good_lines)
+    assert p_good.searches[0].match_count == 2
+    assert p_good.searches[0].truncated is False
+    assert p_good.searches[0].matched_files == ["x.pyc", "src/a.py"]
+
+    assert (p_good.searches[1].query, p_good.searches[1].search_paths) == ("foo", ["src"])
+    assert (p_good.searches[2].query, p_good.searches[2].search_paths) == ("foo", ["src"])
+    assert (p_good.searches[3].query, p_good.searches[3].search_paths) == ("foo", ["src"])
+    assert p_good.searches[4].match_count == 1
+    assert p_good.searches[5].excluded_dirs == [".git", "node_modules"]
+    assert p_good.searches[5].glob_pattern == "*.py"
+    assert p_good.searches[6].excluded_dirs == ["vendor"]
+
+    # Restored genuine truncation banners
+    assert detect_truncation("Truncated at 100 results.")[0] is True
+    assert detect_truncation("(output omitted)")[0] is True
+    assert detect_truncation("(rest omitted)")[0] is True
+    assert detect_truncation("File exceeded token budget")[0] is True

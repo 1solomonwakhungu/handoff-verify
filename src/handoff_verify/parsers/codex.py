@@ -127,11 +127,10 @@ def _unwrap_codex_output(raw_output: str) -> tuple[str, int | None, bool]:
             exit_code = safe_int(meta.get("exit_code"))
             if exit_code is None:
                 exit_code = safe_int(obj.get("exit_code"))
-            is_err = (
-                bool(obj.get("is_error", False))
-                or (exit_code is not None and exit_code != 0)
-                or _is_codex_error_text(inner_out)
-            )
+            if exit_code is not None:
+                is_err = bool(obj.get("is_error", False)) or exit_code != 0
+            else:
+                is_err = bool(obj.get("is_error", False)) or _is_codex_error_text(inner_out)
             return inner_out, exit_code, is_err
 
     exit_code: int | None = None
@@ -150,7 +149,7 @@ def _unwrap_codex_output(raw_output: str) -> tuple[str, int | None, bool]:
         if m_exit:
             exit_code = int(m_exit.group(1))
 
-    is_err = (exit_code is not None and exit_code != 0) or _is_codex_error_text(clean)
+    is_err = exit_code != 0 if exit_code is not None else _is_codex_error_text(clean)
     return clean, exit_code, is_err
 
 
@@ -356,6 +355,15 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
         )
         truncated, trunc_reason = detect_truncation(clean_out, tool_name=name)
 
+        # Only derive read/search/edit evidence when a real execution envelope produced
+        # an explicit exit_code. Missing exit_code covers user rejections, aborts
+        # (`Wall time: ...\naborted by user`, `aborted before dispatch`), policy denials,
+        # parse errors, and still-running sessions (`Process running with session ID N`).
+        cmd_is_error = is_error or (
+            exit_code is None
+            and not clean_out.lstrip().lower().startswith("process running with session id")
+        )
+
         ev_cmd = CommandEvent(
             event_id=call.event_id,
             event_index=call.event_index,
@@ -363,7 +371,7 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
             timestamp=call.timestamp,
             raw_input=raw_in,
             raw_output=call.raw_output,
-            is_error=is_error,
+            is_error=cmd_is_error,
             has_result=True,
             truncated=truncated,
             truncation_reason=trunc_reason,
@@ -376,6 +384,9 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
         transcript.events.append(ev_cmd)
         transcript.commands.append(ev_cmd)
 
+        if exit_code is None:
+            return
+
         derived = analyze_shell_command(
             command=command,
             stdout=clean_out,
@@ -385,7 +396,7 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
             timestamp=call.timestamp,
             raw_input=raw_in,
             raw_output=call.raw_output,
-            is_error=is_error,
+            is_error=cmd_is_error,
             exit_code=exit_code,
             truncated=truncated,
             truncation_reason=trunc_reason,
@@ -402,13 +413,19 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
                 timestamp=call.timestamp,
                 raw_input=raw_in,
                 raw_output=clean_out,
-                is_error=is_error,
+                is_error=cmd_is_error,
             )
             if pag is not None:
                 transcript.paginations.append(pag)
         return
 
     if name == "apply_patch":
+        # Require explicit exit_code == 0 or Codex's `Success...` confirmation before
+        # recording an applied patch (rejections/aborts have no exit_code and no Success).
+        patch_applied = (exit_code == 0) or (
+            exit_code is None and not is_error and clean_out.lstrip().startswith("Success")
+        )
+        patch_is_error = not patch_applied
         patch_text = safe_str(raw_in.get("patch") or raw_in.get("input") or "")
         edits = extract_apply_patch_edits(
             patch_text,
@@ -418,11 +435,11 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
             timestamp=call.timestamp,
             raw_input=raw_in,
             raw_output=call.raw_output,
-            is_error=is_error,
+            is_error=patch_is_error,
         )
         if edits:
             transcript.events.append(edits[0])
-            if not is_error:
+            if patch_applied:
                 transcript.file_edits.extend(edits)
         else:
             ev_fallback = FileEditEvent(
@@ -432,12 +449,12 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
                 timestamp=call.timestamp,
                 raw_input=raw_in,
                 raw_output=call.raw_output,
-                is_error=is_error,
+                is_error=patch_is_error,
                 has_result=True,
                 operation="edit",
             )
             transcript.events.append(ev_fallback)
-            if not is_error:
+            if patch_applied:
                 transcript.file_edits.append(ev_fallback)
         return
 
