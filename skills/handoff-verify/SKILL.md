@@ -1,91 +1,66 @@
 ---
 name: handoff-verify
-description: Check that the file pointers, code quotes and "no other callers"-style claims in an agent's final report are backed by what the agent actually read and searched. Use before handing work back, when a handoff-verify hook reports findings, or when reviewing a subagent's report.
+description: 'Use when reviewing a subagent report or agent handoff before trusting or repeating it, when asked to verify, audit, or fact-check what an agent claimed (hallucinated file/line citations, made-up code quotes, "no other callers", "not used anywhere", "checked all files", "reviewed all pages"), when a Stop or SubagentStop hook prints "handoff-verify: FAIL", when auditing a Claude Code or Codex CLI transcript, or when asked to set up Stop/SubagentStop verification hooks. Checks every path:line pointer, quoted snippet, and absence or completeness claim in the final message against the tool-call transcript. Deterministic, local, no LLM calls. Does not judge whether code is correct or tests pass. First command: uvx handoff-verify check <transcript.jsonl> --repo . --format markdown --quiet-on-pass'
+license: MIT
+compatibility: Requires uv (uvx) or pipx; Python >= 3.11. Reads Claude Code and Codex CLI JSONL transcripts. Hook auto-wiring (init) is Claude Code only.
 ---
 
 # handoff-verify
 
-`handoff-verify` reads an agent transcript and checks the final message against the tool
-calls in it. It makes no model calls and runs in well under a second.
+**Run `handoff-verify ...`** (if not on `PATH`, prefix with `uvx handoff-verify ...`; no `uv`? use `pipx run handoff-verify ...`).
 
-It checks three kinds of claim:
+Deterministically verifies every `path:line` pointer, quoted code snippet, and absence/completeness claim (`"no other callers"`, `"not used anywhere"`, `"checked all files"`, `"reviewed all pages"`) in an agent's final report against what the tool-call transcript actually read and searched.
 
-- **Pointers**: `src/auth.py:42`, `src/auth.py:40-55`, `auth.py#L10-L20`. Was that file read,
-  and were those lines in what was shown?
-- **Quotes**: inline or fenced code attributed to a file or to command output. Does that exact
-  text appear in what was read, written or printed?
-- **Absence and completeness**: "no other callers", "not used anywhere", "reviewed all pages".
-  Was there an untruncated search over that scope, and were all pagination cursors followed?
+## When to Run
 
-## When to run it
+| Situation | Action |
+| --- | --- |
+| A subagent returned a report and you are about to trust or repeat its citations/absence claims | Run `handoff-verify check` on the subagent's transcript before relaying it (see command below) |
+| A `Stop` or `SubagentStop` hook prints `handoff-verify: FAIL` | Read each finding (`severity`, `code`, `claim`, `suggestion`), run the missing read or search, and fix or qualify the claim before finishing |
+| Auditing a finished Claude Code or Codex CLI session | `handoff-verify check <transcript.jsonl> --format markdown --quiet-on-pass` *(drop `--repo .` on older transcripts so later disk edits do not trigger `STALE_FILE_READ`; `--latest` finds Claude Code main sessions only, never subagents or Codex)* |
+| Checking what files, search roots, truncations, or unread cursors a transcript actually recorded | `handoff-verify inspect <transcript.jsonl> --json` *(or `inspect --latest` for Claude Code main sessions)* |
+| Wiring Claude Code `Stop` / `SubagentStop` hooks | Run `handoff-verify doctor` first. If `claude_hooks` is OK (e.g. plugin already installed), stop to avoid double-wiring. Otherwise run `handoff-verify init --write --command "uvx handoff-verify"` (add `--settings .claude/settings.local.json` to keep it out of git; use `--mode block` only when the user asks). Under `uvx`, a `binary_on_path` warning is expected (`doctor` exits `0` on warnings). |
 
-- Before reporting back from a review, an investigation or any task whose report cites code.
-- When a `Stop` or `SubagentStop` hook returns a `handoff-verify: FAIL` message.
-- When you receive a subagent's report and plan to repeat its citations.
-
-## Commands
+Check the most recent Claude Code subagent transcript for this repo (if several subagents ran, pass the file matching the agent ID from the Agent tool result instead of `head -1`):
 
 ```bash
-# Check the current Claude Code session (run from the project directory)
-handoff-verify check --latest --json --quiet-on-pass
-
-# Check a specific transcript, such as a subagent's
-handoff-verify check <path-to-transcript.jsonl> --json
-
-# See what a transcript's agent actually read, edited and searched
-handoff-verify inspect <path-to-transcript.jsonl>
-
-# Check PATH, Python version, and Claude Code hook configuration
-handoff-verify doctor
+proj="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects/$(pwd | sed 's/[^A-Za-z0-9]/-/g')"
+handoff-verify check "$(ls -t "$proj"/*/subagents/agent-*.jsonl | head -1)" --repo . --format markdown --quiet-on-pass
 ```
 
-Exit codes: `0` passed, `1` findings, `2` usage or parse error. With `--quiet-on-pass`, a
-clean check prints nothing.
+> **Critical timing rule:** `check` inspects the last assistant text already written to the JSONL file. It cannot see a report you have not sent, and inside your own live session `check --latest` usually reads your most recent mid-turn preamble (0 claims, silent pass). For your own final message, use the `Stop` hook. Use `check` on finished subagent transcripts and past sessions.
 
-Transcript locations:
+## Reading Output & Exit Codes
 
-- Claude Code: `~/.claude/projects/<cwd-with-dashes>/<session-id>.jsonl`
-- Claude Code subagent: `.../<session-id>/subagents/agent-<id>.jsonl`
-- Codex CLI: `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`
+Prefer `--format markdown --quiet-on-pass` (or `--format md`) for compact findings; `--json` includes every extracted claim as well as `findings` (`severity`, `code`, `claim`, `suggestion`).
 
-## Reading a finding
+- Exit `0`: no error-level findings (warnings may still print; `--quiet-on-pass` is silent only at 0 findings; pass `--strict` to promote warnings to exit `1`)
+- Exit `1`: at least one error-level finding (or warning under `--strict`)
+- Exit `2`: usage, missing file, or parse error
 
-Each entry in `findings` has:
+| Finding Code | Meaning | Fix |
+| --- | --- | --- |
+| `UNREAD_FILE` | Cited a file never read in the transcript | Read the file before citing it |
+| `LINE_OUT_OF_RANGE` | Cited lines outside the read window (`offset`/`limit`) | Read the cited line range |
+| `STALE_FILE_READ` | File was edited after reading (or drifted on disk with `--repo .`; has warning variants) | Re-read after the edit, or drop `--repo .` for historical audits |
+| `UNMATCHED_QUOTE` | Quoted snippet does not match tool output | Re-read and quote verbatim, or paraphrase without quotes |
+| `UNSEARCHED_CLAIM` | Claimed `"no other callers"` / `"not used anywhere"` without a search | Run `rg` / `Grep` across the claimed scope |
+| `TRUNCATED_SEARCH` | Search output hit `head_limit` / truncation | Re-run narrowed or untruncated, or qualify the claim |
+| `SCOPE_MISMATCH` | Search covered a narrower directory than claimed | Search the full claimed scope, or narrow the claim |
+| `UNPAGINATED_COMPLETENESS` | Claimed `"all pages"` / `"all results"` with an unread pagination cursor | Fetch remaining pages, or state how many pages were checked |
+| `UNVERIFIED_ABSENCE` | Generic absence claim lacking search evidence | Run an explicit search or soften the claim |
+| `EXCLUDED_SEARCH_DIRS` *(warning only)* | Search excluded non-trivial source directories | Re-search including them, or state the exclusion |
+| `INVALID_LINE_RANGE` / `LINE_BEYOND_EOF` | Backwards range or line past EOF | Re-read the file and correct the line numbers |
 
-- `code`: what went wrong (table below)
-- `claim.text` and `claim.context`: the exact words in the report
-- `evidence`: what the transcript does and does not show
-- `suggestion`: the read or search that would ground the claim
+## Transcript Locations
 
-A finding means the transcript does not show support for the claim. It does not prove the
-claim false. Resolve it by looking, then either keep the claim or correct it.
-
-| Code | What to do |
-| --- | --- |
-| `UNREAD_FILE` | Read the cited lines. If they say what you claimed, keep the citation; otherwise fix or drop it. |
-| `LINE_OUT_OF_READ_WINDOW` | You read the file but not those lines. Read them. |
-| `STALE_FILE_READ` | The file changed after you read it. Re-read and update the line numbers. |
-| `FILE_NOT_FOUND`, `LINE_OUT_OF_BOUNDS` | The path or line does not exist on disk. Correct it. |
-| `QUOTE_NOT_FOUND` | The quoted text was never observed. Re-read and quote exactly, or paraphrase without code formatting. |
-| `QUOTE_MISMATCH` | The quote was seen in a different file. Fix the attribution. |
-| `NO_SEARCH_EVIDENCE` | You claimed absence without searching. Run the search or soften the claim. |
-| `TRUNCATED_SEARCH_OUTPUT` | The search output was cut off (`head`, a result limit). Re-run it unbounded. |
-| `NARROW_SEARCH_SCOPE` | You searched a subdirectory and claimed the whole repository. Widen the search or name the scope you searched. |
-| `UNREAD_PAGINATION_CURSOR` | A tool returned more pages than you fetched. Fetch them or say how many you reviewed. |
-| `EXCLUDED_SEARCH_DIRS` | The search excluded directories the claim does not mention. Name them or search them. |
-
-## Habits that keep reports clean
-
-- Cite a line only after reading it with a tool that shows line numbers: the Read tool,
-  `grep -n`, `cat -n`, `sed -n 'A,Bp' file` as a single command, or `git diff`.
-- Quote code by copying it from tool output. If you are summarising, do not use backticks.
-- State the scope of a search in the claim: "no other callers under `src/`".
-- After editing a file, re-read the region before citing line numbers in it.
+- **Claude Code main sessions:** `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<cwd-non-alnum-to-dashes>/<session-id>.jsonl` (`check --latest` discovers these only)
+- **Claude Code subagents:** `${CLAUDE_CONFIG_DIR:-~/.claude}/projects/<cwd-non-alnum-to-dashes>/<parent-session-id>/subagents/agent-<id>.jsonl`
+- **Codex CLI rollouts:** `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (always pass the path explicitly)
 
 ## Limits
 
-- Reads through arbitrary scripts (`python - <<EOF` slicing files) cannot always be mapped to
-  line numbers and may still be reported as unread. One direct read of the cited lines clears
-  the finding.
-- It verifies that claims are grounded in the transcript. It does not judge whether the
-  conclusions drawn from them are right.
+- Checks **grounding against the transcript**, not whether code is correct or tests pass.
+- Currently parses Claude Code and Codex CLI JSONL transcripts (not Cursor, OpenCode, or Antigravity transcripts).
+- Shell reads through arbitrary inline scripts (`python -c ...`) cannot always map back to exact line numbers; prefer dedicated file-read tools or `nl -ba` / `sed -n` / `cat -n`.
+- Treat a finding as *"the transcript does not show this"*, not *"this is definitely false"*.
