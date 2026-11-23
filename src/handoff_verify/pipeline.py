@@ -5,13 +5,14 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
+from handoff_verify.extractors import extract_claims
 from handoff_verify.models import (
-    Claim,
     Finding,
     ParsedTranscript,
     ScopeReceipt,
     VerificationReport,
 )
+from handoff_verify.verifiers import verify_pointers, verify_quotes, verify_scope
 
 
 def _dedupe_preserve_order(items: list[str]) -> list[str]:
@@ -108,17 +109,16 @@ def verify_transcript(
     repo_root: Path | None = None,
     strict: bool = False,
 ) -> VerificationReport:
-    """Verify claims in a parsed transcript against observed tool-call evidence.
-
-    In PR 1 (Foundation), this builds the factual ScopeReceipt and returns a clean
-    VerificationReport. Deterministic claim extractors and verifiers plug in here in PR 2.
-    """
-    _ = repo_root  # Reserved for live-repo verification in PR 2
+    """Extract and deterministically verify claims in a parsed transcript."""
     t0 = time.perf_counter()
 
     scope_receipt = build_scope_receipt(transcript)
-    claims: list[Claim] = []
+    claims = extract_claims(transcript, repo_root=repo_root)
+
     findings: list[Finding] = []
+    findings.extend(verify_pointers(claims, transcript, repo_root=repo_root))
+    findings.extend(verify_quotes(claims, transcript, repo_root=repo_root))
+    findings.extend(verify_scope(claims, transcript, scope_receipt, repo_root=repo_root))
 
     passed = not any(
         f.severity == "error" or (strict and f.severity == "warning") for f in findings
