@@ -1,4 +1,4 @@
-"""Quoted code snippet verifier (exact and whitespace-normalized matching)."""
+"""Quoted code snippet verifier (exact, whitespace/operator normalized, lazy corpus)."""
 
 from __future__ import annotations
 
@@ -11,11 +11,11 @@ from handoff_verify.parsers._common import split_lf_lines
 from handoff_verify.verifiers._paths import (
     build_base_dirs,
     is_exact_path_match,
+    is_suffix_path_match,
     normalize_path,
     paths_match,
 )
 
-# Line-number prefix patterns commonly copied from Read / cat -n / grep -n outputs
 _ARROW_PREFIX_RE = re.compile(r"^\s*\d+→")
 _TAB_NUM_PREFIX_RE = re.compile(r"^\s*\d+\t")
 _GREP_PREFIX_RE = re.compile(r"^[^\s:][^:\n]*:\d+[:-]")
@@ -24,6 +24,11 @@ _WS_RUN_RE = re.compile(r"[ \t]+")
 _PUNCT_OPEN_SPACE_RE = re.compile(r"([(\[{])\s+")
 _PUNCT_CLOSE_SPACE_RE = re.compile(r"\s+([)\]},;])")
 _TRAILING_COMMA_RE = re.compile(r",([)\]}])")
+_OP_SPACE_RE = re.compile(r"\s*(==|!=|<=|>=|=>|->|:=|\+=|-=|\*=|/=|=|:|,)\s*")
+_PAST_TENSE_QUOTE_RE = re.compile(
+    r"\b(?:previously|before|used\s+to|formerly|originally|was|had|old|removed|replaced)\b",
+    re.IGNORECASE,
+)
 
 
 def _strip_line_prefixes(lines: list[str]) -> list[str]:
@@ -35,12 +40,10 @@ def _strip_line_prefixes(lines: list[str]) -> list[str]:
     if not non_empty:
         return lines
 
-    # Check if every non-empty line carries a Claude Code arrow, cat -n tab, or grep prefix
     for pat in (_ARROW_PREFIX_RE, _TAB_NUM_PREFIX_RE, _GREP_PREFIX_RE):
         if all(pat.match(ln) for ln in non_empty):
             return [pat.sub("", ln, count=1) if ln.strip() else ln for ln in lines]
 
-    # For multi-line snippets only, strip `12: code` or `12 | code` if ALL non-empty lines match
     if len(non_empty) >= 2 and all(_COLON_NUM_PREFIX_RE.match(ln) for ln in non_empty):
         return [_COLON_NUM_PREFIX_RE.sub("", ln, count=1) if ln.strip() else ln for ln in lines]
 
@@ -48,7 +51,6 @@ def _strip_line_prefixes(lines: list[str]) -> list[str]:
 
 
 def _normalize_lines(text: str) -> list[str]:
-    """Normalize text into stripped, single-space-collapsed non-empty lines."""
     raw_lines = _strip_line_prefixes(split_lf_lines(text))
     norm: list[str] = []
     for ln in raw_lines:
@@ -59,56 +61,132 @@ def _normalize_lines(text: str) -> list[str]:
 
 
 def _compact_code(flat: str) -> str:
-    """Normalize spacing around delimiters and trailing commas while preserving all tokens."""
+    """Normalize spacing around delimiters and operators while preserving all tokens."""
     s = _PUNCT_OPEN_SPACE_RE.sub(r"\1", flat)
     s = _PUNCT_CLOSE_SPACE_RE.sub(r"\1", s)
     s = _TRAILING_COMMA_RE.sub(r"\1", s)
+    s = _OP_SPACE_RE.sub(r"\1", s)
     return s
+
+
+def _is_ident_char(ch: str) -> bool:
+    return ch.isalnum() or ch == "_"
+
+
+def _bounded_contains(needle: str, haystack: str) -> bool:
+    """Substring check enforcing identifier boundaries at start/end of needle.
+
+    Prevents `out = 30` from falsely matching inside `timeout = 30`.
+    """
+    if not needle:
+        return True
+    need_left = _is_ident_char(needle[0])
+    need_right = _is_ident_char(needle[-1])
+    start = 0
+    n_len = len(needle)
+    h_len = len(haystack)
+    while True:
+        idx = haystack.find(needle, start)
+        if idx == -1:
+            return False
+        left_ok = (not need_left) or idx == 0 or not _is_ident_char(haystack[idx - 1])
+        end_idx = idx + n_len
+        right_ok = (not need_right) or end_idx == h_len or not _is_ident_char(haystack[end_idx])
+        if left_ok and right_ok:
+            return True
+        start = idx + 1
 
 
 @dataclass(frozen=True)
 class _NormalizedText:
     raw: str
+    lines: tuple[str, ...]
     block: str
     flat: str
     compact: str
 
 
 def _prepare_text(text: str) -> _NormalizedText:
-    norm_lines = _normalize_lines(text)
+    norm_lines = tuple(_normalize_lines(text))
     block = "\n".join(norm_lines)
     flat = " ".join(norm_lines)
     compact = _compact_code(flat)
-    return _NormalizedText(raw=text, block=block, flat=flat, compact=compact)
+    return _NormalizedText(raw=text, lines=norm_lines, block=block, flat=flat, compact=compact)
 
 
-@dataclass(frozen=True)
-class _CorpusEntry:
-    source_kind: str  # "file_read", "file_edit", "search", "command", "tool"
+@dataclass
+class _LazyCorpusEntry:
+    source_kind: str  # "file_read", "file_edit", "file_edit_old", "search", "command", "tool"
     file_path: str | None
     event_index: int
     tool_name: str
-    text: _NormalizedText
+    raw_text: str
+    _prepared: _NormalizedText | None = None
+
+    def prepared(self) -> _NormalizedText:
+        if self._prepared is None:
+            self._prepared = _prepare_text(self.raw_text)
+        return self._prepared
 
 
-def _matches(snippet: _NormalizedText, corpus: _NormalizedText) -> bool:
-    """Return True if snippet matches corpus exactly or under whitespace normalization."""
+def _ordered_subsequence_match(
+    snippet_lines: tuple[str, ...], corpus_lines: tuple[str, ...]
+) -> bool:
+    """Return True if every normalized snippet line appears in order inside corpus_lines."""
+    if len(snippet_lines) < 2 or not corpus_lines:
+        return False
+    c_idx = 0
+    c_len = len(corpus_lines)
+    for s_ln in snippet_lines:
+        s_compact = _compact_code(s_ln)
+        found = False
+        while c_idx < c_len:
+            c_ln = corpus_lines[c_idx]
+            c_idx += 1
+            if _bounded_contains(s_ln, c_ln) or (
+                len(s_compact) >= 6 and _bounded_contains(s_compact, _compact_code(c_ln))
+            ):
+                found = True
+                break
+        if not found:
+            return False
+    return True
+
+
+def _matches(
+    snippet: _NormalizedText,
+    entry: _LazyCorpusEntry,
+    *,
+    allow_subsequence: bool = False,
+) -> bool:
+    """Return True if snippet matches entry exactly or under whitespace/operator normalization."""
     if not snippet.block:
         return True
-    if snippet.raw in corpus.raw:
+    # Fast raw check before normalizing a huge entry!
+    if _bounded_contains(snippet.raw, entry.raw_text):
         return True
-    if snippet.block in corpus.block:
+    corpus = entry.prepared()
+    if _bounded_contains(snippet.block, corpus.block):
         return True
-    if snippet.flat and snippet.flat in corpus.flat:
+    if snippet.flat and _bounded_contains(snippet.flat, corpus.flat):
         return True
-    return bool(snippet.compact and len(snippet.compact) >= 6 and snippet.compact in corpus.compact)
+    if (
+        snippet.compact
+        and len(snippet.compact) >= 6
+        and _bounded_contains(snippet.compact, corpus.compact)
+    ):
+        return True
+    if allow_subsequence and len(snippet.lines) >= 2:
+        return _ordered_subsequence_match(snippet.lines, corpus.lines)
+    return False
 
 
-def _build_corpus(
+def _build_lazy_corpus(
     transcript: ParsedTranscript,
     base_dirs: tuple[str, ...],
-) -> list[_CorpusEntry]:
-    entries: list[_CorpusEntry] = []
+) -> list[_LazyCorpusEntry]:
+    """Build lightweight raw corpus entries; normalization happens lazily per entry on demand."""
+    entries: list[_LazyCorpusEntry] = []
 
     for r in transcript.file_reads:
         if not r.has_result or r.is_error:
@@ -118,12 +196,12 @@ def _build_corpus(
             continue
         norm_fp = normalize_path(r.file_path, base_dirs=base_dirs) if r.file_path else None
         entries.append(
-            _CorpusEntry(
+            _LazyCorpusEntry(
                 source_kind="file_read",
                 file_path=norm_fp,
                 event_index=r.event_index,
                 tool_name=r.tool_name,
-                text=_prepare_text(body),
+                raw_text=body,
             )
         )
 
@@ -131,84 +209,87 @@ def _build_corpus(
         if not e.has_result or e.is_error:
             continue
         norm_fp = normalize_path(e.file_path, base_dirs=base_dirs) if e.file_path else None
-        parts = [p for p in (e.content, e.new_text, e.old_text) if p]
-        if not parts:
-            continue
-        entries.append(
-            _CorpusEntry(
-                source_kind="file_edit",
-                file_path=norm_fp,
-                event_index=e.event_index,
-                tool_name=e.tool_name,
-                text=_prepare_text("\n".join(parts)),
+        active_parts = [p for p in (e.content, e.new_text) if p]
+        if active_parts:
+            entries.append(
+                _LazyCorpusEntry(
+                    source_kind="file_edit",
+                    file_path=norm_fp,
+                    event_index=e.event_index,
+                    tool_name=e.tool_name,
+                    raw_text="\n".join(active_parts),
+                )
             )
-        )
+        if e.old_text:
+            entries.append(
+                _LazyCorpusEntry(
+                    source_kind="file_edit_old",
+                    file_path=norm_fp,
+                    event_index=e.event_index,
+                    tool_name=e.tool_name,
+                    raw_text=e.old_text,
+                )
+            )
 
     for s in transcript.searches:
         if not s.has_result or s.is_error or not s.output:
             continue
-        # Group grep content lines by file when formatted as `path:line:content`
         by_file: dict[str, list[str]] = {}
-        all_lines = split_lf_lines(s.output)
-        for ln in all_lines:
-            m = _GREP_PREFIX_RE.match(ln)
-            if m:
+        for ln in split_lf_lines(s.output):
+            if _GREP_PREFIX_RE.match(ln):
                 path_part = ln.split(":", 1)[0].strip()
                 norm_fp = normalize_path(path_part, base_dirs=base_dirs)
                 content_part = _GREP_PREFIX_RE.sub("", ln, count=1)
                 by_file.setdefault(norm_fp, []).append(content_part)
         for norm_fp, flines in by_file.items():
             entries.append(
-                _CorpusEntry(
+                _LazyCorpusEntry(
                     source_kind="search",
                     file_path=norm_fp,
                     event_index=s.event_index,
                     tool_name=s.tool_name,
-                    text=_prepare_text("\n".join(flines)),
+                    raw_text="\n".join(flines),
                 )
             )
         entries.append(
-            _CorpusEntry(
+            _LazyCorpusEntry(
                 source_kind="search",
                 file_path=None,
                 event_index=s.event_index,
                 tool_name=s.tool_name,
-                text=_prepare_text(s.output),
+                raw_text=s.output,
             )
         )
 
     for cmd in transcript.commands:
         if not cmd.has_result:
             continue
-        combined = "\n".join(p for p in (cmd.stdout, cmd.stderr) if p)
+        # B7: include executed command string as well as stdout/stderr so command mentions match
+        combined = "\n".join(p for p in (cmd.command, cmd.stdout, cmd.stderr) if p)
         if not combined:
             continue
         entries.append(
-            _CorpusEntry(
+            _LazyCorpusEntry(
                 source_kind="command",
                 file_path=None,
                 event_index=cmd.event_index,
                 tool_name=cmd.tool_name,
-                text=_prepare_text(combined),
+                raw_text=combined,
             )
         )
 
-    # Also index other completed non-errored tool outputs (e.g., MCP / WebFetch)
+    # B7: include ALL completed tool outputs (including errored tool calls!) so quoting an
+    # error message from a failed MCP/WebFetch tool call verifies cleanly.
     indexed_event_indices = {entry.event_index for entry in entries}
     for ev in transcript.events:
-        if (
-            ev.event_index not in indexed_event_indices
-            and ev.has_result
-            and not ev.is_error
-            and ev.raw_output
-        ):
+        if ev.event_index not in indexed_event_indices and ev.has_result and ev.raw_output:
             entries.append(
-                _CorpusEntry(
+                _LazyCorpusEntry(
                     source_kind="tool",
                     file_path=None,
                     event_index=ev.event_index,
                     tool_name=ev.tool_name,
-                    text=_prepare_text(ev.raw_output),
+                    raw_text=ev.raw_output,
                 )
             )
 
@@ -216,22 +297,35 @@ def _build_corpus(
 
 
 def _entries_for_file(
-    entries: list[_CorpusEntry],
+    entries: list[_LazyCorpusEntry],
     claimed_path: str,
     base_dirs: tuple[str, ...],
-) -> list[_CorpusEntry]:
-    exact = [
+    *,
+    include_old: bool,
+) -> list[_LazyCorpusEntry]:
+    eligible = [
         e
         for e in entries
-        if e.file_path is not None
-        and is_exact_path_match(claimed_path, e.file_path, base_dirs=base_dirs)
+        if e.file_path is not None and (include_old or e.source_kind != "file_edit_old")
+    ]
+    exact = [
+        e
+        for e in eligible
+        if is_exact_path_match(claimed_path, e.file_path or "", base_dirs=base_dirs)
     ]
     if exact:
         return exact
-    return [
+    suffix = [
         e
-        for e in entries
-        if e.file_path is not None and paths_match(claimed_path, e.file_path, base_dirs=base_dirs)
+        for e in eligible
+        if is_suffix_path_match(claimed_path, e.file_path or "", base_dirs=base_dirs)
+    ]
+    if suffix:
+        distinct = {e.file_path for e in suffix}
+        if len(distinct) == 1:
+            return suffix
+    return [
+        e for e in eligible if paths_match(claimed_path, e.file_path or "", base_dirs=base_dirs)
     ]
 
 
@@ -247,19 +341,63 @@ def verify_quotes(
         return []
 
     base_dirs = build_base_dirs(transcript.cwd, repo_root)
-    corpus = _build_corpus(transcript, base_dirs)
+    corpus = _build_lazy_corpus(transcript, base_dirs)
     findings: list[Finding] = []
 
     for claim in quote_claims:
         assert claim.snippet is not None
         snippet_norm = _prepare_text(claim.snippet)
         preview = claim.snippet.strip().splitlines()[0][:80]
+        is_past_tense = bool(_PAST_TENSE_QUOTE_RE.search(claim.context or ""))
 
         if claim.file_path:
             norm_path = normalize_path(claim.file_path, base_dirs=base_dirs)
-            file_entries = _entries_for_file(corpus, claim.file_path, base_dirs)
+            file_entries = _entries_for_file(
+                corpus, claim.file_path, base_dirs, include_old=is_past_tense
+            )
 
-            if any(_matches(snippet_norm, entry.text) for entry in file_entries):
+            # NB3: If the file was edited and the claim is present-tense, don't let a pre-edit
+            # read justify code that was explicitly removed by a later Edit's `old_text`.
+            if not is_past_tense:
+                removed_entries = [
+                    e
+                    for e in _entries_for_file(corpus, claim.file_path, base_dirs, include_old=True)
+                    if e.source_kind == "file_edit_old"
+                ]
+                active_edit_entries = [e for e in file_entries if e.source_kind == "file_edit"]
+                if removed_entries:
+                    in_removed = any(_matches(snippet_norm, e) for e in removed_entries)
+                    in_new = any(_matches(snippet_norm, e) for e in active_edit_entries)
+                    latest_edit_idx = max(e.event_index for e in removed_entries)
+                    post_edit_reads = [
+                        e
+                        for e in file_entries
+                        if e.source_kind == "file_read" and e.event_index > latest_edit_idx
+                    ]
+                    in_post_read = any(_matches(snippet_norm, e) for e in post_edit_reads)
+                    if in_removed and not in_new and not in_post_read:
+                        findings.append(
+                            Finding(
+                                severity="error",
+                                code="QUOTE_NOT_FOUND",
+                                claim=claim,
+                                evidence={
+                                    "claimed_file": norm_path,
+                                    "reason": "quoted_removed_code",
+                                    "snippet_preview": preview,
+                                },
+                                message=(
+                                    f"Quoted snippet `{preview}` was removed from `{norm_path}` "
+                                    f"by an edit at event #{latest_edit_idx}."
+                                ),
+                                suggestion=(
+                                    f"Re-read `{norm_path}` and quote the current post-edit code."
+                                ),
+                            )
+                        )
+                        continue
+
+            if any(_matches(snippet_norm, entry) for entry in file_entries):
                 continue
 
             # Not found in the cited file; check if it actually appeared in a DIFFERENT file
@@ -268,8 +406,9 @@ def verify_quotes(
                     entry
                     for entry in corpus
                     if entry.file_path is not None
+                    and entry.source_kind != "file_edit_old"
                     and entry not in file_entries
-                    and _matches(snippet_norm, entry.text)
+                    and _matches(snippet_norm, entry)
                 ),
                 None,
             )
@@ -297,18 +436,6 @@ def verify_quotes(
                 )
                 continue
 
-            # Also check command stdout (e.g., error output tied to file mention)
-            cmd_match = next(
-                (
-                    entry
-                    for entry in corpus
-                    if entry.source_kind == "command" and _matches(snippet_norm, entry.text)
-                ),
-                None,
-            )
-            if cmd_match is not None:
-                continue
-
             checked_sources = [f"{e.source_kind}#{e.event_index}" for e in file_entries]
             findings.append(
                 Finding(
@@ -333,8 +460,17 @@ def verify_quotes(
                 )
             )
         else:
-            # General quote (command output or unattributed fenced block)
-            if any(_matches(snippet_norm, entry.text) for entry in corpus):
+            # General quote (command output, tool output, or unattributed fenced block):
+            # allow ordered line-subsequence match for non-contiguous multi-line output excerpts.
+            if any(
+                _matches(
+                    snippet_norm,
+                    entry,
+                    allow_subsequence=entry.source_kind in ("command", "tool", "search"),
+                )
+                for entry in corpus
+                if entry.source_kind != "file_edit_old" or is_past_tense
+            ):
                 continue
 
             findings.append(

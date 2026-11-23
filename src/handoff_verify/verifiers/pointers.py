@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
+import posixpath
 import re
+import shlex
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
@@ -18,17 +22,28 @@ from handoff_verify.models import (
 )
 from handoff_verify.parsers._common import split_lf_lines
 from handoff_verify.verifiers._paths import (
+    KNOWN_EXTENSIONLESS_FILES,
     build_base_dirs,
     is_exact_path_match,
+    is_suffix_path_match,
     normalize_path,
     paths_match,
     resolve_in_repo,
 )
 
+_T = TypeVar("_T")
+
 _GREP_CONTENT_LINE_RE = re.compile(r"^([^\s:][^:\n]*):(\d+)[:-]")
+_SIMPLE_COLON_LINE_END_RE = re.compile(r":(\d{1,6})$")
+_PY_TRACEBACK_FILE_RE = re.compile(r'File\s+"([^"]+)",\s+line\s+(\d+)')
+_EDIT_SNIPPET_LINE_RE = re.compile(r"^\s*(\d+)[→\t]")
 _EDIT_SUMMARY_VERB_RE = re.compile(
     r"\b(?:updated?|edited?|modif(?:y|ied)|fixed?|changed?|patched?|"
     r"added?|removed?|deleted?|refactored?|wrote|written|created?|applied?|replaced?)\b",
+    re.IGNORECASE,
+)
+_DELETE_SUMMARY_VERB_RE = re.compile(
+    r"\b(?:removed?|deleted?|dropped?|cleaned\s+up|unlinked?|rm)\b",
     re.IGNORECASE,
 )
 
@@ -71,7 +86,6 @@ def _format_uncovered_suggestion(
     if c_end < min_start:
         return f"Read lines {c_start}-{min_start - 1} of {file_path}"
 
-    # Compute uncovered sub-intervals inside [c_start, c_end]
     uncovered: list[tuple[int, int]] = []
     cur = c_start
     for ws, we in merged:
@@ -108,7 +122,17 @@ def _write_event_window(ev: FileEditEvent) -> tuple[int, int] | None:
     return (1, max(1, line_count))
 
 
-_T = TypeVar("_T")
+def _edit_result_snippet_lines(ev: FileEditEvent) -> set[int]:
+    """Extract 1-based line numbers shown in an Edit tool result's `cat -n` snippet."""
+    lines_seen: set[int] = set()
+    if ev.raw_output:
+        for ln in split_lf_lines(ev.raw_output):
+            m = _EDIT_SNIPPET_LINE_RE.match(ln)
+            if m:
+                num = int(m.group(1))
+                if num >= 1:
+                    lines_seen.add(num)
+    return lines_seen
 
 
 def _filter_matching_events(
@@ -117,7 +141,7 @@ def _filter_matching_events(
     claimed_path: str,
     base_dirs: tuple[str, ...],
 ) -> list[_T]:
-    """Match events by exact normalized path first; fall back to basename only if no exact match."""
+    """3-tier path match: exact -> unique relative suffix -> basename-only fallback."""
     exact = [
         item
         for item in items
@@ -126,6 +150,19 @@ def _filter_matching_events(
     ]
     if exact:
         return exact
+
+    # B2: relative-vs-relative segment-boundary suffix match (when unique distinct file)
+    suffix = [
+        item
+        for item in items
+        if path_getter(item)
+        and is_suffix_path_match(claimed_path, path_getter(item), base_dirs=base_dirs)
+    ]
+    if suffix:
+        distinct = {normalize_path(path_getter(item), base_dirs=base_dirs) for item in suffix}
+        if len(distinct) == 1:
+            return suffix
+
     return [
         item
         for item in items
@@ -133,50 +170,193 @@ def _filter_matching_events(
     ]
 
 
-def _grep_observed_lines(
-    searches: list[SearchEvent],
-    claimed_path: str,
-    base_dirs: tuple[str, ...],
-) -> set[int]:
-    """Return 1-based line numbers explicitly shown in grep/rg content output for claimed_path."""
-    observed: set[int] = set()
-    for search in searches:
-        if not search.has_result or search.is_error or not search.output:
-            continue
-        for line in split_lf_lines(search.output):
+# --- B5 + B15: Pre-built O(N) output line index & observed path index ---
+
+
+class _OutputLineIndex:
+    """Single-pass index of `path:line` observations across searches, commands, and tool outputs."""
+
+    def __init__(self, transcript: ParsedTranscript, base_dirs: tuple[str, ...]) -> None:
+        self._base_dirs = base_dirs
+        # norm_path -> dict[line_no, max_event_index]
+        self._by_path: dict[str, dict[int, int]] = {}
+        self._by_basename: dict[str, set[str]] = {}
+        self._index_transcript(transcript)
+
+    def _add(self, raw_path: str, line_no: int, event_index: int) -> None:
+        if line_no < 1 or not raw_path:
+            return
+        norm_p = normalize_path(raw_path, base_dirs=self._base_dirs)
+        if not norm_p:
+            return
+        line_map = self._by_path.setdefault(norm_p, {})
+        prev = line_map.get(line_no)
+        if prev is None or event_index > prev:
+            line_map[line_no] = event_index
+        base = posixpath.basename(norm_p)
+        self._by_basename.setdefault(base, set()).add(norm_p)
+
+    def _scan_text(self, text: str, event_index: int, *, scan_inline: bool = False) -> None:
+        if not text:
+            return
+        for line in split_lf_lines(text):
             m = _GREP_CONTENT_LINE_RE.match(line)
-            if not m:
+            if m and (not scan_inline or " " not in m.group(1)):
+                with contextlib.suppress(ValueError):
+                    self._add(m.group(1), int(m.group(2)), event_index)
                 continue
-            path_part = m.group(1)
-            if paths_match(claimed_path, path_part, base_dirs=base_dirs):
-                try:
-                    line_num = int(m.group(2))
-                except ValueError:
-                    continue
-                if line_num >= 1:
-                    observed.add(line_num)
-    return observed
+            m_tb = _PY_TRACEBACK_FILE_RE.search(line)
+            if m_tb:
+                with contextlib.suppress(ValueError):
+                    self._add(m_tb.group(1), int(m_tb.group(2)), event_index)
+                continue
+            if scan_inline:
+                for tok in line.split():
+                    if len(tok) > 320 or ":" not in tok:
+                        continue
+                    cleaned = tok.strip("`\"'()[].,;:!?*")
+                    m_end = _SIMPLE_COLON_LINE_END_RE.search(cleaned)
+                    if not m_end:
+                        continue
+                    p_part = cleaned[: m_end.start()]
+                    if "/" in p_part and "://" not in p_part:
+                        with contextlib.suppress(ValueError):
+                            self._add(p_part, int(m_end.group(1)), event_index)
+
+    def _index_transcript(self, transcript: ParsedTranscript) -> None:
+        indexed_ev: set[int] = set()
+        for search in transcript.searches:
+            if not search.has_result or search.is_error or not search.output:
+                continue
+            indexed_ev.add(search.event_index)
+            self._scan_text(search.output, search.event_index)
+
+        for cmd in transcript.commands:
+            if not cmd.has_result:
+                continue
+            indexed_ev.add(cmd.event_index)
+            if cmd.stdout:
+                self._scan_text(cmd.stdout, cmd.event_index)
+            if cmd.stderr:
+                self._scan_text(cmd.stderr, cmd.event_index)
+
+        # Also index other completed tool outputs (e.g., Task/subagent results relaying path:line)
+        for ev in transcript.events:
+            if (
+                ev.event_index not in indexed_ev
+                and ev.has_result
+                and not ev.is_error
+                and ev.raw_output
+            ):
+                self._scan_text(ev.raw_output, ev.event_index, scan_inline=True)
+
+    def matching_lines(
+        self, claimed_path: str, *, after_event_index: int | None = None
+    ) -> set[int]:
+        """Return observed 1-based line numbers for `claimed_path` in O(1) amortized time."""
+        norm_c = normalize_path(claimed_path, base_dirs=self._base_dirs)
+        if not norm_c:
+            return set()
+        base = posixpath.basename(norm_c)
+        candidate_paths = self._by_basename.get(base)
+        if not candidate_paths:
+            return set()
+
+        matched_paths: list[str] = []
+        if norm_c in candidate_paths:
+            matched_paths = [norm_c]
+        else:
+            exact = [
+                p
+                for p in candidate_paths
+                if is_exact_path_match(norm_c, p, base_dirs=self._base_dirs)
+            ]
+            if exact:
+                matched_paths = exact
+            else:
+                suffix = [
+                    p
+                    for p in candidate_paths
+                    if is_suffix_path_match(norm_c, p, base_dirs=self._base_dirs)
+                ]
+                if len(suffix) == 1:
+                    matched_paths = suffix
+                elif "/" not in norm_c:
+                    matched_paths = list(candidate_paths)
+
+        out: set[int] = set()
+        for p in matched_paths:
+            for ln, ev_idx in self._by_path[p].items():
+                if after_event_index is None or ev_idx > after_event_index:
+                    out.add(ln)
+        return out
 
 
-def _file_mentioned_in_searches(
+def _collect_search_observed_paths(
     searches: list[SearchEvent],
-    claimed_path: str,
     base_dirs: tuple[str, ...],
-) -> bool:
+) -> set[str]:
+    """Collect normalized file paths observed via Glob/Grep/LS (joining dir + bare entries)."""
+    observed: set[str] = set()
     for search in searches:
         if not search.has_result or search.is_error:
             continue
+        roots = search.search_paths or ([search.search_path] if search.search_path else [])
+        for sp in roots:
+            norm_sp = normalize_path(sp, base_dirs=base_dirs)
+            if norm_sp:
+                observed.add(norm_sp)
         for mf in search.matched_files:
-            if paths_match(claimed_path, mf, base_dirs=base_dirs):
-                return True
-        for sp in search.search_paths:
-            if paths_match(claimed_path, sp, base_dirs=base_dirs):
-                return True
-        if search.search_path and paths_match(
-            claimed_path, search.search_path, base_dirs=base_dirs
-        ):
-            return True
-    return False
+            norm_mf = normalize_path(mf, base_dirs=base_dirs)
+            if norm_mf:
+                observed.add(norm_mf)
+                # B5: `LS` tool / `ls src/` lists bare filenames relative to `search_path`
+                if "/" not in norm_mf:
+                    for sp in roots:
+                        norm_sp = normalize_path(sp, base_dirs=base_dirs)
+                        if norm_sp and norm_sp != ".":
+                            observed.add(posixpath.join(norm_sp, norm_mf))
+    return observed
+
+
+def _collect_ls_joined_paths(
+    commands: list[CommandEvent],
+    base_dirs: tuple[str, ...],
+) -> set[str]:
+    """Join `ls <dir>` stdout bare filenames with `<dir>` so `ls src/` observes `src/a.py`."""
+    observed: set[str] = set()
+    for cmd in commands:
+        if not cmd.has_result or cmd.is_error or not cmd.command or not cmd.stdout:
+            continue
+        try:
+            tokens = shlex.split(cmd.command)
+        except ValueError:
+            continue
+        if not tokens or posixpath.basename(tokens[0]) != "ls":
+            continue
+        dirs = [t for t in tokens[1:] if not t.startswith("-")]
+        if len(dirs) != 1:
+            continue
+        norm_dir = normalize_path(dirs[0], base_dirs=base_dirs)
+        if not norm_dir or norm_dir == ".":
+            continue
+        for line in split_lf_lines(cmd.stdout):
+            for entry in line.split():
+                clean = entry.strip().rstrip("/")
+                if clean and "/" not in clean and not clean.startswith("total"):
+                    observed.add(posixpath.join(norm_dir, clean))
+    return observed
+
+
+def _file_in_path_set(
+    claimed_path: str,
+    observed_paths: set[str],
+    base_dirs: tuple[str, ...],
+) -> bool:
+    norm_c = normalize_path(claimed_path, base_dirs=base_dirs)
+    if norm_c in observed_paths:
+        return True
+    return any(paths_match(norm_c, obs, base_dirs=base_dirs) for obs in observed_paths)
 
 
 def _file_mentioned_in_commands(
@@ -184,59 +364,157 @@ def _file_mentioned_in_commands(
     claimed_path: str,
     base_dirs: tuple[str, ...],
 ) -> bool:
-    """Return True if a non-errored command stdout explicitly mentions the normalized file path."""
+    """Return True if a completed command's stdout or invocation mentions the file path."""
     norm_c = normalize_path(claimed_path, base_dirs=base_dirs)
     if not norm_c:
         return False
-    # Require boundary around path so `app.py` doesn't match `myapp.py`
-    pattern = re.compile(r"(?:^|[\s`'\"(/:])" + re.escape(norm_c) + r"(?:$|[\s`'\"):,;\r\n])")
+    pattern = re.compile(r"(?:^|[\s`'\"(/:=])" + re.escape(norm_c) + r"(?:$|[\s`'\"):,;\r\n])")
     for cmd in commands:
-        if not cmd.has_result or cmd.is_error:
+        if not cmd.has_result:
             continue
-        if cmd.stdout and pattern.search(cmd.stdout):
+        if not cmd.is_error and cmd.command and pattern.search(cmd.command):
+            return True
+        if not cmd.is_error and cmd.stdout and pattern.search(cmd.stdout):
             return True
     return False
 
 
-def _claim_refers_to_in_place_edit(
-    claim: Claim,
-    edit: FileEditEvent,
+# --- B1: Sequential Edit Simulation for Precise Stale-Read Analysis ---
+
+
+@dataclass
+class _EditSimulation:
+    """Result of simulating sequential edits after the last FileReadEvent."""
+
+    deleted: bool = False
+    unlocated_or_bash: bool = False
+    earliest_shifted_line: int | None = None
+    known_safe_ranges: list[tuple[int, int]] = None  # type: ignore[assignment]
+    post_edit_observed_lines: set[int] = None  # type: ignore[assignment]
+    last_edit: FileEditEvent | None = None
+
+    def __post_init__(self) -> None:
+        if self.known_safe_ranges is None:
+            self.known_safe_ranges = []
+        if self.post_edit_observed_lines is None:
+            self.post_edit_observed_lines = set()
+
+
+def _simulate_edits_after_read(
     last_read: FileReadEvent | None,
-) -> bool:
-    """Return True if a line-specific claim refers to an exact same-line-count edit just made."""
-    if edit.operation != "edit":
-        return False
-    if edit.old_text is None or edit.new_text is None:
-        return False
-    old_lines = split_lf_lines(edit.old_text)
-    new_lines = split_lf_lines(edit.new_text)
-    if len(old_lines) != len(new_lines):
-        # Line count changed, so line numbers in the file may have shifted!
-        return False
+    edits_after_read: list[FileEditEvent],
+    post_edit_grep_lines: set[int],
+) -> _EditSimulation:
+    """Track which line ranges stayed valid vs shifted across edits after the last read."""
+    sim = _EditSimulation(
+        post_edit_observed_lines=set(post_edit_grep_lines),
+        last_edit=edits_after_read[-1] if edits_after_read else None,
+    )
+    if not edits_after_read:
+        return sim
 
-    ctx = claim.context or ""
-    has_edit_verb = bool(_EDIT_SUMMARY_VERB_RE.search(ctx))
-    # Check if the sentence mentions a non-trivial line/snippet from new_text
-    quotes_new = any(len(ln.strip()) >= 6 and ln.strip() in ctx for ln in new_lines if ln.strip())
-    if not (has_edit_verb or quotes_new):
-        return False
+    # Include `cat -n` snippet lines from the final edit's raw_output (if any)
+    sim.post_edit_observed_lines.update(_edit_result_snippet_lines(edits_after_read[-1]))
 
-    # Verify the claimed line actually matches where old_text was located in last_read (if known)
+    sim_lines: list[str] | None = None
+    sim_start = 1
     if last_read is not None and last_read.content and last_read.start_line is not None:
-        read_lines = split_lf_lines(last_read.content)
-        c_start = claim.start_line
-        if c_start is not None and last_read.start_line <= c_start <= (last_read.end_line or 0):
-            rel_idx = c_start - last_read.start_line
-            if 0 <= rel_idx < len(read_lines):
-                line_text = read_lines[rel_idx].strip()
-                if any(
-                    ol.strip() and (ol.strip() in line_text or line_text in ol.strip())
-                    for ol in old_lines
-                ):
-                    return True
-            return False
+        sim_lines = split_lf_lines(last_read.content)
+        sim_start = last_read.start_line
 
-    return quotes_new
+    known_ranges: list[tuple[int, int]] = []
+    earliest_shifted: int | None = None
+
+    for edit in edits_after_read:
+        if edit.operation == "write":
+            sim.deleted = False
+            sim.unlocated_or_bash = False
+            earliest_shifted = None
+            sim_lines = split_lf_lines(edit.content or "")
+            sim_start = 1
+            known_ranges = [(1, max(1, len(sim_lines)))]
+            continue
+
+        if edit.operation == "delete":
+            sim.deleted = True
+            sim_lines = None
+            known_ranges = []
+            continue
+
+        if edit.operation == "bash_modify":
+            sim.unlocated_or_bash = True
+            earliest_shifted = 1
+            known_ranges = []
+            sim_lines = None
+            continue
+
+        # Standard `edit` operation
+        if sim_lines is None or not edit.old_text:
+            sim.unlocated_or_bash = True
+            earliest_shifted = 1
+            known_ranges = []
+            continue
+
+        joined = "\n".join(sim_lines)
+        pos = joined.find(edit.old_text)
+        if pos == -1:
+            sim.unlocated_or_bash = True
+            earliest_shifted = 1
+            known_ranges = []
+            continue
+
+        start_offset_lines = joined[:pos].count("\n")
+        edit_start_line = sim_start + start_offset_lines
+        old_line_count = len(split_lf_lines(edit.old_text))
+        new_text = edit.new_text if edit.new_text is not None else ""
+        new_line_count = len(split_lf_lines(new_text))
+        delta = new_line_count - old_line_count
+
+        # Apply replacement so subsequent sequential edits / MultiEdit sub-edits locate cleanly
+        updated_joined = joined[:pos] + new_text + joined[pos + len(edit.old_text) :]
+        sim_lines = split_lf_lines(updated_joined)
+
+        new_end_line = edit_start_line + max(1, new_line_count) - 1
+
+        # Shift any previously tracked safe edited ranges that sit below this edit
+        if delta != 0:
+            shifted_prev: list[tuple[int, int]] = []
+            for rs, re_ in known_ranges:
+                if re_ < edit_start_line:
+                    shifted_prev.append((rs, re_))
+                elif rs > edit_start_line + old_line_count - 1:
+                    shifted_prev.append((rs + delta, re_ + delta))
+            known_ranges = shifted_prev
+            shift_point = new_end_line + 1
+            if earliest_shifted is None or shift_point < earliest_shifted:
+                earliest_shifted = shift_point
+
+        known_ranges.append((edit_start_line, new_end_line))
+
+    sim.earliest_shifted_line = earliest_shifted
+    sim.known_safe_ranges = _merge_windows(known_ranges)
+    return sim
+
+
+def _is_line_range_stale(sim: _EditSimulation, c_start: int, c_end: int) -> bool:
+    """Return True if [c_start, c_end] was invalidated/shifted by edits since the last read."""
+    if sim.deleted:
+        return True
+    # Explicitly observed post-edit (via Edit `cat -n` result or post-edit Grep -n)
+    if sim.post_edit_observed_lines and all(
+        ln in sim.post_edit_observed_lines for ln in range(c_start, c_end + 1)
+    ):
+        return False
+    # Directly inside a known edited new-text range (or full Write range)
+    if _window_covers(sim.known_safe_ranges, c_start, c_end):
+        return False
+    if sim.unlocated_or_bash:
+        return True
+    if sim.earliest_shifted_line is None:
+        # All edits preserved line counts -> no lines shifted anywhere in the file!
+        return False
+    # Untouched lines strictly above the earliest shifting edit did NOT shift
+    return c_end >= sim.earliest_shifted_line
 
 
 def verify_pointers(
@@ -254,6 +532,12 @@ def verify_pointers(
         e for e in transcript.file_edits if e.has_result and not e.is_error and e.file_path
     ]
     valid_searches = [s for s in transcript.searches if s.has_result and not s.is_error]
+
+    # B15: Build O(N) indices ONCE before looping over claims
+    output_line_index = _OutputLineIndex(transcript, base_dirs)
+    search_observed_paths = _collect_search_observed_paths(valid_searches, base_dirs)
+    ls_observed_paths = _collect_ls_joined_paths(transcript.commands, base_dirs)
+    all_listed_paths = search_observed_paths | ls_observed_paths
 
     findings: list[Finding] = []
     live_file_cache: dict[Path, list[str] | None] = {}
@@ -287,10 +571,26 @@ def verify_pointers(
             _filter_matching_events(valid_edits, lambda e: e.file_path, claimed_path, base_dirs),
             key=lambda e: e.event_index,
         )
-        grep_lines = (
-            _grep_observed_lines(valid_searches, claimed_path, base_dirs) if c_start else set()
-        )
-        in_searches = _file_mentioned_in_searches(valid_searches, claimed_path, base_dirs)
+        output_lines = output_line_index.matching_lines(claimed_path) if c_start else set()
+        in_searches = _file_in_path_set(claimed_path, all_listed_paths, base_dirs)
+
+        # B4: For slash-less, line-less bare names (e.g. `app.config`, `res.json`, `docs.rs`),
+        # require that the name matches an observed transcript path or an actual file in repo_root;
+        # otherwise drop to avoid false positives on dotted identifiers/domains.
+        if (
+            c_start is None
+            and "/" not in norm_path
+            and norm_path not in KNOWN_EXTENSIONLESS_FILES
+            and not reads
+            and not edits
+            and not in_searches
+            and not _file_mentioned_in_commands(transcript.commands, claimed_path, base_dirs)
+        ):
+            if repo_root is None:
+                continue
+            resolved_check = resolve_in_repo(claimed_path, repo_root, base_dirs=base_dirs)
+            if resolved_check is None or not resolved_check.is_file():
+                continue
 
         write_edits = [e for e in edits if e.operation == "write"]
         unread_fired = False
@@ -298,10 +598,10 @@ def verify_pointers(
         # --- 1. Unread file check ---
         if c_start is not None:
             assert c_end is not None
-            grep_covers_range = bool(grep_lines) and all(
-                ln in grep_lines for ln in range(c_start, c_end + 1)
+            output_covers_range = bool(output_lines) and all(
+                ln in output_lines for ln in range(c_start, c_end + 1)
             )
-            if not reads and not write_edits and not grep_covers_range:
+            if not reads and not write_edits and not output_covers_range:
                 unread_fired = True
                 if in_searches:
                     reason = "only listed/matched in search output without reading file contents"
@@ -321,7 +621,7 @@ def verify_pointers(
                             "observed_in_search": in_searches,
                             "reason": reason,
                         },
-                        message=(f"Cited `{norm_path}` ({line_label}), but the file was {reason}."),
+                        message=f"Cited `{norm_path}` ({line_label}), but the file was {reason}.",
                         suggestion=f"Read {line_label} of {norm_path}",
                     )
                 )
@@ -351,134 +651,153 @@ def verify_pointers(
                     )
                 )
 
-        # --- 2. Stale read & Line window checks (only if file was observed) ---
+        # --- 2. Stale read & Line window checks ---
         stale_fired = False
-        if not unread_fired:
-            last_read = reads[-1] if reads else None
-            last_edit = edits[-1] if edits else None
+        last_edit = edits[-1] if edits else None
+        last_read = reads[-1] if reads else None
+        is_deleted_in_transcript = last_edit is not None and last_edit.operation == "delete"
 
-            # Check if file was edited after the last read
-            if last_edit is not None and (
-                last_read is None or last_edit.event_index > last_read.event_index
-            ):
-                if last_edit.operation == "write":
-                    # Full file write: agent knows current content and line numbers
-                    pass
-                elif last_edit.operation == "delete":
-                    stale_fired = True
-                    findings.append(
-                        Finding(
-                            severity="error",
-                            code="STALE_FILE_READ",
-                            claim=claim,
-                            evidence={
-                                "file_path": norm_path,
-                                "last_read_event_index": last_read.event_index
-                                if last_read
-                                else None,
-                                "last_edit_event_index": last_edit.event_index,
-                                "edit_operation": "delete",
-                            },
-                            message=(
-                                f"Cited `{norm_path}`, which was deleted at event "
-                                f"#{last_edit.event_index}."
-                            ),
-                            suggestion=f"Verify whether {norm_path} still exists before citing it.",
-                        )
+        if not unread_fired:
+            # NB7: include same-event-index `bash_modify` (`cat f && sed -i ... f`)
+            edits_after_read = [
+                e
+                for e in edits
+                if last_read is None
+                or e.event_index > last_read.event_index
+                or (e.event_index == last_read.event_index and e.operation == "bash_modify")
+            ]
+
+            sim: _EditSimulation | None = None
+            if edits_after_read:
+                post_edit_grep = (
+                    output_line_index.matching_lines(
+                        claimed_path, after_event_index=edits_after_read[-1].event_index
                     )
+                    if c_start is not None
+                    else set()
+                )
+                sim = _simulate_edits_after_read(last_read, edits_after_read, post_edit_grep)
+
+                if sim.deleted:
+                    # B6: summarizing a deletion ("Removed `src/a.py`") without line numbers is ok
+                    if c_start is not None or not _DELETE_SUMMARY_VERB_RE.search(
+                        claim.context or ""
+                    ):
+                        stale_fired = True
+                        findings.append(
+                            Finding(
+                                severity="error",
+                                code="STALE_FILE_READ",
+                                claim=claim,
+                                evidence={
+                                    "file_path": norm_path,
+                                    "last_read_event_index": last_read.event_index
+                                    if last_read
+                                    else None,
+                                    "last_edit_event_index": edits_after_read[-1].event_index,
+                                    "edit_operation": "delete",
+                                },
+                                message=(
+                                    f"Cited `{norm_path}`, which was deleted at event "
+                                    f"#{edits_after_read[-1].event_index}."
+                                ),
+                                suggestion=(
+                                    f"Verify whether {norm_path} still exists before citing it."
+                                ),
+                            )
+                        )
+                elif c_start is not None:
+                    assert c_end is not None
+                    if _is_line_range_stale(sim, c_start, c_end):
+                        stale_fired = True
+                        line_label = (
+                            f"line {c_start}" if c_start == c_end else f"lines {c_start}-{c_end}"
+                        )
+                        last_ed = edits_after_read[-1]
+                        findings.append(
+                            Finding(
+                                severity="error",
+                                code="STALE_FILE_READ",
+                                claim=claim,
+                                evidence={
+                                    "file_path": norm_path,
+                                    "claimed_range": [c_start, c_end],
+                                    "last_read_event_index": last_read.event_index
+                                    if last_read
+                                    else None,
+                                    "last_edit_event_index": last_ed.event_index,
+                                    "edit_operation": last_ed.operation,
+                                },
+                                message=(
+                                    f"Cited `{norm_path}` ({line_label}) using a stale read: "
+                                    f"the file was modified at event #{last_ed.event_index} "
+                                    f"({last_ed.operation}) and not re-read afterward."
+                                ),
+                                suggestion=(
+                                    f"Re-read {norm_path} after event #{last_ed.event_index} "
+                                    f"to verify current line numbers."
+                                ),
+                            )
+                        )
                 else:
-                    # `edit` or `bash_modify` after last read without re-reading
-                    if c_start is not None:
-                        if not _claim_refers_to_in_place_edit(claim, last_edit, last_read):
-                            stale_fired = True
-                            line_label = (
-                                f"line {c_start}"
-                                if c_start == c_end
-                                else f"lines {c_start}-{c_end}"
+                    # File-level mention after edit: clean for `write` or edit-summary verbs
+                    last_ed = edits_after_read[-1]
+                    if last_ed.operation != "write" and not _EDIT_SUMMARY_VERB_RE.search(
+                        claim.context or ""
+                    ):
+                        stale_fired = True
+                        findings.append(
+                            Finding(
+                                severity="warning",
+                                code="STALE_FILE_READ",
+                                claim=claim,
+                                evidence={
+                                    "file_path": norm_path,
+                                    "last_read_event_index": last_read.event_index
+                                    if last_read
+                                    else None,
+                                    "last_edit_event_index": last_ed.event_index,
+                                    "edit_operation": last_ed.operation,
+                                },
+                                message=(
+                                    f"Referenced `{norm_path}` after modifying it at event "
+                                    f"#{last_ed.event_index} ({last_ed.operation}) without "
+                                    f"re-reading."
+                                ),
+                                suggestion=f"Re-read {norm_path} to confirm its post-edit state.",
                             )
-                            findings.append(
-                                Finding(
-                                    severity="error",
-                                    code="STALE_FILE_READ",
-                                    claim=claim,
-                                    evidence={
-                                        "file_path": norm_path,
-                                        "claimed_range": [c_start, c_end],
-                                        "last_read_event_index": last_read.event_index
-                                        if last_read
-                                        else None,
-                                        "last_edit_event_index": last_edit.event_index,
-                                        "edit_operation": last_edit.operation,
-                                    },
-                                    message=(
-                                        f"Cited `{norm_path}` ({line_label}) using a stale read: "
-                                        f"the file was modified at event #{last_edit.event_index} "
-                                        f"({last_edit.operation}) and not re-read afterward."
-                                    ),
-                                    suggestion=(
-                                        f"Re-read {norm_path} after event #{last_edit.event_index} "
-                                        f"to verify current line numbers."
-                                    ),
-                                )
-                            )
-                    else:
-                        # File-level mention after edit: clean if summarizing the edit itself
-                        if not _EDIT_SUMMARY_VERB_RE.search(claim.context or ""):
-                            stale_fired = True
-                            findings.append(
-                                Finding(
-                                    severity="warning",
-                                    code="STALE_FILE_READ",
-                                    claim=claim,
-                                    evidence={
-                                        "file_path": norm_path,
-                                        "last_read_event_index": last_read.event_index
-                                        if last_read
-                                        else None,
-                                        "last_edit_event_index": last_edit.event_index,
-                                        "edit_operation": last_edit.operation,
-                                    },
-                                    message=(
-                                        f"Referenced `{norm_path}` after modifying it at event "
-                                        f"#{last_edit.event_index} ({last_edit.operation}) without "
-                                        f"re-reading."
-                                    ),
-                                    suggestion=(
-                                        f"Re-read {norm_path} to confirm its post-edit state."
-                                    ),
-                                )
-                            )
+                        )
 
             # Check line window coverage when a line range is cited
             if c_start is not None:
                 assert c_end is not None
-                # Determine which reads/writes apply to the current file version
-                last_modifying_edit = edits[-1] if edits else None
                 post_edit_reads = (
-                    [r for r in reads if r.event_index > last_modifying_edit.event_index]
-                    if last_modifying_edit is not None
+                    [r for r in reads if r.event_index > last_edit.event_index]
+                    if last_edit is not None
                     else reads
                 )
                 windows: list[tuple[int, int]] = []
                 unknown_untruncated_read = False
 
-                if last_modifying_edit is not None and post_edit_reads:
-                    # File WAS re-read after the last edit: check post-edit windows
+                if last_edit is not None and post_edit_reads:
                     for r in post_edit_reads:
                         w = _read_event_window(r)
                         if w is not None:
                             windows.append(w)
                         elif not r.truncated:
                             unknown_untruncated_read = True
-                    if last_modifying_edit.operation == "write":
-                        ww = _write_event_window(last_modifying_edit)
+                    if last_edit.operation == "write":
+                        ww = _write_event_window(last_edit)
                         if ww is not None:
                             windows.append(ww)
+                    for ln in output_line_index.matching_lines(
+                        claimed_path, after_event_index=last_edit.event_index
+                    ):
+                        windows.append((ln, ln))
                     merged_post = _merge_windows(windows)
                     if not unknown_untruncated_read and not _window_covers(
                         merged_post, c_start, c_end
                     ):
-                        # Was it covered by pre-edit reads? If so, that's a stale read!
                         pre_windows = [w for r in reads if (w := _read_event_window(r)) is not None]
                         merged_pre = _merge_windows(pre_windows)
                         if _window_covers(merged_pre, c_start, c_end) and not stale_fired:
@@ -491,13 +810,12 @@ def verify_pointers(
                                     evidence={
                                         "file_path": norm_path,
                                         "claimed_range": [c_start, c_end],
-                                        "last_edit_event_index": last_modifying_edit.event_index,
+                                        "last_edit_event_index": last_edit.event_index,
                                         "post_edit_windows": [[s, e] for s, e in merged_post],
                                     },
                                     message=(
                                         f"Cited `{norm_path}` lines {c_start}-{c_end}, which were "
-                                        f"only read before event "
-                                        f"#{last_modifying_edit.event_index} "
+                                        f"only read before event #{last_edit.event_index} "
                                         f"and not re-read afterward."
                                     ),
                                     suggestion=_format_uncovered_suggestion(
@@ -527,9 +845,8 @@ def verify_pointers(
                                 )
                             )
                 else:
-                    # No post-edit re-read (no edits, write edit, or stale read already flagged)
-                    if last_modifying_edit is not None and last_modifying_edit.operation == "write":
-                        ww = _write_event_window(last_modifying_edit)
+                    if last_edit is not None and last_edit.operation == "write":
+                        ww = _write_event_window(last_edit)
                         if ww is not None:
                             windows.append(ww)
                     else:
@@ -543,7 +860,11 @@ def verify_pointers(
                             ww = _write_event_window(we)
                             if ww is not None:
                                 windows.append(ww)
-                    for ln in grep_lines:
+                        if sim is not None:
+                            windows.extend(sim.known_safe_ranges)
+                            for ln in sim.post_edit_observed_lines:
+                                windows.append((ln, ln))
+                    for ln in output_lines:
                         windows.append((ln, ln))
 
                     merged = _merge_windows(windows)
@@ -576,8 +897,12 @@ def verify_pointers(
                             )
                         )
 
-        # --- 3. Live repo check (when repo_root is provided) ---
+        # --- 3. Live repo check (confined strictly inside repo_root) ---
         if repo_root is not None:
+            # B6: Never emit FILE_NOT_FOUND for a file deleted in the transcript (line-less mention)
+            if is_deleted_in_transcript and c_start is None:
+                continue
+
             observed_paths = [r.file_path for r in reads] + [e.file_path for e in edits]
             resolved = resolve_in_repo(
                 claimed_path,
@@ -585,6 +910,10 @@ def verify_pointers(
                 base_dirs=base_dirs,
                 fallback_observed=observed_paths,
             )
+            # NB8: Paths escaping repo_root (e.g. `../secret.py` or `/etc/passwd`) are never opened
+            if resolved is None:
+                continue
+
             live_lines = _read_live_lines(resolved)
             if live_lines is None:
                 findings.append(
@@ -631,7 +960,6 @@ def verify_pointers(
                             )
                         )
                     elif reads and not edits and not stale_fired:
-                        # Check if live file content disagrees with the transcript read
                         for r in reversed(reads):
                             if (
                                 r.content
@@ -647,7 +975,6 @@ def verify_pointers(
                                     expected_slice = r_lines[rel_s:rel_e]
                                     live_slice = live_lines[c_start - 1 : c_end]
                                     if expected_slice != live_slice:
-                                        drift_reason = "live_file_differs_from_transcript_read"
                                         findings.append(
                                             Finding(
                                                 severity="error",
@@ -657,7 +984,9 @@ def verify_pointers(
                                                     "file_path": norm_path,
                                                     "claimed_range": [c_start, c_end],
                                                     "read_event_index": r.event_index,
-                                                    "reason": drift_reason,
+                                                    "reason": (
+                                                        "live_file_differs_from_transcript_read"
+                                                    ),
                                                 },
                                                 message=(
                                                     f"Live content of `{norm_path}` at lines "
@@ -672,7 +1001,6 @@ def verify_pointers(
                                         )
                                 break
                 elif reads and not edits and not stale_fired:
-                    # File-level live drift check
                     r = reads[-1]
                     if r.content and r.start_line is not None and r.end_line is not None:
                         r_lines = split_lf_lines(r.content)

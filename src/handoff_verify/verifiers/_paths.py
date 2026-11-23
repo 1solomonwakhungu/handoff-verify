@@ -3,16 +3,52 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import posixpath
 from collections.abc import Sequence
 from pathlib import Path
+
+KNOWN_EXTENSIONLESS_FILES: frozenset[str] = frozenset(
+    {
+        "Makefile",
+        "GNUmakefile",
+        "Dockerfile",
+        "Containerfile",
+        "Procfile",
+        "Gemfile",
+        "Rakefile",
+        "Justfile",
+        "Vagrantfile",
+        "Jenkinsfile",
+        "Brewfile",
+        "LICENSE",
+        "README",
+        "CHANGELOG",
+        "AUTHORS",
+        "CODEOWNERS",
+        "BUILD",
+        "WORKSPACE",
+        "Tiltfile",
+        "Earthfile",
+        ".gitignore",
+        ".dockerignore",
+        ".editorconfig",
+        ".npmrc",
+        ".nvmrc",
+        ".eslintrc",
+        ".prettierrc",
+        ".babelrc",
+        ".env",
+        ".python-version",
+        ".tool-versions",
+    }
+)
 
 
 def _to_posix(raw: str) -> str:
     """Convert backslashes to forward slashes and strip surrounding whitespace/quotes."""
     s = raw.strip().strip("`\"'")
-    s = s.replace("\\", "/")
-    return s
+    return s.replace("\\", "/")
 
 
 def _norm_base(base: str | Path) -> str:
@@ -52,19 +88,17 @@ def build_base_dirs(cwd: str | None, repo_root: Path | None) -> tuple[str, ...]:
     return tuple(normalized)
 
 
-def normalize_path(raw: str, *, base_dirs: Sequence[str] = ()) -> str:
-    """Normalize a file or directory path to a clean repo-relative POSIX form when possible."""
+@functools.lru_cache(maxsize=8192)
+def _normalize_path_cached(raw: str, base_dirs: tuple[str, ...]) -> str:
     s = _to_posix(raw)
     if not s:
         return ""
 
-    # Preserve leading double slash only? No, collapse duplicate slashes cleanly.
     is_abs = s.startswith("/")
     norm = posixpath.normpath(s)
     if is_abs and not norm.startswith("/"):
         norm = "/" + norm
 
-    # Strip matching base directory prefix if absolute
     if norm.startswith("/"):
         for base in base_dirs:
             if not base or not base.startswith("/"):
@@ -76,37 +110,20 @@ def normalize_path(raw: str, *, base_dirs: Sequence[str] = ()) -> str:
                 rel = norm[len(prefix) :]
                 return rel or "."
 
-    # Strip leading "./"
     while norm.startswith("./"):
         norm = norm[2:]
 
     return norm or "."
 
 
-def paths_match(claimed: str, observed: str, *, base_dirs: Sequence[str] = ()) -> bool:
-    """Return True if a claimed file path refers to the same file as an observed path."""
-    norm_c = normalize_path(claimed, base_dirs=base_dirs)
-    norm_o = normalize_path(observed, base_dirs=base_dirs)
-    if not norm_c or not norm_o:
-        return False
-    if norm_c == norm_o:
-        return True
-
-    # Segment-boundary suffix match when one is absolute and the other is relative
-    # (covers transcripts where cwd wasn't recorded and tool used an absolute path).
-    c_abs = norm_c.startswith("/")
-    o_abs = norm_o.startswith("/")
-    if o_abs and not c_abs and norm_o.endswith("/" + norm_c):
-        return True
-    if c_abs and not o_abs and norm_c.endswith("/" + norm_o):
-        return True
-
-    # Basename-only fallback when claimed path has no directory component
-    return "/" not in norm_c and posixpath.basename(norm_o) == norm_c
+def normalize_path(raw: str, *, base_dirs: Sequence[str] = ()) -> str:
+    """Normalize a file or directory path to a clean repo-relative POSIX form when possible."""
+    bd = base_dirs if isinstance(base_dirs, tuple) else tuple(base_dirs)
+    return _normalize_path_cached(raw, bd)
 
 
 def is_exact_path_match(claimed: str, observed: str, *, base_dirs: Sequence[str] = ()) -> bool:
-    """Return True if claimed and observed match without basename-only fallback."""
+    """Return True if claimed and observed match exactly (or abs-vs-rel suffix)."""
     norm_c = normalize_path(claimed, base_dirs=base_dirs)
     norm_o = normalize_path(observed, base_dirs=base_dirs)
     if not norm_c or not norm_o:
@@ -120,6 +137,36 @@ def is_exact_path_match(claimed: str, observed: str, *, base_dirs: Sequence[str]
     return c_abs and not o_abs and norm_c.endswith("/" + norm_o)
 
 
+def is_suffix_path_match(claimed: str, observed: str, *, base_dirs: Sequence[str] = ()) -> bool:
+    """Return True if two multi-segment paths match via a segment-boundary suffix in either dir.
+
+    Covers monorepo sub-paths (`apps/api/src/auth.ts` vs `src/auth.ts`) and subdirectory cwd
+    paths (`src/a.py` with cwd `/repo/packages/web` vs `packages/web/src/a.py`).
+    """
+    norm_c = normalize_path(claimed, base_dirs=base_dirs)
+    norm_o = normalize_path(observed, base_dirs=base_dirs)
+    if not norm_c or not norm_o:
+        return False
+    if norm_c == norm_o:
+        return True
+    if "/" not in norm_c or "/" not in norm_o:
+        return False
+    return norm_o.endswith("/" + norm_c) or norm_c.endswith("/" + norm_o)
+
+
+def paths_match(claimed: str, observed: str, *, base_dirs: Sequence[str] = ()) -> bool:
+    """Return True if a claimed file path refers to the same file as an observed path."""
+    if is_exact_path_match(claimed, observed, base_dirs=base_dirs):
+        return True
+    if is_suffix_path_match(claimed, observed, base_dirs=base_dirs):
+        return True
+    norm_c = normalize_path(claimed, base_dirs=base_dirs)
+    norm_o = normalize_path(observed, base_dirs=base_dirs)
+    if not norm_c or not norm_o:
+        return False
+    return "/" not in norm_c and posixpath.basename(norm_o) == norm_c
+
+
 def is_repo_root_path(path: str | None, *, base_dirs: Sequence[str] = ()) -> bool:
     """Return True if a search root path covers the entire repository root."""
     if path is None:
@@ -130,7 +177,6 @@ def is_repo_root_path(path: str | None, *, base_dirs: Sequence[str] = ()) -> boo
     norm = normalize_path(s, base_dirs=base_dirs)
     if norm in ("", ".", "./"):
         return True
-    # Also treat an ancestor directory of a base_dir as covering repo root
     if norm.startswith("/"):
         for base in base_dirs:
             if base.startswith("/") and (base == norm or base.startswith(norm.rstrip("/") + "/")):
@@ -151,7 +197,6 @@ def path_is_within(child: str, parent: str, *, base_dirs: Sequence[str] = ()) ->
     parent_prefix = norm_parent.rstrip("/") + "/"
     if norm_child.startswith(parent_prefix):
         return True
-    # Handle one-absolute, one-relative case when cwd wasn't recorded
     if (
         norm_parent.startswith("/")
         and not norm_child.startswith("/")
@@ -171,27 +216,44 @@ def resolve_in_repo(
     *,
     base_dirs: Sequence[str] = (),
     fallback_observed: Sequence[str] = (),
-) -> Path:
-    """Resolve a claimed path to a concrete filesystem Path inside/relative to repo_root."""
+) -> Path | None:
+    """Resolve a claimed path inside `repo_root`, returning None if outside `repo_root`."""
     norm_c = normalize_path(claimed, base_dirs=base_dirs)
     if not norm_c:
-        return repo_root
+        return None
+
+    try:
+        resolved_root = repo_root.resolve()
+    except OSError:
+        resolved_root = repo_root
+
+    def _confined(candidate: Path) -> Path | None:
+        try:
+            res = candidate.resolve()
+            if res.is_relative_to(resolved_root):
+                return res
+        except OSError:
+            return None
+        return None
 
     if norm_c.startswith("/"):
-        return Path(norm_c)
+        return _confined(Path(norm_c))
 
-    direct = repo_root / norm_c
-    if direct.exists():
+    direct = _confined(repo_root / norm_c)
+    if direct is not None and direct.exists():
         return direct
 
-    # If claimed is a bare basename (e.g. `login.py`) and an observed read path
-    # matches it (e.g. `src/auth/login.py`), resolve via the observed path.
-    if "/" not in norm_c:
-        for obs in fallback_observed:
-            norm_o = normalize_path(obs, base_dirs=base_dirs)
-            if posixpath.basename(norm_o) == norm_c:
-                candidate = Path(norm_o) if norm_o.startswith("/") else repo_root / norm_o
-                if candidate.exists():
-                    return candidate
+    # Try resolving via observed transcript paths (handles basename & monorepo suffix matches)
+    for obs in fallback_observed:
+        norm_o = normalize_path(obs, base_dirs=base_dirs)
+        if not norm_o:
+            continue
+        if is_suffix_path_match(norm_c, norm_o) or (
+            "/" not in norm_c and posixpath.basename(norm_o) == norm_c
+        ):
+            cand = Path(norm_o) if norm_o.startswith("/") else repo_root / norm_o
+            confined = _confined(cand)
+            if confined is not None and confined.exists():
+                return confined
 
     return direct
