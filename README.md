@@ -70,7 +70,7 @@ handoff-verify check session.jsonl --format markdown
 handoff-verify check session.jsonl --format json
 ```
 
-Run the bundled 24-case seeded regression suite (shipped in both source checkouts and built wheels; pass `--cases-dir <path>` to run a custom suite):
+Run the bundled 24-case seeded regression suite (shipped in both source checkouts and built wheels; the bundled suite runs by default, so pass `--cases-dir <path>` when running a custom local suite):
 
 ```bash
 # Exit 0 when all targets pass, exit 1 if targets are missed, exit 2 on missing/invalid manifest
