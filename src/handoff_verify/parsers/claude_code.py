@@ -22,14 +22,17 @@ from handoff_verify.parsers._common import (
     detect_pagination,
     detect_truncation,
     extract_text_content,
+    is_truncation_banner_line,
     load_jsonl,
     mark_followed_cursors,
     parse_numbered_lines,
     safe_int,
     safe_str,
+    split_lf_lines,
 )
 
 _EXIT_CODE_RE = re.compile(r"(?:^|\n)Exit code[:\s]+(-?\d+)\b", re.IGNORECASE)
+_LEADING_EXIT_CODE_RE = re.compile(r"^Exit code[:\s]+-?\d+\s*(?:\r?\n)?", re.IGNORECASE)
 _NO_MATCH_SENTINELS = frozenset(
     {
         "no files found",
@@ -87,7 +90,7 @@ def _parse_grep_output(
     if not stripped or stripped.lower() in _NO_MATCH_SENTINELS:
         return [], 0
 
-    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    lines = [line.strip() for line in split_lf_lines(stripped) if line.strip()]
     matched_files: list[str] = []
     seen: set[str] = set()
     match_count = 0
@@ -96,8 +99,9 @@ def _parse_grep_output(
         low = line.lower()
         if low in _NO_MATCH_SENTINELS:
             continue
-        if low.startswith(("found ", "showing ", "... ", "[")):
-            # Summary or truncation banner line
+        if is_truncation_banner_line(line)[0]:
+            continue
+        if low.startswith(("found ", "showing ")):
             continue
         if output_mode == "count" and ":" in line:
             path_part, count_part = line.rsplit(":", 1)
@@ -137,11 +141,13 @@ def _parse_glob_output(raw_output: str, tool_use_result: Any) -> tuple[list[str]
         return [], 0
 
     files: list[str] = []
-    for line in stripped.splitlines():
+    for line in split_lf_lines(stripped):
         s = line.strip()
         if not s or s.lower() in _NO_MATCH_SENTINELS:
             continue
-        if s.startswith(("...", "[")):
+        if is_truncation_banner_line(s)[0]:
+            continue
+        if s.startswith("..."):
             continue
         files.append(s)
     return files, len(files)
@@ -170,6 +176,11 @@ def parse_claude_code(
             transcript.cwd = record["cwd"].strip()
 
         rec_type = record.get("type")
+        # Strictly process only `assistant` and `user` records; ignore side-channel blobs
+        # such as `api-request-blob`, `progress`, `system`, `summary`, `file-history-snapshot`.
+        if rec_type not in ("assistant", "user"):
+            continue
+
         timestamp = record.get("timestamp") if isinstance(record.get("timestamp"), str) else None
         message = record.get("message")
         tool_use_result = record.get("toolUseResult")
@@ -177,11 +188,10 @@ def parse_claude_code(
         if not isinstance(message, dict):
             continue
 
-        role = message.get("role")
         content = message.get("content")
         msg_id = message.get("id") if isinstance(message.get("id"), str) else None
 
-        if rec_type == "assistant" or role == "assistant":
+        if rec_type == "assistant":
             text_parts: list[str] = []
             if isinstance(content, str):
                 if content.strip():
@@ -196,6 +206,8 @@ def parse_claude_code(
                             text_parts.append(block["text"])
                     elif btype == "tool_use":
                         tool_id = safe_str(block.get("id")) or f"tool_{len(pending_list)}"
+                        if tool_id in pending_by_id:
+                            continue
                         tool_name = safe_str(block.get("name"))
                         raw_input = block.get("input")
                         if not isinstance(raw_input, dict):
@@ -212,24 +224,28 @@ def parse_claude_code(
 
             if text_parts:
                 combined_text = "\n".join(text_parts)
+                after_idx = len(pending_list) - 1 if pending_list else None
                 if (
                     msg_id is not None
                     and msg_id == last_assistant_msg_id
                     and transcript.assistant_messages
                 ):
                     prev = transcript.assistant_messages[-1]
-                    prev.text = f"{prev.text}\n{combined_text}"
+                    if prev.text != combined_text:
+                        prev.text = f"{prev.text}\n{combined_text}"
+                    prev.after_event_index = after_idx
                 else:
                     transcript.assistant_messages.append(
                         AssistantMessage(
                             index=len(transcript.assistant_messages),
                             text=combined_text,
                             timestamp=timestamp,
+                            after_event_index=after_idx,
                         )
                     )
                     last_assistant_msg_id = msg_id
 
-        elif (rec_type == "user" or role == "user") and isinstance(content, list):
+        elif rec_type == "user" and isinstance(content, list):
             for block in content:
                 if not isinstance(block, dict) or block.get("type") != "tool_result":
                     continue
@@ -249,7 +265,7 @@ def parse_claude_code(
     for call in pending_list:
         _materialize_claude_event(transcript, call)
 
-    # Mark pagination cursors that were followed by later tool calls
+    # Mark pagination cursors that were followed by later same-tool calls
     mark_followed_cursors(transcript.events, transcript.paginations)
 
     # Mark final assistant message
@@ -266,6 +282,23 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
     raw_out = call.raw_output
     tur = call.tool_use_result if isinstance(call.tool_use_result, dict) else {}
 
+    # Unresolved calls (no matching tool_result) stay in `events` with has_result=False
+    # and never enter typed evidence lists.
+    if not call.has_result:
+        transcript.events.append(
+            ToolEvent(
+                event_id=call.event_id,
+                event_index=call.event_index,
+                tool_name=name,
+                timestamp=call.timestamp,
+                raw_input=raw_in,
+                raw_output="",
+                is_error=False,
+                has_result=False,
+            )
+        )
+        return
+
     if name == "Read":
         file_path = safe_str(raw_in.get("file_path") or raw_in.get("path"))
         offset = safe_int(raw_in.get("offset"))
@@ -281,11 +314,14 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
                     raw_input=raw_in,
                     raw_output=raw_out,
                     is_error=True,
+                    has_result=True,
                 )
             )
             return
 
-        parsed_read = parse_numbered_lines(raw_out, offset=offset, limit=limit)
+        parsed_read = parse_numbered_lines(
+            raw_out, offset=offset, limit=limit, expect_line_numbers=True
+        )
         truncated = parsed_read.truncated
         trunc_reason = parsed_read.truncation_reason
 
@@ -326,6 +362,7 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
             raw_input=raw_in,
             raw_output=raw_out,
             is_error=False,
+            has_result=True,
             truncated=truncated,
             truncation_reason=trunc_reason,
             file_path=file_path,
@@ -341,6 +378,21 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
         return
 
     if name == "Grep":
+        if call.is_error:
+            transcript.events.append(
+                ToolEvent(
+                    event_id=call.event_id,
+                    event_index=call.event_index,
+                    tool_name=name,
+                    timestamp=call.timestamp,
+                    raw_input=raw_in,
+                    raw_output=raw_out,
+                    is_error=True,
+                    has_result=True,
+                )
+            )
+            return
+
         output_mode = safe_str(raw_in.get("output_mode")) or "files_with_matches"
         head_limit = safe_int(raw_in.get("head_limit")) or safe_int(tur.get("appliedLimit"))
         matched_files, match_count = _parse_grep_output(
@@ -357,6 +409,7 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
             truncated = True
             trunc_reason = "toolUseResult.truncated=true"
 
+        sp = safe_str(raw_in.get("path")) or None
         ev_search = SearchEvent(
             event_id=call.event_id,
             event_index=call.event_index,
@@ -364,11 +417,13 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
             timestamp=call.timestamp,
             raw_input=raw_in,
             raw_output=raw_out,
-            is_error=call.is_error,
+            is_error=False,
+            has_result=True,
             truncated=truncated,
             truncation_reason=trunc_reason,
             query=safe_str(raw_in.get("pattern")),
-            search_path=safe_str(raw_in.get("path")) or None,
+            search_path=sp,
+            search_paths=[sp] if sp else [],
             glob_pattern=safe_str(raw_in.get("glob") or raw_in.get("type")) or None,
             excluded_dirs=_extract_negative_globs(raw_in),
             match_count=match_count,
@@ -381,6 +436,21 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
         return
 
     if name in ("Glob", "LS"):
+        if call.is_error:
+            transcript.events.append(
+                ToolEvent(
+                    event_id=call.event_id,
+                    event_index=call.event_index,
+                    tool_name=name,
+                    timestamp=call.timestamp,
+                    raw_input=raw_in,
+                    raw_output=raw_out,
+                    is_error=True,
+                    has_result=True,
+                )
+            )
+            return
+
         matched_files, match_count = _parse_glob_output(raw_out, tur)
         result_limit = safe_int(raw_in.get("limit"))
         truncated, trunc_reason = detect_truncation(
@@ -393,6 +463,7 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
             truncated = True
             trunc_reason = "toolUseResult.truncated=true"
 
+        sp = safe_str(raw_in.get("path")) or None
         ev_glob = SearchEvent(
             event_id=call.event_id,
             event_index=call.event_index,
@@ -400,11 +471,13 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
             timestamp=call.timestamp,
             raw_input=raw_in,
             raw_output=raw_out,
-            is_error=call.is_error,
+            is_error=False,
+            has_result=True,
             truncated=truncated,
             truncation_reason=trunc_reason,
             query=safe_str(raw_in.get("pattern")),
-            search_path=safe_str(raw_in.get("path")) or None,
+            search_path=sp,
+            search_paths=[sp] if sp else [],
             glob_pattern=safe_str(raw_in.get("pattern")) or None,
             excluded_dirs=_extract_negative_globs(raw_in),
             match_count=match_count,
@@ -418,7 +491,10 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
 
     if name == "Bash":
         command = safe_str(raw_in.get("command"))
-        stdout = tur["stdout"] if isinstance(tur.get("stdout"), str) else raw_out
+        if isinstance(tur.get("stdout"), str):
+            stdout = tur["stdout"]
+        else:
+            stdout = _LEADING_EXIT_CODE_RE.sub("", raw_out, count=1)
         stderr = tur["stderr"] if isinstance(tur.get("stderr"), str) else ""
         exit_code = safe_int(tur.get("exitCode") or tur.get("exit_code"))
         if exit_code is None:
@@ -427,10 +503,10 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
                 exit_code = int(m_exit.group(1))
             elif call.is_error:
                 exit_code = 1
-            elif call.has_result:
+            else:
                 exit_code = 0
 
-        truncated, trunc_reason = detect_truncation(raw_out, tool_name=name)
+        truncated, trunc_reason = detect_truncation(stdout, tool_name=name)
         if tur.get("truncated") is True and not truncated:
             truncated = True
             trunc_reason = "toolUseResult.truncated=true"
@@ -443,6 +519,7 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
             raw_input=raw_in,
             raw_output=raw_out,
             is_error=call.is_error,
+            has_result=True,
             truncated=truncated,
             truncation_reason=trunc_reason,
             command=command,
@@ -472,17 +549,19 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
         transcript.file_edits.extend(derived.file_edits)
         transcript.searches.extend(derived.searches)
 
-        pag = detect_pagination(
-            event_id=call.event_id,
-            event_index=call.event_index,
-            tool_name=name,
-            timestamp=call.timestamp,
-            raw_input=raw_in,
-            raw_output=stdout,
-            is_error=call.is_error,
-        )
-        if pag is not None:
-            transcript.paginations.append(pag)
+        # Skip pagination heuristics on shell commands that read or searched repo files
+        if not derived.file_reads and not derived.searches:
+            pag = detect_pagination(
+                event_id=call.event_id,
+                event_index=call.event_index,
+                tool_name=name,
+                timestamp=call.timestamp,
+                raw_input=raw_in,
+                raw_output=stdout,
+                is_error=call.is_error,
+            )
+            if pag is not None:
+                transcript.paginations.append(pag)
         return
 
     if name == "Edit":
@@ -494,6 +573,7 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
             raw_input=raw_in,
             raw_output=raw_out,
             is_error=call.is_error,
+            has_result=True,
             file_path=safe_str(raw_in.get("file_path") or raw_in.get("path")),
             operation="edit",
             old_text=raw_in.get("old_string")
@@ -520,6 +600,7 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
                 raw_input=raw_in,
                 raw_output=raw_out,
                 is_error=call.is_error,
+                has_result=True,
                 file_path=file_path,
                 operation="edit",
             )
@@ -540,6 +621,7 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
                 raw_input=raw_in,
                 raw_output=raw_out,
                 is_error=call.is_error,
+                has_result=True,
                 file_path=file_path,
                 operation="edit",
                 old_text=entry.get("old_string")
@@ -567,6 +649,7 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
             raw_input=raw_in,
             raw_output=raw_out,
             is_error=call.is_error,
+            has_result=True,
             file_path=safe_str(raw_in.get("file_path") or raw_in.get("path")),
             operation="write",
             content=content_val,
@@ -588,6 +671,7 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
             raw_input=raw_in,
             raw_output=raw_out,
             is_error=call.is_error,
+            has_result=True,
             file_path=safe_str(raw_in.get("notebook_path") or raw_in.get("file_path")),
             operation=op,
             new_text=new_source,
@@ -607,6 +691,7 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
         raw_input=raw_in,
         raw_output=raw_out,
         is_error=call.is_error,
+        has_result=True,
         truncated=truncated,
         truncation_reason=trunc_reason,
     )

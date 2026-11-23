@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import posixpath
 import re
 import shlex
 from collections.abc import Iterable
@@ -19,6 +20,7 @@ from handoff_verify.models import (
 )
 
 MAX_PARSE_WARNINGS = 50
+_MAX_JSON_PARSE_BYTES = 10_000_000  # 10 MB guard for inline tool output JSON
 
 
 @dataclass
@@ -31,7 +33,7 @@ class JsonlLoadResult:
 
 
 def load_jsonl_lines(lines: Iterable[str]) -> JsonlLoadResult:
-    """Parse JSONL lines into dict records, never crashing on malformed lines."""
+    """Parse JSONL lines into dict records, never crashing on malformed or pathological lines."""
     result = JsonlLoadResult()
     suppressed = 0
     for line_no, raw_line in enumerate(lines, start=1):
@@ -40,10 +42,11 @@ def load_jsonl_lines(lines: Iterable[str]) -> JsonlLoadResult:
             continue
         try:
             parsed = json.loads(stripped)
-        except json.JSONDecodeError as exc:
+        except (ValueError, RecursionError) as exc:
             result.malformed_lines += 1
             if len(result.parse_warnings) < MAX_PARSE_WARNINGS:
-                result.parse_warnings.append(f"Line {line_no}: invalid JSON ({exc.msg})")
+                msg = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
+                result.parse_warnings.append(f"Line {line_no}: invalid JSON ({msg})")
             else:
                 suppressed += 1
             continue
@@ -72,15 +75,18 @@ def load_jsonl(source: str | Path | Iterable[str]) -> tuple[JsonlLoadResult, str
 
 
 def safe_int(value: Any) -> int | None:
-    """Convert an int-like value to int, rejecting booleans."""
+    """Convert an int-like value to int, rejecting booleans and oversized digit strings."""
     if isinstance(value, bool) or value is None:
         return None
     if isinstance(value, int):
         return value
     if isinstance(value, str):
         s = value.strip()
-        if s and (s.isdigit() or (s.startswith("-") and s[1:].isdigit())):
-            return int(s)
+        if s and len(s) <= 100 and (s.isdigit() or (s.startswith("-") and s[1:].isdigit())):
+            try:
+                return int(s)
+            except ValueError:
+                return None
     return None
 
 
@@ -118,20 +124,53 @@ def extract_text_content(content: Any) -> str:
             return content["text"]
         if isinstance(content.get("output"), str):
             return content["output"]
-        return json.dumps(content, ensure_ascii=False)
+        try:
+            return json.dumps(content, ensure_ascii=False)
+        except (TypeError, ValueError, RecursionError):
+            return str(content)
     return str(content)
+
+
+def split_lf_lines(text: str) -> list[str]:
+    """Split text strictly on CRLF/LF (preserving form feed \\x0c and U+2028 inside lines)."""
+    if not text:
+        return []
+    normalized = text.replace("\r\n", "\n")
+    if normalized.endswith("\n"):
+        normalized = normalized[:-1]
+    return normalized.split("\n")
 
 
 # --- Line-numbered read output parsing ---
 
-_SYSTEM_REMINDER_RE = re.compile(r"\n*<system-reminder>.*?</system-reminder>\s*", re.DOTALL)
 _ARROW_LINE_RE = re.compile(r"^\s*(\d+)→(.*)$")
-_TAB_LINE_RE = re.compile(r"^\s*(\d+)\t(.*)$")
+_TAB_LINE_RE = re.compile(r"^(\s*)(\d+)\t(.*)$")
 _TRAILING_NOTICE_RE = re.compile(
     r"^(?:\.\.\.|\[.*truncated.*\]|Note:|Showing\s+|File\s+content\s+truncated|"
+    r"Results?\s+(?:are|were)\s+truncated|"
     r"\(\d+\s+more\s+lines?\)|\(End of file)",
     re.IGNORECASE,
 )
+
+
+def _strip_trailing_reminders(raw_output: str) -> tuple[str, list[str]]:
+    """Strip only trailing line-start <system-reminder> blocks, keeping in-file tags intact."""
+    reminders: list[str] = []
+    text = raw_output
+    open_tag = "<system-reminder>"
+    close_tag = "</system-reminder>"
+    while True:
+        stripped_end = text.rstrip()
+        if not stripped_end.endswith(close_tag):
+            break
+        open_idx = stripped_end.rfind(open_tag)
+        if open_idx == -1:
+            break
+        if open_idx > 0 and stripped_end[open_idx - 1] != "\n":
+            break
+        reminders.append(stripped_end[open_idx + len(open_tag) : -len(close_tag)])
+        text = stripped_end[:open_idx].rstrip("\r\n")
+    return text, reminders
 
 
 @dataclass
@@ -151,13 +190,14 @@ def parse_numbered_lines(
     *,
     offset: int | None = None,
     limit: int | None = None,
+    expect_line_numbers: bool = True,
 ) -> ParsedReadOutput:
     """Parse Claude Code / cat -n line-numbered output into clean content and line bounds."""
-    cleaned_raw = _SYSTEM_REMINDER_RE.sub("", raw_output)
+    cleaned_raw, trailing_reminders = _strip_trailing_reminders(raw_output)
     if not cleaned_raw:
         return ParsedReadOutput(content="", start_line=None, end_line=None, line_count=0)
 
-    lines = cleaned_raw.splitlines()
+    lines = split_lf_lines(cleaned_raw)
     if not lines:
         return ParsedReadOutput(content="", start_line=None, end_line=None, line_count=0)
 
@@ -178,39 +218,78 @@ def parse_numbered_lines(
         else:
             break
 
-    # Try arrow format first (Claude Code's `   12→code`), then tab format (`   12\tcode`)
-    for regex in (_ARROW_LINE_RE, _TAB_LINE_RE):
-        parsed_nums: list[int] = []
-        parsed_text: list[str] = []
-        matched = True
+    if not truncated and trailing_reminders:
+        for reminder in trailing_reminders:
+            r_trunc, r_reason = detect_truncation(reminder, tool_name="Read")
+            if r_trunc:
+                truncated = True
+                truncation_reason = r_reason
+                break
+
+    if expect_line_numbers and effective_lines:
+        # 1. Try Claude Code's `   12→code` format (strictly increasing line numbers)
+        arrow_nums: list[int] = []
+        arrow_text: list[str] = []
+        arrow_ok = True
         prev_num = 0
         for line in effective_lines:
-            m = regex.match(line)
+            m = _ARROW_LINE_RE.match(line)
             if not m:
-                matched = False
+                arrow_ok = False
                 break
             num = int(m.group(1))
             if num <= prev_num:
-                matched = False
+                arrow_ok = False
                 break
             prev_num = num
-            parsed_nums.append(num)
-            parsed_text.append(m.group(2))
-        if matched and parsed_nums:
-            # Check for explicit line-length truncation inside Claude Code Read notices
-            if not truncated:
-                # Only check non-code reminders from original raw_output (if any)
-                for reminder in _SYSTEM_REMINDER_RE.findall(raw_output):
-                    r_trunc, r_reason = detect_truncation(reminder, tool_name="Read")
-                    if r_trunc:
-                        truncated = True
-                        truncation_reason = r_reason
-                        break
+            arrow_nums.append(num)
+            arrow_text.append(m.group(2))
+        if arrow_ok and arrow_nums:
             return ParsedReadOutput(
-                content="\n".join(parsed_text),
-                start_line=parsed_nums[0],
-                end_line=parsed_nums[-1],
-                line_count=len(parsed_nums),
+                content="\n".join(arrow_text),
+                start_line=arrow_nums[0],
+                end_line=arrow_nums[-1],
+                line_count=len(arrow_nums),
+                truncated=truncated,
+                truncation_reason=truncation_reason,
+            )
+
+        # 2. Try `cat -n` / `nl` / `read_file` tab format: require consecutive increments
+        #    and either starting at 1, matching an explicit offset, or having leading padding
+        #    spaces (so unpadded TSV like `100\tAlice\n101\tBob` is not misparsed).
+        tab_nums: list[int] = []
+        tab_text: list[str] = []
+        tab_ok = True
+        has_padding = False
+        prev_num = 0
+        for idx, line in enumerate(effective_lines):
+            m = _TAB_LINE_RE.match(line)
+            if not m:
+                tab_ok = False
+                break
+            if m.group(1):
+                has_padding = True
+            num = int(m.group(2))
+            if idx == 0:
+                if num < 1:
+                    tab_ok = False
+                    break
+            elif num != prev_num + 1:
+                tab_ok = False
+                break
+            prev_num = num
+            tab_nums.append(num)
+            tab_text.append(m.group(3))
+        if (
+            tab_ok
+            and tab_nums
+            and (tab_nums[0] == 1 or (offset is not None and tab_nums[0] == offset) or has_padding)
+        ):
+            return ParsedReadOutput(
+                content="\n".join(tab_text),
+                start_line=tab_nums[0],
+                end_line=tab_nums[-1],
+                line_count=len(tab_nums),
                 truncated=truncated,
                 truncation_reason=truncation_reason,
             )
@@ -238,76 +317,134 @@ def parse_numbered_lines(
     )
 
 
-# --- Truncation detection ---
+# --- Truncation detection (linear time, anchored to head/tail banners) ---
 
+_GREP_MATCH_LINE_RE = re.compile(r"^[^\s:][^:]*:\d+:")
 _SHOWING_FIRST_RE = re.compile(
-    r"\bshowing\s+(?:the\s+)?first\s+(\d+)\s+(?:of|out\s+of)\s+(\d+)\b",
+    r"^(?:\[|\(|note:\s*)?showing\s+(?:the\s+)?first\s+(\d+)\s+(?:of|out\s+of)\s+(\d+)\b",
     re.IGNORECASE,
 )
 _SHOWING_RANGE_RE = re.compile(
-    r"\bshowing\s+(?:lines?|results?|items?)\s+(\d+)\s*[-–]\s*(\d+)\s+of\s+(\d+)\b",
+    r"^(?:\[|\(|note:\s*)?showing\s+(?:lines?|results?|items?)\s+(\d+)\s*[-–]\s*(\d+)\s+of\s+(\d+)\b",
     re.IGNORECASE,
 )
-_TRUNCATION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"\[[^\]]*\boutput\s+truncated\b[^\]]*\]", re.IGNORECASE), "output truncated"),
-    (re.compile(r"\[[^\]]*\btruncated\b[^\]]*\]", re.IGNORECASE), "output truncated"),
-    (re.compile(r"(?im)^\s*(?:\.\.\.\s*)?output\s+(?:was\s+)?truncated\b"), "output truncated"),
-    (re.compile(r"\boutput\s+(?:was\s+)?truncated\b", re.IGNORECASE), "output truncated"),
-    (re.compile(r"\bresults?\s+(?:were\s+)?truncated\b", re.IGNORECASE), "results truncated"),
-    (re.compile(r"\bfile\s+content\s+truncated\b", re.IGNORECASE), "file content truncated"),
+_BANNER_TRUNCATION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
-        re.compile(r"\b(?:output|response|content)\s+exceeded\b", re.IGNORECASE),
-        "output limit exceeded",
+        re.compile(r"^\[[^\[\]\n]{0,120}\btruncated\b[^\[\]\n]{0,120}\]$", re.IGNORECASE),
+        "truncated",
     ),
-    (re.compile(r"\blimit\s+reached\b", re.IGNORECASE), "limit reached"),
-    (re.compile(r"\bhead_limit\b[^\n]*\breached\b", re.IGNORECASE), "head_limit reached"),
     (
         re.compile(
-            r"(?:\.\.\.\s*\(?|\()\s*(\d+)\s+more\s+"
-            r"(?:lines?|matches?|results?|files?|items?|chars?|characters?|bytes?)\s*\)?",
+            r"^(?:\.\.\.\s*)?(?:output|results?|response|file\s+content)\s+"
+            r"(?:was|were|is|are)?\s*truncated\b",
+            re.IGNORECASE,
+        ),
+        "output truncated",
+    ),
+    (
+        re.compile(
+            r"^(?:\.\.\.\s*)?truncated\s+(?:to|after)?\s*\d*\s*"
+            r"(?:lines?|chars?|characters?|bytes?|matches?|results?)?\b",
+            re.IGNORECASE,
+        ),
+        "output truncated",
+    ),
+    (
+        re.compile(
+            r"^(?:\.\.\.\s*)?(?:output|response|content|file)\s+"
+            r"(?:exceeded|is\s+longer\s+than)\b",
+            re.IGNORECASE,
+        ),
+        "output limit exceeded",
+    ),
+    (
+        re.compile(
+            r"^(?:\[|\(|note:\s*)?(?:head_limit|result\s+limit|output\s+limit)\b.*\breached\b",
+            re.IGNORECASE,
+        ),
+        "limit reached",
+    ),
+    (
+        re.compile(r"^(?:\[|\()?\s*limit\s+reached\s*(?:\]|\))?\.?$", re.IGNORECASE),
+        "limit reached",
+    ),
+    (
+        re.compile(
+            r"^(?:\.\.\.\s*\(?|\()\s*\d+\s+more\s+"
+            r"(?:lines?|matches?|results?|files?|items?|chars?|characters?|bytes?)\s*\)?\.?$",
             re.IGNORECASE,
         ),
         "additional output omitted",
     ),
     (
         re.compile(
-            r"\(\s*\d+\s+(?:lines?|matches?|results?|chars?|characters?)\s+"
-            r"(?:omitted|truncated|skipped)\s*\)",
+            r"^\(\s*\d+\s+(?:lines?|matches?|results?|chars?|characters?)\s+"
+            r"(?:omitted|truncated|skipped)\s*\)\.?$",
             re.IGNORECASE,
         ),
         "output omitted",
     ),
-    (
-        re.compile(
-            r"\btruncated\s+(?:to|after)\s+\d+\s+"
-            r"(?:lines?|chars?|characters?|bytes?|matches?|results?)\b",
-            re.IGNORECASE,
-        ),
-        "output truncated to cap",
-    ),
-    (
-        re.compile(r"(?im)^\s*truncated\s+\d+\s+(?:lines?|chars?|bytes?)\b"),
-        "output truncated",
-    ),
-    (
-        re.compile(
-            r"\b(?:longer|more)\s+than\s+(?:the\s+)?(?:maximum|max|limit)\b",
-            re.IGNORECASE,
-        ),
-        "output exceeded maximum length",
-    ),
 )
 
 
+def is_truncation_banner_line(line: str) -> tuple[bool, str | None]:
+    """Return (True, reason) if a single standalone line is an explicit truncation banner."""
+    s = line.strip()
+    if not s or len(s) > 240:
+        return False, None
+    # Never treat a `path/to/file.py:42:code` grep match line as a truncation banner
+    if _GREP_MATCH_LINE_RE.match(s):
+        return False, None
+
+    m_first = _SHOWING_FIRST_RE.match(s)
+    if m_first:
+        shown, total = int(m_first.group(1)), int(m_first.group(2))
+        if shown < total:
+            return True, f"showing first {shown} of {total}"
+        return False, None
+
+    m_range = _SHOWING_RANGE_RE.match(s)
+    if m_range:
+        end_idx, total = int(m_range.group(2)), int(m_range.group(3))
+        if end_idx < total:
+            return True, f"showing up to {end_idx} of {total}"
+        return False, None
+
+    for pattern, reason in _BANNER_TRUNCATION_PATTERNS:
+        m = pattern.match(s)
+        if m:
+            snippet = s if len(s) <= 80 else reason
+            return True, snippet
+    return False, None
+
+
 def _try_parse_json_object(text: str) -> dict[str, Any] | None:
+    if not text or len(text) > _MAX_JSON_PARSE_BYTES:
+        return None
     stripped = text.strip()
     if not stripped.startswith("{") or not stripped.endswith("}"):
         return None
     try:
         data = json.loads(stripped)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def _sample_head_tail_lines(text: str, *, head: int = 5, tail: int = 10) -> list[str]:
+    """Extract a bounded slice of head and tail lines in O(1) time even for huge outputs."""
+    if not text:
+        return []
+    head_chunk = text[:2048]
+    tail_chunk = text[-4096:] if len(text) > 4096 else text
+    head_lines = split_lf_lines(head_chunk)[:head]
+    tail_lines = split_lf_lines(tail_chunk)[-tail:]
+    # Preserve order without duplicating lines on small texts
+    if len(text) <= 4096:
+        all_lines = split_lf_lines(text)
+        if len(all_lines) <= head + tail:
+            return all_lines
+    return head_lines + tail_lines
 
 
 def detect_truncation(
@@ -317,7 +454,8 @@ def detect_truncation(
     result_limit: int | None = None,
     observed_count: int | None = None,
 ) -> tuple[bool, str | None]:
-    """Detect explicit truncation markers in tool outputs without noisy false positives."""
+    """Detect explicit truncation markers in O(1) bounded time without content false positives."""
+    _ = tool_name
     if (
         result_limit is not None
         and result_limit > 0
@@ -342,45 +480,52 @@ def detect_truncation(
             ):
                 if container.get(flag) is True:
                     return True, f"JSON flag {flag}=true"
-            # Don't run free-text regexes over arbitrary JSON string values unless explicit
-            # banners appear; fall through only for explicit banner messages in top-level message
             msg = container.get("truncation_reason") or container.get("warning")
             if isinstance(msg, str) and "truncat" in msg.lower():
                 return True, msg.strip()
         return False, None
 
-    # Check "showing first N of M" only when N < M
-    m_first = _SHOWING_FIRST_RE.search(text)
-    if m_first:
-        shown, total = int(m_first.group(1)), int(m_first.group(2))
-        if shown < total:
-            return True, f"showing first {shown} of {total}"
-
-    # Check "showing lines X-Y of Z" only when Y < Z
-    m_range = _SHOWING_RANGE_RE.search(text)
-    if m_range:
-        end_idx, total = int(m_range.group(2)), int(m_range.group(3))
-        if end_idx < total:
-            return True, f"showing up to {end_idx} of {total}"
-
-    for pattern, reason in _TRUNCATION_PATTERNS:
-        m = pattern.search(text)
-        if m:
-            snippet = m.group(0).strip()
-            return True, snippet if len(snippet) <= 80 else reason
+    # Scan only bounded head/tail lines so large outputs stay <1ms and code matches don't trigger
+    for line in _sample_head_tail_lines(text):
+        is_trunc, reason = is_truncation_banner_line(line)
+        if is_trunc:
+            return True, reason
 
     return False, None
 
 
 # --- Pagination detection and cursor tracking ---
 
-_PAGE_OF_RE = re.compile(r"\bpage\s+(\d+)\s+of\s+(\d+)\b", re.IGNORECASE)
-_TEXT_CURSOR_RE = re.compile(
-    r"\b(?:next[_ ]?cursor|next[_ ]?page[_ ]?token|continuation[_ ]?token)\s*[:=]\s*"
-    r"['\"]?([A-Za-z0-9._:/+=-]{2,})['\"]?",
+_TEXT_PAGE_OF_RE = re.compile(
+    r"^[\s*-]*(?:showing\s+)?page\s+(\d+)\s+of\s+(\d+)\b",
     re.IGNORECASE,
 )
-_TEXT_HAS_MORE_RE = re.compile(r"\b(?:has_more|hasMore|hasNextPage)\s*[:=]\s*true\b", re.IGNORECASE)
+_TEXT_CURSOR_LINE_RE = re.compile(
+    r"^[\s*-]*(?:next[_ ]?cursor|next[_ ]?page[_ ]?token|continuation[_ ]?token)\s*:\s*"
+    r"['\"]?([A-Za-z0-9._:/+=-]{2,128})['\"]?\s*$",
+    re.IGNORECASE,
+)
+_TEXT_HAS_MORE_LINE_RE = re.compile(
+    r"^[\s*-]*(?:has_more|hasMore|hasNextPage)\s*:\s*true\s*$",
+    re.IGNORECASE,
+)
+_INVALID_CURSOR_TOKENS = frozenset(
+    {
+        "null",
+        "none",
+        "false",
+        "true",
+        "empty",
+        "undefined",
+        "response",
+        "result",
+        "data",
+        "body",
+        "payload",
+        "cursor",
+        "next_cursor",
+    }
+)
 
 
 def _iter_metadata_dicts(obj: dict[str, Any]) -> list[dict[str, Any]]:
@@ -422,7 +567,7 @@ def detect_pagination(
     raw_output: str,
     is_error: bool = False,
 ) -> PaginationEvent | None:
-    """Extract a PaginationEvent from a tool output if pagination markers are present."""
+    """Extract a PaginationEvent from structured tool outputs without false positives on code."""
     if is_error or not raw_output:
         return None
 
@@ -435,21 +580,23 @@ def detect_pagination(
 
     obj = _try_parse_json_object(raw_output)
     if obj is not None:
+        explicit_has_more: bool | None = None
         for container in _iter_metadata_dicts(obj):
-            for cursor_key in (
-                "nextCursor",
-                "next_cursor",
-                "nextPageToken",
-                "next_page_token",
-                "continuationToken",
-                "continuation_token",
-                "endCursor",
-            ):
-                val = container.get(cursor_key)
-                if isinstance(val, str) and val.strip():
-                    next_cursor = val.strip()
-                    found_signal = True
-                    break
+            if next_cursor is None:
+                for cursor_key in (
+                    "nextCursor",
+                    "next_cursor",
+                    "nextPageToken",
+                    "next_page_token",
+                    "continuationToken",
+                    "continuation_token",
+                    "endCursor",
+                ):
+                    val = container.get(cursor_key)
+                    if isinstance(val, str) and val.strip():
+                        next_cursor = val.strip()
+                        found_signal = True
+                        break
 
             for more_key in (
                 "has_more",
@@ -460,6 +607,7 @@ def detect_pagination(
             ):
                 val = container.get(more_key)
                 if isinstance(val, bool):
+                    explicit_has_more = val
                     if val:
                         has_more = True
                     found_signal = True
@@ -486,39 +634,39 @@ def detect_pagination(
 
         if page is not None and total_pages is not None:
             found_signal = True
-            if page < total_pages:
+            if page < total_pages and explicit_has_more is not False:
                 has_more = True
-        if next_cursor is not None and not has_more:
-            # Presence of a non-empty nextCursor/nextPageToken implies more pages unless explicitly
-            # overridden by hasNextPage=False on an endCursor.
-            has_explicit_false = any(
-                container.get(k) is False
-                for container in _iter_metadata_dicts(obj)
-                for k in ("has_more", "hasMore", "hasNextPage", "has_next_page")
-            )
-            if not has_explicit_false:
-                has_more = True
+        if next_cursor is not None and explicit_has_more is None:
+            has_more = True
+        if explicit_has_more is False:
+            has_more = False
     else:
-        # Text-based pagination detection
-        m_page = _PAGE_OF_RE.search(raw_output)
-        if m_page:
-            page = int(m_page.group(1))
-            total_pages = int(m_page.group(2))
-            found_signal = True
-            if page < total_pages:
-                has_more = True
+        # Line-anchored text pagination detection on bounded head/tail lines only
+        for line in _sample_head_tail_lines(raw_output, head=8, tail=12):
+            s = line.strip()
+            if not s or _GREP_MATCH_LINE_RE.match(s):
+                continue
+            m_page = _TEXT_PAGE_OF_RE.match(s)
+            if m_page and page is None:
+                page = int(m_page.group(1))
+                total_pages = int(m_page.group(2))
+                found_signal = True
+                if page < total_pages:
+                    has_more = True
+                continue
 
-        m_cur = _TEXT_CURSOR_RE.search(raw_output)
-        if m_cur:
-            candidate = m_cur.group(1).strip()
-            if candidate.lower() not in ("null", "none", "false", "empty"):
-                next_cursor = candidate
+            m_cur = _TEXT_CURSOR_LINE_RE.match(s)
+            if m_cur and next_cursor is None:
+                candidate = m_cur.group(1).strip()
+                if candidate.lower() not in _INVALID_CURSOR_TOKENS:
+                    next_cursor = candidate
+                    has_more = True
+                    found_signal = True
+                continue
+
+            if _TEXT_HAS_MORE_LINE_RE.match(s):
                 has_more = True
                 found_signal = True
-
-        if _TEXT_HAS_MORE_RE.search(raw_output):
-            has_more = True
-            found_signal = True
 
     if not found_signal:
         return None
@@ -531,6 +679,7 @@ def detect_pagination(
         raw_input=raw_input,
         raw_output=raw_output,
         is_error=is_error,
+        has_result=True,
         resource=_infer_resource_name(tool_name, raw_input),
         page=page,
         total_pages=total_pages,
@@ -541,39 +690,48 @@ def detect_pagination(
     )
 
 
-def _contains_string_value(data: Any, needle: str) -> bool:
-    """Recursively check whether `needle` appears in any string value in `data`."""
+def _contains_exact_string_value(data: Any, needle: str) -> bool:
+    """Recursively check whether `needle` equals any string value in `data` (exact match)."""
     if isinstance(data, str):
-        return needle == data or needle in data
+        return data == needle
     if isinstance(data, dict):
-        return any(_contains_string_value(v, needle) for v in data.values())
+        return any(_contains_exact_string_value(v, needle) for v in data.values())
     if isinstance(data, (list, tuple)):
-        return any(_contains_string_value(item, needle) for item in data)
+        return any(_contains_exact_string_value(item, needle) for item in data)
     return False
+
+
+def _extract_offset_param(raw_input: dict[str, Any]) -> int | None:
+    for key in ("offset", "skip", "start", "startIndex", "start_index"):
+        val = safe_int(raw_input.get(key))
+        if val is not None:
+            return val
+    return None
 
 
 def mark_followed_cursors(
     events: list[ToolEvent],
     paginations: list[PaginationEvent],
 ) -> None:
-    """Mark each PaginationEvent as cursor_followed if a later tool call fetches the next page."""
+    """Mark each PaginationEvent as cursor_followed if a later same-tool call advances it."""
     for p in paginations:
-        if p.cursor_followed:
+        if p.cursor_followed or not p.has_more:
             continue
-        if not p.has_more and not p.next_cursor:
-            continue
+        prev_offset = _extract_offset_param(p.raw_input) or 0
+
         for later in events:
-            if later.event_index <= p.event_index:
+            if later.event_index <= p.event_index or not later.has_result:
                 continue
-            if p.next_cursor and _contains_string_value(later.raw_input, p.next_cursor):
+            if later.tool_name != p.tool_name:
+                continue
+
+            # 1. Exact cursor match on same tool
+            if p.next_cursor and _contains_exact_string_value(later.raw_input, p.next_cursor):
                 p.cursor_followed = True
                 break
-            if (
-                p.page is not None
-                and p.total_pages is not None
-                and p.page < p.total_pages
-                and later.tool_name == p.tool_name
-            ):
+
+            # 2. Page-number advancement on same tool
+            if p.page is not None and p.total_pages is not None and p.page < p.total_pages:
                 later_page = safe_int(
                     later.raw_input.get("page")
                     or later.raw_input.get("current_page")
@@ -583,8 +741,70 @@ def mark_followed_cursors(
                     p.cursor_followed = True
                     break
 
+            # 3. Offset/skip advancement on same tool (when no explicit cursor was returned)
+            if p.next_cursor is None and p.page is None:
+                later_offset = _extract_offset_param(later.raw_input)
+                if later_offset is not None and later_offset > prev_offset:
+                    p.cursor_followed = True
+                    break
+
 
 # --- Shell command analysis ---
+
+_HEREDOC_OP_RE = re.compile(r"<<(-?)\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+_EXIT_CODE_LINE_RE = re.compile(r"^\s*Exit code[:\s]+(-?\d+)\s*$", re.IGNORECASE)
+_NO_MATCH_OUTPUT_SENTINELS = frozenset(
+    {
+        "no matches found",
+        "no files found",
+        "no matching files found",
+        "0 matches found",
+    }
+)
+_PASSTHROUGH_PIPE_CMDS = frozenset({"head", "tail", "sort", "uniq", "cat", "tee"})
+_SEARCH_VALUE_FLAGS = frozenset(
+    {
+        "-A",
+        "--after-context",
+        "-B",
+        "--before-context",
+        "-C",
+        "--context",
+        "--context-separator",
+        "--color",
+        "--colors",
+        "-d",
+        "--max-depth",
+        "-E",
+        "--engine",
+        "--encoding",
+        "-f",
+        "--file",
+        "--field-match-separator",
+        "-j",
+        "--threads",
+        "--label",
+        "-M",
+        "--max-columns",
+        "--max-filesize",
+        "--path-separator",
+        "--pre",
+        "--pre-glob",
+        "-r",
+        "--replace",
+        "--sort",
+        "--sortr",
+        "-t",
+        "--type",
+        "-T",
+        "--type-not",
+    }
+)
+_PATCH_HEADER_RE = re.compile(
+    r"^\*\*\*\s+(Update File|Add File|Delete File|Move to):\s*(.+?)\s*$",
+    re.MULTILINE,
+)
+_SED_RANGE_RE = re.compile(r"^(\d+)(?:,(\d+|\$))?p$")
 
 
 def unwrap_shell_command(command: str | list[str]) -> str:
@@ -603,8 +823,69 @@ def unwrap_shell_command(command: str | list[str]) -> str:
     return safe_str(command).strip()
 
 
+def _strip_heredocs(command: str) -> tuple[str, list[tuple[str, str]]]:
+    """Remove heredoc bodies from a multi-line shell script while returning (header, body) pairs."""
+    lines = split_lf_lines(command)
+    out_lines: list[str] = []
+    heredocs: list[tuple[str, str]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        out_lines.append(line)
+        # Find unquoted heredoc markers on this line
+        matches = _find_unquoted_heredocs(line)
+        i += 1
+        for strip_tabs, delim in matches:
+            body_lines: list[str] = []
+            while i < len(lines):
+                cand = lines[i]
+                check = cand.lstrip("\t") if strip_tabs else cand
+                if check == delim:
+                    i += 1
+                    break
+                body_lines.append(cand)
+                i += 1
+            heredocs.append((line, "\n".join(body_lines)))
+    return "\n".join(out_lines), heredocs
+
+
+def _find_unquoted_heredocs(line: str) -> list[tuple[bool, str]]:
+    """Find `<<EOF` / `<<'EOF'` / `<<-EOF` operators outside quotes (excluding `<<<`)."""
+    results: list[tuple[bool, str]] = []
+    quote: str | None = None
+    i = 0
+    n = len(line)
+    while i < n:
+        ch = line[i]
+        if quote:
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "#":
+            break
+        if line.startswith("<<", i) and not line.startswith("<<<", i):
+            m = _HEREDOC_OP_RE.match(line, i)
+            if m:
+                results.append((bool(m.group(1)), m.group(3)))
+                i = m.end()
+                continue
+        i += 1
+    return results
+
+
 def _split_shell_segments(command: str, delimiters: tuple[str, ...]) -> list[str]:
-    """Split a shell command on top-level delimiters, respecting quotes and escapes."""
+    """Split a shell command on top-level unquoted delimiters, respecting quotes and escapes."""
     segments: list[str] = []
     buf: list[str] = []
     quote: str | None = None
@@ -631,10 +912,14 @@ def _split_shell_segments(command: str, delimiters: tuple[str, ...]) -> list[str
             buf.append(command[i + 1])
             i += 2
             continue
+        if ch == "#" and (not buf or buf[-1].isspace()):
+            # Skip shell comment to end of line
+            while i < n and command[i] != "\n":
+                i += 1
+            continue
         matched_delim = None
         for d in delimiters:
             if command.startswith(d, i):
-                # Avoid splitting '||' when looking for '|'
                 if d == "|" and command.startswith("||", i):
                     continue
                 matched_delim = d
@@ -654,11 +939,133 @@ def _split_shell_segments(command: str, delimiters: tuple[str, ...]) -> list[str
     return segments
 
 
+def _scan_shell_redirections(segment: str) -> tuple[str, list[str]]:
+    """Quote-aware scanner extracting true unquoted shell output redirections (`>`, `>>`, `&>`).
+
+    Returns (segment_without_redirections, list_of_write_target_paths).
+    Ignores `>`, `=>`, `->` inside single/double quotes, `<<`, `<<<`, `2>&1`, and `/dev/null`.
+    """
+    out: list[str] = []
+    targets: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(segment)
+
+    while i < n:
+        ch = segment[i]
+        if quote:
+            out.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                i += 1
+                out.append(segment[i])
+            elif ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append(ch)
+            out.append(segment[i + 1])
+            i += 2
+            continue
+
+        # Detect unquoted output redirection: optional fd digit or `&` immediately before `>`
+        redir_start = i
+        op_len = 0
+        is_stderr_only = False
+        if ch == ">":
+            op_len = 2 if segment.startswith((">>", ">|", ">&"), i) else 1
+        elif ch == "&" and segment.startswith(("&>>", "&>"), i):
+            op_len = 3 if segment.startswith("&>>", i) else 2
+        elif (
+            ch.isdigit()
+            and (i == 0 or segment[i - 1].isspace())
+            and i + 1 < n
+            and segment[i + 1] == ">"
+        ):
+            is_stderr_only = ch == "2"
+            op_len = 3 if segment.startswith((">>", ">|", ">&"), i + 1) else 2
+
+        if op_len:
+            op = segment[redir_start : redir_start + op_len]
+            j = redir_start + op_len
+            while j < n and segment[j].isspace():
+                j += 1
+            # Read the target token (respecting quotes)
+            tok_buf: list[str] = []
+            tok_quote: str | None = None
+            while j < n:
+                c = segment[j]
+                if tok_quote:
+                    if c == "\\" and tok_quote == '"' and j + 1 < n:
+                        tok_buf.append(segment[j + 1])
+                        j += 2
+                        continue
+                    if c == tok_quote:
+                        tok_quote = None
+                        j += 1
+                        continue
+                    tok_buf.append(c)
+                    j += 1
+                    continue
+                if c in ("'", '"'):
+                    tok_quote = c
+                    j += 1
+                    continue
+                if c.isspace() or c in (";", "|", "&", "<", ">"):
+                    break
+                tok_buf.append(c)
+                j += 1
+
+            target = "".join(tok_buf).strip()
+            if (
+                target
+                and not op.endswith(">&")
+                and not target.startswith("&")
+                and target != "/dev/null"
+                and not is_stderr_only
+            ):
+                targets.append(target)
+            out.append(" ")
+            i = j
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return "".join(out).strip(), targets
+
+
 def _safe_shlex_split(segment: str) -> list[str]:
     try:
         return shlex.split(segment)
     except ValueError:
         return segment.split()
+
+
+def _resolve_path_with_cd(path: str | None, active_subdir: str | None) -> str | None:
+    if not path:
+        return active_subdir
+    if not active_subdir:
+        return path
+    if path.startswith("/") or path.startswith("~"):
+        return path
+    joined = posixpath.normpath(posixpath.join(active_subdir, path))
+    return joined
+
+
+def _update_active_subdir(active_subdir: str | None, target: str | None) -> str | None:
+    if not target or target in ("-", "~"):
+        return None
+    if target.startswith("/"):
+        return posixpath.normpath(target)
+    if active_subdir:
+        return posixpath.normpath(posixpath.join(active_subdir, target))
+    return posixpath.normpath(target)
 
 
 def _extract_head_limit(pipe_segments: list[str]) -> int | None:
@@ -684,30 +1091,101 @@ def _extract_head_limit(pipe_segments: list[str]) -> int | None:
     return None
 
 
-def _parse_matched_files_from_grep_output(output: str) -> tuple[list[str], int]:
-    """Extract matched file paths and line match count from grep/rg output."""
-    if not output.strip():
+def _strip_exit_code_lines(output: str) -> str:
+    """Remove standalone `Exit code N` header/footer lines added by harnesses."""
+    lines = split_lf_lines(output)
+    while lines and _EXIT_CODE_LINE_RE.match(lines[0]):
+        lines.pop(0)
+    while lines and _EXIT_CODE_LINE_RE.match(lines[-1]):
+        lines.pop()
+    return "\n".join(lines)
+
+
+def _has_transforming_pipe(pipe_segments: list[str]) -> bool:
+    for seg in pipe_segments[1:]:
+        tokens = _safe_shlex_split(seg)
+        if not tokens:
+            continue
+        if Path(tokens[0]).name not in _PASSTHROUGH_PIPE_CMDS:
+            return True
+    return False
+
+
+def _parse_matched_files_from_grep_output(
+    output: str,
+    *,
+    files_only_mode: bool = False,
+) -> tuple[list[str], int]:
+    """Extract matched file paths and line match count from direct grep/rg output."""
+    cleaned = _strip_exit_code_lines(output)
+    if not cleaned.strip():
         return [], 0
     files: list[str] = []
     seen: set[str] = set()
     match_lines = 0
-    for line in output.splitlines():
+    for line in split_lf_lines(cleaned):
         s = line.strip()
-        if not s or s.startswith("--"):
+        if not s or s == "--":
             continue
-        if _TRAILING_NOTICE_RE.search(s):
+        if s.lower() in _NO_MATCH_OUTPUT_SENTINELS:
             continue
-        match_lines += 1
-        # Format `path/to/file.py:12:matched text` or `path/to/file.py`
+        if is_truncation_banner_line(s)[0]:
+            continue
+        if _EXIT_CODE_LINE_RE.match(s):
+            continue
         if ":" in s:
             prefix = s.split(":", 1)[0].strip()
-            if prefix and not prefix.startswith(" ") and prefix not in seen:
+            match_lines += 1
+            if prefix and not prefix.isdigit() and " " not in prefix and prefix not in seen:
                 seen.add(prefix)
                 files.append(prefix)
-        elif " " not in s and s not in seen:
-            seen.add(s)
-            files.append(s)
+        elif files_only_mode and " " not in s and not s.isdigit() or "/" in s and " " not in s:
+            match_lines += 1
+            if s not in seen:
+                seen.add(s)
+                files.append(s)
     return files, match_lines
+
+
+def extract_apply_patch_edits(
+    patch_text: str,
+    *,
+    event_id: str,
+    event_index: int,
+    tool_name: str,
+    timestamp: str | None,
+    raw_input: dict[str, Any],
+    raw_output: str,
+    is_error: bool,
+    active_subdir: str | None = None,
+) -> list[FileEditEvent]:
+    """Parse `*** Update/Add/Delete/Move File:` headers from an apply_patch payload."""
+    edits: list[FileEditEvent] = []
+    for match in _PATCH_HEADER_RE.finditer(patch_text):
+        action = match.group(1)
+        raw_path = match.group(2).strip()
+        file_path = _resolve_path_with_cd(raw_path, active_subdir) or raw_path
+        if action == "Add File":
+            op = "write"
+        elif action == "Delete File":
+            op = "delete"
+        else:
+            op = "edit"
+        edits.append(
+            FileEditEvent(
+                event_id=event_id,
+                event_index=event_index,
+                tool_name=tool_name,
+                timestamp=timestamp,
+                raw_input=raw_input,
+                raw_output=raw_output,
+                is_error=is_error,
+                has_result=True,
+                file_path=file_path,
+                operation=op,
+            )
+        )
+    return edits
 
 
 @dataclass
@@ -717,10 +1195,6 @@ class ShellDerivedEvents:
     file_reads: list[FileReadEvent] = field(default_factory=list)
     file_edits: list[FileEditEvent] = field(default_factory=list)
     searches: list[SearchEvent] = field(default_factory=list)
-
-
-_REDIR_RE = re.compile(r"(?<![0-9&])>>?\s*([^\s;&|]+)")
-_SED_RANGE_RE = re.compile(r"^(\d+)(?:,(\d+))?p$")
 
 
 def analyze_shell_command(
@@ -743,31 +1217,68 @@ def analyze_shell_command(
     if not command:
         return derived
 
-    # Split compound commands (`&&`, `;`, `||`) while tracking `cd <dir>`
-    compounds = _split_shell_segments(command, ("&&", "||", ";"))
+    # Strip heredoc bodies first so they aren't parsed as commands or redirects
+    stripped_cmd, heredocs = _strip_heredocs(command)
+
+    # Split compound commands (`&&`, `||`, `;`, `\n`) while tracking `cd <dir>`
+    compounds = _split_shell_segments(stripped_cmd, ("&&", "||", ";", "\n"))
     active_subdir: str | None = None
+
+    # Count non-cd commands to know whether stdout belongs uniquely to a single command
+    non_cd_count = 0
+    for comp in compounds:
+        toks = _safe_shlex_split(comp)
+        if toks and toks[0] != "cd":
+            non_cd_count += 1
+    sole_command = non_cd_count == 1
+
+    # Check if any heredoc was fed to `apply_patch`
+    if not is_error and exit_code in (None, 0):
+        for header_line, body in heredocs:
+            header_tokens = _safe_shlex_split(header_line)
+            if header_tokens and Path(header_tokens[0]).name == "apply_patch":
+                derived.file_edits.extend(
+                    extract_apply_patch_edits(
+                        body,
+                        event_id=event_id,
+                        event_index=event_index,
+                        tool_name=f"{tool_name}:apply_patch",
+                        timestamp=timestamp,
+                        raw_input=raw_input,
+                        raw_output=raw_output,
+                        is_error=is_error,
+                        active_subdir=active_subdir,
+                    )
+                )
 
     for comp in compounds:
         pipe_segments = _split_shell_segments(comp, ("|",))
         if not pipe_segments:
             continue
-        first_tokens = _safe_shlex_split(pipe_segments[0])
+
+        # Scan unquoted output redirections across pipe stages
+        clean_first, first_redirects = _scan_shell_redirections(pipe_segments[0])
+        all_redirects = list(first_redirects)
+        clean_pipes = [clean_first]
+        for seg in pipe_segments[1:]:
+            c_seg, seg_redirs = _scan_shell_redirections(seg)
+            clean_pipes.append(c_seg)
+            all_redirects.extend(seg_redirs)
+
+        first_tokens = _safe_shlex_split(clean_pipes[0])
         if not first_tokens:
             continue
 
-        # Handle `cd <dir>` prefix in compound commands
-        if first_tokens[0] == "cd" and len(first_tokens) >= 2:
-            active_subdir = first_tokens[1]
+        # Handle `cd <dir>` tracking
+        if first_tokens[0] == "cd":
+            target_dir = first_tokens[1] if len(first_tokens) >= 2 else None
+            active_subdir = _update_active_subdir(active_subdir, target_dir)
             continue
 
-        # Check for redirection-based file modifications (even on chained commands)
-        has_write_redirect = False
+        has_write_redirect = bool(all_redirects)
         if not is_error and exit_code in (None, 0):
-            for m in _REDIR_RE.finditer(comp):
-                target = m.group(1).strip("'\"")
-                if target in ("/dev/null",) or target.startswith("&"):
-                    continue
-                has_write_redirect = True
+            for target in all_redirects:
+                resolved_target = _resolve_path_with_cd(target, active_subdir) or target
                 derived.file_edits.append(
                     FileEditEvent(
                         event_id=event_id,
@@ -776,21 +1287,23 @@ def analyze_shell_command(
                         timestamp=timestamp,
                         raw_input=raw_input,
                         raw_output=raw_output,
-                        file_path=target,
+                        has_result=True,
+                        file_path=resolved_target,
                         operation="bash_modify",
                     )
                 )
 
         cmd_name = Path(first_tokens[0]).name
-        # Handle `git grep` and `git rm`
         subcmd = first_tokens[1] if len(first_tokens) > 1 else ""
+
         if cmd_name == "git" and subcmd == "grep":
             _analyze_search_tokens(
                 derived=derived,
                 search_cmd="git grep",
                 tokens=first_tokens[2:],
-                pipe_segments=pipe_segments,
+                pipe_segments=clean_pipes,
                 active_subdir=active_subdir,
+                sole_command=sole_command,
                 stdout=stdout,
                 event_id=event_id,
                 event_index=event_index,
@@ -804,9 +1317,11 @@ def analyze_shell_command(
                 truncation_reason=truncation_reason,
             )
             continue
+
         if cmd_name == "git" and subcmd == "rm" and not is_error and exit_code in (None, 0):
             for tok in first_tokens[2:]:
                 if not tok.startswith("-"):
+                    resolved = _resolve_path_with_cd(tok, active_subdir) or tok
                     derived.file_edits.append(
                         FileEditEvent(
                             event_id=event_id,
@@ -815,7 +1330,8 @@ def analyze_shell_command(
                             timestamp=timestamp,
                             raw_input=raw_input,
                             raw_output=raw_output,
-                            file_path=tok,
+                            has_result=True,
+                            file_path=resolved,
                             operation="delete",
                         )
                     )
@@ -826,8 +1342,9 @@ def analyze_shell_command(
                 derived=derived,
                 search_cmd=cmd_name,
                 tokens=first_tokens[1:],
-                pipe_segments=pipe_segments,
+                pipe_segments=clean_pipes,
                 active_subdir=active_subdir,
+                sole_command=sole_command,
                 stdout=stdout,
                 event_id=event_id,
                 event_index=event_index,
@@ -847,8 +1364,9 @@ def analyze_shell_command(
                 derived=derived,
                 search_cmd=cmd_name,
                 tokens=first_tokens[1:],
-                pipe_segments=pipe_segments,
+                pipe_segments=clean_pipes,
                 active_subdir=active_subdir,
+                sole_command=sole_command,
                 stdout=stdout,
                 event_id=event_id,
                 event_index=event_index,
@@ -857,24 +1375,25 @@ def analyze_shell_command(
                 raw_input=raw_input,
                 raw_output=raw_output,
                 is_error=is_error,
+                exit_code=exit_code,
                 truncated=truncated,
                 truncation_reason=truncation_reason,
             )
             continue
 
-        # Only parse single-command reads when no write redirection occurred and command succeeded
         if (
             not has_write_redirect
             and not is_error
             and exit_code in (None, 0)
-            and len(compounds) <= 2
             and cmd_name in ("cat", "nl", "head", "tail", "sed")
         ):
             _analyze_read_tokens(
                 derived=derived,
                 cmd_name=cmd_name,
                 tokens=first_tokens[1:],
-                pipe_segments=pipe_segments,
+                pipe_segments=clean_pipes,
+                active_subdir=active_subdir,
+                sole_command=sole_command,
                 stdout=stdout,
                 event_id=event_id,
                 event_index=event_index,
@@ -891,6 +1410,7 @@ def analyze_shell_command(
             if cmd_name == "rm":
                 for tok in first_tokens[1:]:
                     if not tok.startswith("-"):
+                        resolved = _resolve_path_with_cd(tok, active_subdir) or tok
                         derived.file_edits.append(
                             FileEditEvent(
                                 event_id=event_id,
@@ -899,31 +1419,29 @@ def analyze_shell_command(
                                 timestamp=timestamp,
                                 raw_input=raw_input,
                                 raw_output=raw_output,
-                                file_path=tok,
+                                has_result=True,
+                                file_path=resolved,
                                 operation="delete",
                             )
                         )
             elif cmd_name == "sed" and any(
                 t == "-i" or t.startswith("-i") for t in first_tokens[1:]
             ):
-                # Last non-flag argument(s) after expression are edited files
-                positionals = [t for t in first_tokens[1:] if not t.startswith("-")]
-                for target in positionals[1:]:
-                    derived.file_edits.append(
-                        FileEditEvent(
-                            event_id=event_id,
-                            event_index=event_index,
-                            tool_name=tool_name,
-                            timestamp=timestamp,
-                            raw_input=raw_input,
-                            raw_output=raw_output,
-                            file_path=target,
-                            operation="bash_modify",
-                        )
-                    )
+                _extract_sed_inplace_edits(
+                    derived=derived,
+                    tokens=first_tokens[1:],
+                    active_subdir=active_subdir,
+                    event_id=event_id,
+                    event_index=event_index,
+                    tool_name=tool_name,
+                    timestamp=timestamp,
+                    raw_input=raw_input,
+                    raw_output=raw_output,
+                )
             elif cmd_name in ("mv", "cp"):
                 positionals = [t for t in first_tokens[1:] if not t.startswith("-")]
                 if len(positionals) >= 2:
+                    dst = _resolve_path_with_cd(positionals[-1], active_subdir) or positionals[-1]
                     derived.file_edits.append(
                         FileEditEvent(
                             event_id=event_id,
@@ -932,11 +1450,13 @@ def analyze_shell_command(
                             timestamp=timestamp,
                             raw_input=raw_input,
                             raw_output=raw_output,
-                            file_path=positionals[-1],
+                            has_result=True,
+                            file_path=dst,
                             operation="bash_modify",
                         )
                     )
                     if cmd_name == "mv":
+                        src = _resolve_path_with_cd(positionals[0], active_subdir) or positionals[0]
                         derived.file_edits.append(
                             FileEditEvent(
                                 event_id=event_id,
@@ -945,18 +1465,20 @@ def analyze_shell_command(
                                 timestamp=timestamp,
                                 raw_input=raw_input,
                                 raw_output=raw_output,
-                                file_path=positionals[0],
+                                has_result=True,
+                                file_path=src,
                                 operation="delete",
                             )
                         )
 
         # Check `| tee <file>` in pipes
         if not is_error and exit_code in (None, 0):
-            for seg in pipe_segments[1:]:
+            for seg in clean_pipes[1:]:
                 p_toks = _safe_shlex_split(seg)
                 if p_toks and Path(p_toks[0]).name == "tee":
                     for tok in p_toks[1:]:
                         if not tok.startswith("-"):
+                            resolved = _resolve_path_with_cd(tok, active_subdir) or tok
                             derived.file_edits.append(
                                 FileEditEvent(
                                     event_id=event_id,
@@ -965,12 +1487,72 @@ def analyze_shell_command(
                                     timestamp=timestamp,
                                     raw_input=raw_input,
                                     raw_output=raw_output,
-                                    file_path=tok,
+                                    has_result=True,
+                                    file_path=resolved,
                                     operation="bash_modify",
                                 )
                             )
 
     return derived
+
+
+def _extract_sed_inplace_edits(
+    *,
+    derived: ShellDerivedEvents,
+    tokens: list[str],
+    active_subdir: str | None,
+    event_id: str,
+    event_index: int,
+    tool_name: str,
+    timestamp: str | None,
+    raw_input: dict[str, Any],
+    raw_output: str,
+) -> None:
+    """Extract target file paths from `sed -i [ext] <expr> <files...>` (GNU & BSD/macOS)."""
+    has_e_flag = False
+    positionals: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "-e" and i + 1 < len(tokens):
+            has_e_flag = True
+            i += 2
+            continue
+        if tok == "-f" and i + 1 < len(tokens):
+            has_e_flag = True
+            i += 2
+            continue
+        if tok == "-i":
+            # BSD/macOS `sed -i '' 's/a/b/' file` passes an explicit backup suffix (often `""`)
+            if i + 1 < len(tokens) and (tokens[i + 1] == "" or tokens[i + 1].startswith(".")):
+                i += 2
+                continue
+            i += 1
+            continue
+        if tok.startswith("-"):
+            i += 1
+            continue
+        positionals.append(tok)
+        i += 1
+
+    targets = positionals if has_e_flag else positionals[1:]
+    for target in targets:
+        if not target:
+            continue
+        resolved = _resolve_path_with_cd(target, active_subdir) or target
+        derived.file_edits.append(
+            FileEditEvent(
+                event_id=event_id,
+                event_index=event_index,
+                tool_name=tool_name,
+                timestamp=timestamp,
+                raw_input=raw_input,
+                raw_output=raw_output,
+                has_result=True,
+                file_path=resolved,
+                operation="bash_modify",
+            )
+        )
 
 
 def _analyze_search_tokens(
@@ -980,6 +1562,7 @@ def _analyze_search_tokens(
     tokens: list[str],
     pipe_segments: list[str],
     active_subdir: str | None,
+    sole_command: bool,
     stdout: str,
     event_id: str,
     event_index: int,
@@ -992,10 +1575,16 @@ def _analyze_search_tokens(
     truncated: bool,
     truncation_reason: str | None,
 ) -> None:
+    # Real tool failure (not exit 1 "no matches") should not become a SearchEvent
+    effective_error = is_error and exit_code not in (0, 1, None)
+    if effective_error:
+        return
+
     query: str | None = None
-    search_paths: list[str] = []
+    raw_paths: list[str] = []
     glob_pattern: str | None = None
     excluded_dirs: list[str] = []
+    files_only_mode = False
     result_limit = _extract_head_limit(pipe_segments)
 
     i = 0
@@ -1007,11 +1596,19 @@ def _analyze_search_tokens(
             i += 1
             continue
         if not end_of_flags and tok.startswith("-"):
+            if tok in ("-l", "--files-with-matches", "--files"):
+                files_only_mode = True
+                i += 1
+                continue
             if tok in ("-e", "--regexp") and i + 1 < len(tokens):
                 query = tokens[i + 1]
                 i += 2
                 continue
-            if tok in ("-g", "--glob", "--include") and i + 1 < len(tokens):
+            if tok.startswith("--regexp="):
+                query = tok.split("=", 1)[1]
+                i += 1
+                continue
+            if tok in ("-g", "--glob", "--iglob", "--include") and i + 1 < len(tokens):
                 val = tokens[i + 1]
                 if val.startswith("!"):
                     excluded_dirs.append(val[1:].strip("/").removesuffix("/**"))
@@ -1019,7 +1616,7 @@ def _analyze_search_tokens(
                     glob_pattern = val
                 i += 2
                 continue
-            if tok.startswith("--glob=") or tok.startswith("--include="):
+            if tok.startswith(("--glob=", "--iglob=", "--include=")):
                 val = tok.split("=", 1)[1]
                 if val.startswith("!"):
                     excluded_dirs.append(val[1:].strip("/").removesuffix("/**"))
@@ -1031,7 +1628,7 @@ def _analyze_search_tokens(
                 excluded_dirs.append(tokens[i + 1])
                 i += 2
                 continue
-            if tok.startswith("--exclude-dir=") or tok.startswith("--exclude="):
+            if tok.startswith(("--exclude-dir=", "--exclude=", "--ignore=")):
                 excluded_dirs.append(tok.split("=", 1)[1])
                 i += 1
                 continue
@@ -1041,7 +1638,7 @@ def _analyze_search_tokens(
                     result_limit = val_int
                 i += 2
                 continue
-            if tok in ("-t", "--type", "-A", "-B", "-C", "-f", "--file") and i + 1 < len(tokens):
+            if tok in _SEARCH_VALUE_FLAGS and i + 1 < len(tokens):
                 i += 2
                 continue
             i += 1
@@ -1050,22 +1647,42 @@ def _analyze_search_tokens(
         if query is None:
             query = tok
         else:
-            search_paths.append(tok)
+            raw_paths.append(tok)
         i += 1
 
-    # Note: grep/rg exit code 1 means "no matches", not a tool crash
-    effective_error = is_error and exit_code not in (0, 1, None)
-    matched_files, match_count = _parse_matched_files_from_grep_output(stdout)
+    # Resolve all search paths against active `cd` subdir
+    resolved_paths: list[str] = []
+    if raw_paths:
+        for rp in raw_paths:
+            res = _resolve_path_with_cd(rp, active_subdir)
+            if res:
+                resolved_paths.append(res)
+    elif active_subdir:
+        resolved_paths.append(active_subdir)
+
+    # Determine whether stdout can be directly interpreted as grep output
+    transforming_pipe = _has_transforming_pipe(pipe_segments)
+    direct_output = sole_command and not transforming_pipe
+
+    matched_files: list[str]
+    match_count: int | None
+    if direct_output:
+        matched_files, match_count = _parse_matched_files_from_grep_output(
+            stdout, files_only_mode=files_only_mode
+        )
+    else:
+        matched_files = []
+        match_count = None
+
     is_trunc, trunc_reason = (truncated, truncation_reason)
     if not is_trunc:
         is_trunc, trunc_reason = detect_truncation(
-            stdout,
+            stdout if direct_output else "",
             tool_name=search_cmd,
             result_limit=result_limit,
             observed_count=match_count,
         )
 
-    search_path = search_paths[0] if search_paths else active_subdir
     derived.searches.append(
         SearchEvent(
             event_id=event_id,
@@ -1074,16 +1691,18 @@ def _analyze_search_tokens(
             timestamp=timestamp,
             raw_input=raw_input,
             raw_output=raw_output,
-            is_error=effective_error,
+            is_error=False,
+            has_result=True,
             truncated=is_trunc,
             truncation_reason=trunc_reason,
             query=query or "",
-            search_path=search_path,
+            search_path=resolved_paths[0] if resolved_paths else None,
+            search_paths=resolved_paths,
             glob_pattern=glob_pattern,
             excluded_dirs=excluded_dirs,
             match_count=match_count,
             matched_files=matched_files,
-            output=stdout,
+            output=stdout if direct_output else "",
             result_limit=result_limit,
         )
     )
@@ -1096,6 +1715,7 @@ def _analyze_find_tokens(
     tokens: list[str],
     pipe_segments: list[str],
     active_subdir: str | None,
+    sole_command: bool,
     stdout: str,
     event_id: str,
     event_index: int,
@@ -1104,10 +1724,14 @@ def _analyze_find_tokens(
     raw_input: dict[str, Any],
     raw_output: str,
     is_error: bool,
+    exit_code: int | None,
     truncated: bool,
     truncation_reason: str | None,
 ) -> None:
-    search_path: str | None = None
+    if is_error and exit_code not in (0, None):
+        return
+
+    raw_paths: list[str] = []
     glob_pattern: str | None = None
     excluded_dirs: list[str] = []
     result_limit = _extract_head_limit(pipe_segments)
@@ -1123,23 +1747,40 @@ def _analyze_find_tokens(
             excluded_dirs.append(tokens[i + 1])
             i += 2
             continue
-        if not tok.startswith("-") and tok not in ("!", "(", ")") and search_path is None:
+        if not tok.startswith("-") and tok not in ("!", "(", ")"):
             if search_cmd == "find":
-                search_path = tok
+                raw_paths.append(tok)
+            elif glob_pattern is None:
+                glob_pattern = tok
             else:
-                glob_pattern = glob_pattern or tok
-        elif search_cmd == "fd" and not tok.startswith("-") and search_path is None:
-            search_path = tok
+                raw_paths.append(tok)
         i += 1
 
-    lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+    resolved_paths: list[str] = []
+    if raw_paths:
+        for rp in raw_paths:
+            res = _resolve_path_with_cd(rp, active_subdir)
+            if res:
+                resolved_paths.append(res)
+    elif active_subdir:
+        resolved_paths.append(active_subdir)
+
+    direct_output = sole_command and not _has_transforming_pipe(pipe_segments)
+    cleaned_stdout = _strip_exit_code_lines(stdout)
+    lines = (
+        [line.strip() for line in split_lf_lines(cleaned_stdout) if line.strip()]
+        if direct_output
+        else []
+    )
+    match_count: int | None = len(lines) if direct_output else None
+
     is_trunc, trunc_reason = (truncated, truncation_reason)
     if not is_trunc:
         is_trunc, trunc_reason = detect_truncation(
-            stdout,
+            cleaned_stdout if direct_output else "",
             tool_name=search_cmd,
             result_limit=result_limit,
-            observed_count=len(lines),
+            observed_count=match_count,
         )
 
     derived.searches.append(
@@ -1150,19 +1791,36 @@ def _analyze_find_tokens(
             timestamp=timestamp,
             raw_input=raw_input,
             raw_output=raw_output,
-            is_error=is_error,
+            is_error=False,
+            has_result=True,
             truncated=is_trunc,
             truncation_reason=trunc_reason,
             query=glob_pattern or "",
-            search_path=search_path or active_subdir,
+            search_path=resolved_paths[0] if resolved_paths else None,
+            search_paths=resolved_paths,
             glob_pattern=glob_pattern,
             excluded_dirs=excluded_dirs,
-            match_count=len(lines),
+            match_count=match_count,
             matched_files=lines,
-            output=stdout,
+            output=cleaned_stdout if direct_output else "",
             result_limit=result_limit,
         )
     )
+
+
+def _pipe_allows_exact_read_window(pipe_segments: list[str]) -> tuple[bool, int | None]:
+    """Return (is_exact_window, head_limit) for a read command's downstream pipe stages.
+
+    Only unpiped reads or a single `| head -n K` preserve 1-based line windows.
+    Piping through `grep`, `tail`, `awk`, `sed`, etc. breaks the line-number mapping.
+    """
+    if len(pipe_segments) == 1:
+        return True, None
+    if len(pipe_segments) == 2:
+        tokens = _safe_shlex_split(pipe_segments[1])
+        if tokens and Path(tokens[0]).name == "head":
+            return True, _extract_head_limit(pipe_segments)
+    return False, None
 
 
 def _analyze_read_tokens(
@@ -1171,6 +1829,8 @@ def _analyze_read_tokens(
     cmd_name: str,
     tokens: list[str],
     pipe_segments: list[str],
+    active_subdir: str | None,
+    sole_command: bool,
     stdout: str,
     event_id: str,
     event_index: int,
@@ -1181,20 +1841,56 @@ def _analyze_read_tokens(
     truncated: bool,
     truncation_reason: str | None,
 ) -> None:
+    exact_pipe, pipe_head_limit = _pipe_allows_exact_read_window(pipe_segments)
+    can_infer_window = sole_command and exact_pipe
+
     if cmd_name == "sed":
-        # Only recognize `sed -n 'X,Yp' <file>` (read-only print range)
         if "-n" not in tokens or any(t == "-i" or t.startswith("-i") for t in tokens):
             return
         positionals = [t for t in tokens if not t.startswith("-")]
         if len(positionals) != 2:
             return
-        expr, file_path = positionals
+        expr, raw_path = positionals
         m = _SED_RANGE_RE.match(expr.strip())
         if not m:
             return
+        file_path = _resolve_path_with_cd(raw_path, active_subdir) or raw_path
         start = int(m.group(1))
-        end = int(m.group(2)) if m.group(2) else start
-        parsed = parse_numbered_lines(stdout, offset=start, limit=end - start + 1)
+        end_tok = m.group(2)
+        if not can_infer_window:
+            derived.file_reads.append(
+                FileReadEvent(
+                    event_id=event_id,
+                    event_index=event_index,
+                    tool_name=f"{tool_name}:sed",
+                    timestamp=timestamp,
+                    raw_input=raw_input,
+                    raw_output=raw_output,
+                    has_result=True,
+                    truncated=truncated,
+                    truncation_reason=truncation_reason,
+                    file_path=file_path,
+                    start_line=None,
+                    end_line=None,
+                    offset=start,
+                    limit=None,
+                    content="",
+                    line_count=0,
+                )
+            )
+            return
+
+        explicit_end = int(end_tok) if (end_tok and end_tok != "$") else None
+        req_limit = (explicit_end - start + 1) if explicit_end is not None else pipe_head_limit
+        parsed = parse_numbered_lines(
+            stdout, offset=start, limit=req_limit, expect_line_numbers=False
+        )
+        end_line: int | None
+        if explicit_end is not None:
+            end_line = min(explicit_end, parsed.end_line) if parsed.end_line else explicit_end
+        else:
+            end_line = parsed.end_line
+
         derived.file_reads.append(
             FileReadEvent(
                 event_id=event_id,
@@ -1203,13 +1899,14 @@ def _analyze_read_tokens(
                 timestamp=timestamp,
                 raw_input=raw_input,
                 raw_output=raw_output,
+                has_result=True,
                 truncated=truncated or parsed.truncated,
                 truncation_reason=truncation_reason or parsed.truncation_reason,
                 file_path=file_path,
-                start_line=start,
-                end_line=min(end, parsed.end_line) if parsed.end_line else end,
+                start_line=start if parsed.line_count > 0 else None,
+                end_line=end_line,
                 offset=start,
-                limit=end - start + 1,
+                limit=req_limit,
                 content=parsed.content,
                 line_count=parsed.line_count,
             )
@@ -1218,6 +1915,7 @@ def _analyze_read_tokens(
 
     # `cat`, `nl`, `head`, `tail`
     limit: int | None = None
+    has_line_num_flag = cmd_name == "nl"
     files: list[str] = []
     i = 0
     while i < len(tokens):
@@ -1243,20 +1941,51 @@ def _analyze_read_tokens(
         ):
             i += 2
             continue
+        elif cmd_name == "cat" and tok in ("-n", "-b", "--number", "--number-nonblank"):
+            has_line_num_flag = True
+            i += 1
+            continue
         if tok.startswith("-"):
             i += 1
             continue
         files.append(tok)
         i += 1
 
-    if len(files) != 1:
+    if not files:
         return
-    file_path = files[0]
+
+    # Multiple files in one `cat a.py b.py`: emit unknown-window FileReadEvents for each
+    if len(files) > 1 or not can_infer_window:
+        for raw_path in files:
+            file_path = _resolve_path_with_cd(raw_path, active_subdir) or raw_path
+            derived.file_reads.append(
+                FileReadEvent(
+                    event_id=event_id,
+                    event_index=event_index,
+                    tool_name=f"{tool_name}:{cmd_name}",
+                    timestamp=timestamp,
+                    raw_input=raw_input,
+                    raw_output=raw_output,
+                    has_result=True,
+                    truncated=truncated,
+                    truncation_reason=truncation_reason,
+                    file_path=file_path,
+                    start_line=None,
+                    end_line=None,
+                    offset=None,
+                    limit=limit,
+                    content="",
+                    line_count=0,
+                )
+            )
+        return
+
+    file_path = _resolve_path_with_cd(files[0], active_subdir) or files[0]
     if cmd_name == "head" and limit is None:
         limit = 10
     if cmd_name == "tail":
-        # Without knowing total file lines, tail cannot guarantee start_line=1
-        parsed = parse_numbered_lines(stdout)
+        # Without knowing total file lines, tail cannot establish 1-based start_line/end_line
+        parsed = parse_numbered_lines(stdout, expect_line_numbers=False)
         derived.file_reads.append(
             FileReadEvent(
                 event_id=event_id,
@@ -1265,6 +1994,7 @@ def _analyze_read_tokens(
                 timestamp=timestamp,
                 raw_input=raw_input,
                 raw_output=raw_output,
+                has_result=True,
                 truncated=truncated or parsed.truncated,
                 truncation_reason=truncation_reason or parsed.truncation_reason,
                 file_path=file_path,
@@ -1278,9 +2008,13 @@ def _analyze_read_tokens(
         )
         return
 
-    pipe_limit = _extract_head_limit(pipe_segments)
-    eff_limit = limit if limit is not None else pipe_limit
-    parsed = parse_numbered_lines(stdout, offset=1, limit=eff_limit)
+    eff_limit = limit if limit is not None else pipe_head_limit
+    parsed = parse_numbered_lines(
+        stdout,
+        offset=1,
+        limit=eff_limit,
+        expect_line_numbers=has_line_num_flag,
+    )
     derived.file_reads.append(
         FileReadEvent(
             event_id=event_id,
@@ -1289,6 +2023,7 @@ def _analyze_read_tokens(
             timestamp=timestamp,
             raw_input=raw_input,
             raw_output=raw_output,
+            has_result=True,
             truncated=truncated or parsed.truncated,
             truncation_reason=truncation_reason or parsed.truncation_reason,
             file_path=file_path,

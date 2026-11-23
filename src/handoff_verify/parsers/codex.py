@@ -22,24 +22,33 @@ from handoff_verify.parsers._common import (
     analyze_shell_command,
     detect_pagination,
     detect_truncation,
+    extract_apply_patch_edits,
     extract_text_content,
+    is_truncation_banner_line,
     load_jsonl,
     mark_followed_cursors,
     parse_numbered_lines,
     safe_int,
     safe_str,
+    split_lf_lines,
     unwrap_shell_command,
 )
 
-_CODEX_EXIT_RE = re.compile(r"Process exited with code\s+(-?\d+)", re.IGNORECASE)
-_CODEX_OUTPUT_MARKER_RE = re.compile(r"(?:^|\n)Output:\n", re.MULTILINE)
-_PATCH_HEADER_RE = re.compile(
-    r"^\*\*\*\s+(Update File|Add File|Delete File|Move to):\s*(.+?)\s*$",
-    re.MULTILINE,
+_CODEX_EXIT_RE = re.compile(
+    r"(?:Process exited with code|Exit code:?)\s+(-?\d+)",
+    re.IGNORECASE,
 )
+_CODEX_OUTPUT_MARKER_RE = re.compile(r"(?:^|\n)Output:\n", re.MULTILINE)
 
 _SHELL_TOOLS = frozenset(
-    {"shell", "local_shell", "exec_command", "shell_command", "container.exec"}
+    {
+        "shell",
+        "local_shell",
+        "local_shell_call",
+        "exec_command",
+        "shell_command",
+        "container.exec",
+    }
 )
 _READ_TOOLS = frozenset({"read_file", "view_file", "open_file"})
 _SEARCH_TOOLS = frozenset({"grep_files", "search_files", "find_files", "rg"})
@@ -71,8 +80,9 @@ def _parse_codex_arguments(raw_args: Any, line_no: int, warnings: list[str]) -> 
                 if isinstance(parsed, dict):
                     return parsed
                 return {"value": parsed}
-            except json.JSONDecodeError as exc:
-                warnings.append(f"Line {line_no}: malformed tool arguments JSON ({exc.msg})")
+            except (ValueError, RecursionError) as exc:
+                msg = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
+                warnings.append(f"Line {line_no}: malformed tool arguments JSON ({msg})")
                 return {"_raw": raw_args}
         return {"input": raw_args}
     if raw_args is None:
@@ -89,7 +99,7 @@ def _unwrap_codex_output(raw_output: str) -> tuple[str, int | None, bool]:
     if stripped.startswith("{") and stripped.endswith("}"):
         try:
             obj = json.loads(stripped)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             obj = None
         if isinstance(obj, dict) and "output" in obj:
             inner_out = safe_str(obj.get("output"))
@@ -101,48 +111,17 @@ def _unwrap_codex_output(raw_output: str) -> tuple[str, int | None, bool]:
             return inner_out, exit_code, is_err
 
     exit_code: int | None = None
-    m_exit = _CODEX_EXIT_RE.search(raw_output)
+    m_exit = _CODEX_EXIT_RE.search(raw_output[:512])
     if m_exit:
         exit_code = int(m_exit.group(1))
 
     clean = raw_output
-    m_marker = _CODEX_OUTPUT_MARKER_RE.search(raw_output)
+    m_marker = _CODEX_OUTPUT_MARKER_RE.search(raw_output[:1024])
     if m_marker:
         clean = raw_output[m_marker.end() :]
 
     is_err = (exit_code is not None and exit_code != 0) or clean.lstrip().startswith("Error:")
     return clean, exit_code, is_err
-
-
-def _extract_patch_edits(
-    patch_text: str,
-    call: _PendingCodexCall,
-    is_error: bool,
-) -> list[FileEditEvent]:
-    edits: list[FileEditEvent] = []
-    for match in _PATCH_HEADER_RE.finditer(patch_text):
-        action = match.group(1)
-        file_path = match.group(2).strip()
-        if action == "Add File":
-            op = "write"
-        elif action == "Delete File":
-            op = "delete"
-        else:
-            op = "edit"
-        edits.append(
-            FileEditEvent(
-                event_id=call.event_id,
-                event_index=call.event_index,
-                tool_name=call.tool_name,
-                timestamp=call.timestamp,
-                raw_input=call.raw_input,
-                raw_output=call.raw_output,
-                is_error=is_error,
-                file_path=file_path,
-                operation=op,
-            )
-        )
-    return edits
 
 
 def parse_codex(
@@ -161,7 +140,7 @@ def parse_codex(
 
     pending_list: list[_PendingCodexCall] = []
     pending_by_id: dict[str, _PendingCodexCall] = {}
-    fallback_agent_messages: list[tuple[str, str | None]] = []
+    fallback_agent_messages: list[tuple[str, str | None, int | None]] = []
 
     for line_no, record in loaded.records:
         rec_type = record.get("type")
@@ -186,7 +165,8 @@ def parse_codex(
             if payload.get("type") == "agent_message" and isinstance(payload.get("message"), str):
                 text = payload["message"].strip()
                 if text:
-                    fallback_agent_messages.append((text, timestamp))
+                    after_idx = len(pending_list) - 1 if pending_list else None
+                    fallback_agent_messages.append((text, timestamp, after_idx))
             continue
 
         # Normalize modern `response_item` wrapper vs legacy flat records
@@ -198,6 +178,8 @@ def parse_codex(
 
         if item_type == "function_call":
             call_id = safe_str(item.get("call_id") or item.get("id")) or f"call_{len(pending_list)}"
+            if call_id in pending_by_id:
+                continue
             tool_name = safe_str(item.get("name"))
             raw_in = _parse_codex_arguments(
                 item.get("arguments"), line_no, transcript.parse_warnings
@@ -214,6 +196,8 @@ def parse_codex(
 
         elif item_type == "custom_tool_call":
             call_id = safe_str(item.get("call_id") or item.get("id")) or f"call_{len(pending_list)}"
+            if call_id in pending_by_id:
+                continue
             tool_name = safe_str(item.get("name"))
             raw_in = _parse_codex_arguments(item.get("input"), line_no, transcript.parse_warnings)
             call = _PendingCodexCall(
@@ -226,7 +210,29 @@ def parse_codex(
             pending_list.append(call)
             pending_by_id[call_id] = call
 
-        elif item_type in ("function_call_output", "custom_tool_call_output"):
+        elif item_type == "local_shell_call":
+            call_id = safe_str(item.get("call_id") or item.get("id")) or f"call_{len(pending_list)}"
+            if call_id in pending_by_id:
+                continue
+            action = item.get("action") if isinstance(item.get("action"), dict) else {}
+            raw_in: dict[str, Any] = dict(action) if action else {}
+            if "command" not in raw_in and "command" in item:
+                raw_in["command"] = item["command"]
+            call = _PendingCodexCall(
+                event_index=len(pending_list),
+                event_id=call_id,
+                tool_name="local_shell_call",
+                raw_input=raw_in,
+                timestamp=timestamp,
+            )
+            pending_list.append(call)
+            pending_by_id[call_id] = call
+
+        elif item_type in (
+            "function_call_output",
+            "custom_tool_call_output",
+            "local_shell_call_output",
+        ):
             call_id = safe_str(item.get("call_id") or item.get("id"))
             call = pending_by_id.get(call_id)
             if call is None:
@@ -240,27 +246,46 @@ def parse_codex(
         elif item_type == "message" and item.get("role") == "assistant":
             text = extract_text_content(item.get("content")).strip()
             if text:
+                after_idx = len(pending_list) - 1 if pending_list else None
                 transcript.assistant_messages.append(
                     AssistantMessage(
                         index=len(transcript.assistant_messages),
                         text=text,
                         timestamp=timestamp,
+                        after_event_index=after_idx,
                     )
                 )
 
     # Fall back to event_msg agent_message only if no response_item assistant messages were found
     if not transcript.assistant_messages and fallback_agent_messages:
-        for text, ts in fallback_agent_messages:
+        for text, ts, after_idx in fallback_agent_messages:
             transcript.assistant_messages.append(
                 AssistantMessage(
                     index=len(transcript.assistant_messages),
                     text=text,
                     timestamp=ts,
+                    after_event_index=after_idx,
                 )
             )
 
     for call in pending_list:
         _materialize_codex_event(transcript, call)
+
+    # Warn if tool calls existed but none mapped to typed read/edit/search/command/pagination events
+    if (
+        transcript.events
+        and not transcript.file_reads
+        and not transcript.file_edits
+        and not transcript.searches
+        and not transcript.commands
+        and not transcript.paginations
+    ):
+        tool_names = sorted({ev.tool_name for ev in transcript.events if ev.tool_name})
+        transcript.parse_warnings.append(
+            f"Codex transcript had {len(transcript.events)} tool call(s) "
+            f"({', '.join(tool_names[:5])}), none of which mapped to typed "
+            f"read/edit/search/command events"
+        )
 
     mark_followed_cursors(transcript.events, transcript.paginations)
 
@@ -274,12 +299,31 @@ def parse_codex(
 def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCall) -> None:
     name = call.tool_name
     raw_in = call.raw_input
+
+    if not call.has_result:
+        transcript.events.append(
+            ToolEvent(
+                event_id=call.event_id,
+                event_index=call.event_index,
+                tool_name=name,
+                timestamp=call.timestamp,
+                raw_input=raw_in,
+                raw_output="",
+                is_error=False,
+                has_result=False,
+            )
+        )
+        return
+
     clean_out, exit_code, is_error = _unwrap_codex_output(call.raw_output)
 
     if name in _SHELL_TOOLS:
         cmd_raw = raw_in.get("command") or raw_in.get("cmd") or raw_in.get("input") or ""
         command = unwrap_shell_command(cmd_raw)
-        cwd = safe_str(raw_in.get("workdir") or raw_in.get("cwd")) or transcript.cwd
+        cwd = (
+            safe_str(raw_in.get("workdir") or raw_in.get("working_directory") or raw_in.get("cwd"))
+            or transcript.cwd
+        )
         truncated, trunc_reason = detect_truncation(clean_out, tool_name=name)
 
         ev_cmd = CommandEvent(
@@ -290,6 +334,7 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
             raw_input=raw_in,
             raw_output=call.raw_output,
             is_error=is_error,
+            has_result=True,
             truncated=truncated,
             truncation_reason=trunc_reason,
             command=command,
@@ -319,22 +364,32 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
         transcript.file_edits.extend(derived.file_edits)
         transcript.searches.extend(derived.searches)
 
-        pag = detect_pagination(
+        if not derived.file_reads and not derived.searches:
+            pag = detect_pagination(
+                event_id=call.event_id,
+                event_index=call.event_index,
+                tool_name=name,
+                timestamp=call.timestamp,
+                raw_input=raw_in,
+                raw_output=clean_out,
+                is_error=is_error,
+            )
+            if pag is not None:
+                transcript.paginations.append(pag)
+        return
+
+    if name == "apply_patch":
+        patch_text = safe_str(raw_in.get("patch") or raw_in.get("input") or "")
+        edits = extract_apply_patch_edits(
+            patch_text,
             event_id=call.event_id,
             event_index=call.event_index,
             tool_name=name,
             timestamp=call.timestamp,
             raw_input=raw_in,
-            raw_output=clean_out,
+            raw_output=call.raw_output,
             is_error=is_error,
         )
-        if pag is not None:
-            transcript.paginations.append(pag)
-        return
-
-    if name == "apply_patch":
-        patch_text = safe_str(raw_in.get("patch") or raw_in.get("input") or "")
-        edits = _extract_patch_edits(patch_text, call, is_error)
         if edits:
             transcript.events.append(edits[0])
             if not is_error:
@@ -348,6 +403,7 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
                 raw_input=raw_in,
                 raw_output=call.raw_output,
                 is_error=is_error,
+                has_result=True,
                 operation="edit",
             )
             transcript.events.append(ev_fallback)
@@ -369,10 +425,13 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
                     raw_input=raw_in,
                     raw_output=call.raw_output,
                     is_error=True,
+                    has_result=True,
                 )
             )
             return
-        parsed_read = parse_numbered_lines(clean_out, offset=offset, limit=limit)
+        parsed_read = parse_numbered_lines(
+            clean_out, offset=offset, limit=limit, expect_line_numbers=True
+        )
         ev_read = FileReadEvent(
             event_id=call.event_id,
             event_index=call.event_index,
@@ -381,6 +440,7 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
             raw_input=raw_in,
             raw_output=call.raw_output,
             is_error=False,
+            has_result=True,
             truncated=parsed_read.truncated,
             truncation_reason=parsed_read.truncation_reason,
             file_path=file_path,
@@ -396,13 +456,30 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
         return
 
     if name in _SEARCH_TOOLS or name in _LIST_TOOLS:
+        if is_error:
+            transcript.events.append(
+                ToolEvent(
+                    event_id=call.event_id,
+                    event_index=call.event_index,
+                    tool_name=name,
+                    timestamp=call.timestamp,
+                    raw_input=raw_in,
+                    raw_output=call.raw_output,
+                    is_error=True,
+                    has_result=True,
+                )
+            )
+            return
+
         limit = safe_int(raw_in.get("limit") or raw_in.get("max_results"))
-        lines = [line.strip() for line in clean_out.splitlines() if line.strip()]
+        lines = [
+            line.strip()
+            for line in split_lf_lines(clean_out)
+            if line.strip() and not is_truncation_banner_line(line)[0]
+        ]
         matched_files: list[str] = []
         seen: set[str] = set()
         for line in lines:
-            if line.startswith(("...", "[")):
-                continue
             path_part = line.split(":", 1)[0].strip() if ":" in line else line
             if path_part and path_part not in seen:
                 seen.add(path_part)
@@ -414,6 +491,7 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
             result_limit=limit,
             observed_count=len(lines),
         )
+        sp = safe_str(raw_in.get("path") or raw_in.get("dir_path")) or None
         ev_search = SearchEvent(
             event_id=call.event_id,
             event_index=call.event_index,
@@ -421,11 +499,13 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
             timestamp=call.timestamp,
             raw_input=raw_in,
             raw_output=call.raw_output,
-            is_error=is_error,
+            is_error=False,
+            has_result=True,
             truncated=truncated,
             truncation_reason=trunc_reason,
             query=safe_str(raw_in.get("pattern") or raw_in.get("query")),
-            search_path=safe_str(raw_in.get("path") or raw_in.get("dir_path")) or None,
+            search_path=sp,
+            search_paths=[sp] if sp else [],
             glob_pattern=safe_str(raw_in.get("include") or raw_in.get("glob")) or None,
             match_count=len(lines),
             matched_files=matched_files,
@@ -446,6 +526,7 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
             raw_input=raw_in,
             raw_output=call.raw_output,
             is_error=is_error,
+            has_result=True,
             file_path=safe_str(raw_in.get("file_path") or raw_in.get("path")),
             operation=op,
             old_text=raw_in.get("old_text") if isinstance(raw_in.get("old_text"), str) else None,
@@ -457,7 +538,7 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
             transcript.file_edits.append(ev_edit)
         return
 
-    # MCP and any other custom tools
+    # MCP and any other custom tools (including Codex Desktop `exec`)
     truncated, trunc_reason = detect_truncation(clean_out, tool_name=name)
     ev_other = ToolEvent(
         event_id=call.event_id,
@@ -467,6 +548,7 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
         raw_input=raw_in,
         raw_output=call.raw_output,
         is_error=is_error,
+        has_result=True,
         truncated=truncated,
         truncation_reason=trunc_reason,
     )

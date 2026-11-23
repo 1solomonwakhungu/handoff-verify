@@ -125,16 +125,24 @@ def _format_check_output(report: VerificationReport, fmt: str) -> str:
     return "\n".join(lines)
 
 
-def _cmd_inspect(args: argparse.Namespace) -> int:
-    transcript_path = Path(args.transcript)
+def _load_transcript_arg(raw_arg: str, parser_hint: str) -> ParsedTranscript | None:
+    if raw_arg == "-":
+        return auto_parse(sys.stdin, format_hint=parser_hint, transcript_path="<stdin>")
+
+    transcript_path = Path(raw_arg)
     if not transcript_path.is_file():
         print(f"Error: transcript file not found: {transcript_path}", file=sys.stderr)
-        return 2
+        return None
+    return auto_parse(transcript_path, format_hint=parser_hint)
 
+
+def _cmd_inspect(args: argparse.Namespace) -> int:
     try:
-        transcript = auto_parse(transcript_path, format_hint=args.parser)
+        transcript = _load_transcript_arg(args.transcript, args.parser)
     except (OSError, ValueError) as exc:
         print(f"Error: failed to read transcript: {exc}", file=sys.stderr)
+        return 2
+    if transcript is None:
         return 2
 
     if args.format == "json":
@@ -145,11 +153,6 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
 
 
 def _cmd_check(args: argparse.Namespace) -> int:
-    transcript_path = Path(args.transcript)
-    if not transcript_path.is_file():
-        print(f"Error: transcript file not found: {transcript_path}", file=sys.stderr)
-        return 2
-
     repo_root: Path | None = None
     if args.repo is not None:
         repo_root = Path(args.repo)
@@ -158,9 +161,25 @@ def _cmd_check(args: argparse.Namespace) -> int:
             return 2
 
     try:
-        transcript = auto_parse(transcript_path, format_hint=args.parser)
+        transcript = _load_transcript_arg(args.transcript, args.parser)
     except (OSError, ValueError) as exc:
         print(f"Error: failed to read transcript: {exc}", file=sys.stderr)
+        return 2
+    if transcript is None:
+        return 2
+
+    # Never report PASS on empty, unreadable, or completely unrecognized input files
+    if (
+        transcript.source_format == "unknown"
+        and not transcript.events
+        and not transcript.assistant_messages
+    ):
+        source_label = transcript.transcript_path or args.transcript
+        print(
+            f"Error: no recognizable transcript records found in {source_label} "
+            f"(malformed lines: {transcript.malformed_lines})",
+            file=sys.stderr,
+        )
         return 2
 
     report = verify_transcript(transcript, repo_root=repo_root, strict=args.strict)
@@ -192,7 +211,10 @@ def build_parser() -> argparse.ArgumentParser:
         "inspect",
         help="Parse and summarize a transcript's format, tool events, and warnings.",
     )
-    inspect_parser.add_argument("transcript", help="Path to the JSONL transcript file.")
+    inspect_parser.add_argument(
+        "transcript",
+        help="Path to the JSONL transcript file (or '-' for stdin).",
+    )
     inspect_parser.add_argument(
         "--format",
         choices=("text", "json"),
@@ -211,7 +233,10 @@ def build_parser() -> argparse.ArgumentParser:
         "check",
         help="Verify claims in a transcript against observed tool-call evidence.",
     )
-    check_parser.add_argument("transcript", help="Path to the JSONL transcript file.")
+    check_parser.add_argument(
+        "transcript",
+        help="Path to the JSONL transcript file (or '-' for stdin).",
+    )
     check_parser.add_argument(
         "--repo",
         default=None,
@@ -245,14 +270,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI entry point returning POSIX exit code (0=pass, 1=findings, 2=usage error)."""
+    """CLI entry point returning POSIX exit code (0=pass, 1=findings, 2=usage/internal error)."""
     parser = build_parser()
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:
         code = exc.code
         return code if isinstance(code, int) else 2
-    return int(args.func(args))
+    try:
+        return int(args.func(args))
+    except Exception as exc:
+        print(f"Error: internal failure: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

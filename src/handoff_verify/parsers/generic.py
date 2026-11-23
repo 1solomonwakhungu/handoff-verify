@@ -7,8 +7,8 @@ Supported record `type` values:
 - `file_edit`: `{"type": "file_edit", "file_path": "...", "operation": "edit|write|delete",
   "old_text": "...", "new_text": "...", "content": "..."}`
 - `search`: `{"type": "search", "tool_name": "grep", "query": "...", "search_path": "src/",
-  "glob_pattern": "*.py", "excluded_dirs": ["vendor"], "match_count": 0, "matched_files": [],
-  "output": "...", "truncated": false, "result_limit": 50}`
+  "search_paths": ["src/"], "glob_pattern": "*.py", "excluded_dirs": ["vendor"],
+  "match_count": 0, "matched_files": [], "output": "...", "truncated": false, "result_limit": 50}`
 - `command`: `{"type": "command", "command": "...", "cwd": "...", "stdout": "...",
   "stderr": "...", "exit_code": 0, "truncated": false}`
 - `pagination`: `{"type": "pagination", "tool_name": "...", "resource": "...", "page": 1,
@@ -36,6 +36,7 @@ from handoff_verify.models import (
     ToolEvent,
 )
 from handoff_verify.parsers._common import (
+    MAX_PARSE_WARNINGS,
     analyze_shell_command,
     detect_pagination,
     detect_truncation,
@@ -64,6 +65,8 @@ def parse_generic(
     )
 
     pending_calls: dict[str, ToolEvent] = {}
+    unrecognized_warnings = 0
+    suppressed_unrecognized = 0
 
     for line_no, record in loaded.records:
         if transcript.cwd is None and isinstance(record.get("cwd"), str) and record["cwd"].strip():
@@ -80,11 +83,13 @@ def parse_generic(
         if rec_type == "assistant":
             text = extract_text_content(record.get("text") or record.get("content")).strip()
             if text:
+                after_idx = len(transcript.events) - 1 if transcript.events else None
                 transcript.assistant_messages.append(
                     AssistantMessage(
                         index=len(transcript.assistant_messages),
                         text=text,
                         timestamp=timestamp,
+                        after_event_index=after_idx,
                     )
                 )
             continue
@@ -97,7 +102,10 @@ def parse_generic(
             end_line = safe_int(record.get("end_line"))
             line_count = safe_int(record.get("line_count"))
             parsed_read = parse_numbered_lines(
-                raw_content, offset=offset or start_line, limit=limit
+                raw_content,
+                offset=offset or start_line,
+                limit=limit,
+                expect_line_numbers=True,
             )
 
             eff_content = parsed_read.content if raw_content else ""
@@ -116,6 +124,7 @@ def parse_generic(
                 safe_str(record.get("truncation_reason")) or parsed_read.truncation_reason or None
             )
             is_error = bool(record.get("is_error", False))
+            has_result = bool(record.get("has_result", True))
             ev_read = FileReadEvent(
                 event_id=event_id,
                 event_index=event_index,
@@ -124,6 +133,7 @@ def parse_generic(
                 raw_input=dict(record),
                 raw_output=raw_content,
                 is_error=is_error,
+                has_result=has_result,
                 truncated=truncated,
                 truncation_reason=trunc_reason,
                 file_path=safe_str(record.get("file_path") or record.get("path")),
@@ -135,12 +145,13 @@ def parse_generic(
                 line_count=line_count,
             )
             transcript.events.append(ev_read)
-            if not is_error:
+            if has_result and not is_error:
                 transcript.file_reads.append(ev_read)
             continue
 
         if rec_type == "file_edit":
             is_error = bool(record.get("is_error", False))
+            has_result = bool(record.get("has_result", True))
             ev_edit = FileEditEvent(
                 event_id=event_id,
                 event_index=event_index,
@@ -149,6 +160,7 @@ def parse_generic(
                 raw_input=dict(record),
                 raw_output=extract_text_content(record.get("output")),
                 is_error=is_error,
+                has_result=has_result,
                 file_path=safe_str(record.get("file_path") or record.get("path")),
                 operation=safe_str(record.get("operation")) or "edit",
                 old_text=record.get("old_text")
@@ -160,7 +172,7 @@ def parse_generic(
                 content=record.get("content") if isinstance(record.get("content"), str) else None,
             )
             transcript.events.append(ev_edit)
-            if not is_error:
+            if has_result and not is_error:
                 transcript.file_edits.append(ev_edit)
             continue
 
@@ -184,6 +196,18 @@ def parse_generic(
                 else []
             )
 
+            raw_sp_list = record.get("search_paths")
+            search_paths = (
+                [safe_str(p) for p in raw_sp_list if safe_str(p)]
+                if isinstance(raw_sp_list, list)
+                else []
+            )
+            sp = safe_str(record.get("search_path") or record.get("path")) or None
+            if not search_paths and sp:
+                search_paths = [sp]
+            elif search_paths and sp is None:
+                sp = search_paths[0]
+
             truncated = bool(record.get("truncated", False))
             trunc_reason = safe_str(record.get("truncation_reason")) or None
             if not truncated:
@@ -196,6 +220,8 @@ def parse_generic(
                 truncated = det_trunc
                 trunc_reason = trunc_reason or det_reason
 
+            is_error = bool(record.get("is_error", False))
+            has_result = bool(record.get("has_result", True))
             ev_search = SearchEvent(
                 event_id=event_id,
                 event_index=event_index,
@@ -203,11 +229,13 @@ def parse_generic(
                 timestamp=timestamp,
                 raw_input=dict(record),
                 raw_output=output,
-                is_error=bool(record.get("is_error", False)),
+                is_error=is_error,
+                has_result=has_result,
                 truncated=truncated,
                 truncation_reason=trunc_reason,
                 query=safe_str(record.get("query") or record.get("pattern")),
-                search_path=safe_str(record.get("search_path") or record.get("path")) or None,
+                search_path=sp,
+                search_paths=search_paths,
                 glob_pattern=safe_str(record.get("glob_pattern") or record.get("glob")) or None,
                 excluded_dirs=excluded_dirs,
                 match_count=match_count,
@@ -216,7 +244,8 @@ def parse_generic(
                 result_limit=result_limit,
             )
             transcript.events.append(ev_search)
-            transcript.searches.append(ev_search)
+            if has_result and not is_error:
+                transcript.searches.append(ev_search)
             continue
 
         if rec_type == "command":
@@ -227,6 +256,7 @@ def parse_generic(
             is_error = bool(record.get("is_error", False)) or (
                 exit_code is not None and exit_code != 0
             )
+            has_result = bool(record.get("has_result", True))
             truncated = bool(record.get("truncated", False))
             trunc_reason = safe_str(record.get("truncation_reason")) or None
             if not truncated:
@@ -242,6 +272,7 @@ def parse_generic(
                 raw_input=dict(record),
                 raw_output=stdout,
                 is_error=is_error,
+                has_result=has_result,
                 truncated=truncated,
                 truncation_reason=trunc_reason,
                 command=command,
@@ -251,37 +282,45 @@ def parse_generic(
                 exit_code=exit_code,
             )
             transcript.events.append(ev_cmd)
-            transcript.commands.append(ev_cmd)
-
-            derived = analyze_shell_command(
-                command=command,
-                stdout=stdout,
-                event_id=event_id,
-                event_index=event_index,
-                tool_name=ev_cmd.tool_name,
-                timestamp=timestamp,
-                raw_input=ev_cmd.raw_input,
-                raw_output=stdout,
-                is_error=is_error,
-                exit_code=exit_code,
-                truncated=truncated,
-                truncation_reason=trunc_reason,
-            )
-            transcript.file_reads.extend(derived.file_reads)
-            transcript.file_edits.extend(derived.file_edits)
-            transcript.searches.extend(derived.searches)
+            if has_result:
+                transcript.commands.append(ev_cmd)
+                derived = analyze_shell_command(
+                    command=command,
+                    stdout=stdout,
+                    event_id=event_id,
+                    event_index=event_index,
+                    tool_name=ev_cmd.tool_name,
+                    timestamp=timestamp,
+                    raw_input=ev_cmd.raw_input,
+                    raw_output=stdout,
+                    is_error=is_error,
+                    exit_code=exit_code,
+                    truncated=truncated,
+                    truncation_reason=trunc_reason,
+                )
+                transcript.file_reads.extend(derived.file_reads)
+                transcript.file_edits.extend(derived.file_edits)
+                transcript.searches.extend(derived.searches)
             continue
 
         if rec_type == "pagination":
             page = safe_int(record.get("page"))
             total_pages = safe_int(record.get("total_pages"))
             next_cursor = safe_str(record.get("next_cursor") or record.get("nextCursor")) or None
-            has_more = bool(record.get("has_more", False))
-            if not has_more and page is not None and total_pages is not None and page < total_pages:
-                has_more = True
-            if not has_more and next_cursor is not None and "has_more" not in record:
-                has_more = True
+            if "has_more" in record:
+                has_more = bool(record.get("has_more"))
+            else:
+                has_more = False
+                if (
+                    page is not None
+                    and total_pages is not None
+                    and page < total_pages
+                    or next_cursor is not None
+                ):
+                    has_more = True
 
+            is_error = bool(record.get("is_error", False))
+            has_result = bool(record.get("has_result", True))
             raw_in = record.get("input") if isinstance(record.get("input"), dict) else dict(record)
             ev_pag = PaginationEvent(
                 event_id=event_id,
@@ -290,7 +329,8 @@ def parse_generic(
                 timestamp=timestamp,
                 raw_input=raw_in,
                 raw_output=extract_text_content(record.get("output")),
-                is_error=bool(record.get("is_error", False)),
+                is_error=is_error,
+                has_result=has_result,
                 truncated=bool(record.get("truncated", False)),
                 truncation_reason=safe_str(record.get("truncation_reason")) or None,
                 resource=safe_str(record.get("resource") or record.get("tool_name")),
@@ -302,11 +342,12 @@ def parse_generic(
                 item_count=safe_int(record.get("item_count")),
             )
             transcript.events.append(ev_pag)
-            transcript.paginations.append(ev_pag)
+            if has_result and not is_error:
+                transcript.paginations.append(ev_pag)
             continue
 
         if rec_type == "tool_call":
-            raw_in: dict[str, Any] = (
+            raw_in_call: dict[str, Any] = (
                 record["input"] if isinstance(record.get("input"), dict) else {}
             )
             ev_call = ToolEvent(
@@ -314,8 +355,9 @@ def parse_generic(
                 event_index=event_index,
                 tool_name=safe_str(record.get("tool_name") or record.get("name")),
                 timestamp=timestamp,
-                raw_input=raw_in,
+                raw_input=raw_in_call,
                 raw_output="",
+                has_result=False,
             )
             transcript.events.append(ev_call)
             pending_calls[event_id] = ev_call
@@ -327,36 +369,48 @@ def parse_generic(
             output = extract_text_content(record.get("output") or record.get("content"))
             is_error = bool(record.get("is_error", False))
             if ev_call is None:
-                transcript.parse_warnings.append(
-                    f"Line {line_no}: orphan tool_result for tool_call_id={ref_id!r}"
-                )
+                if len(transcript.parse_warnings) < MAX_PARSE_WARNINGS:
+                    transcript.parse_warnings.append(
+                        f"Line {line_no}: orphan tool_result for tool_call_id={ref_id!r}"
+                    )
                 continue
             ev_call.raw_output = output
             ev_call.is_error = is_error
+            ev_call.has_result = True
             det_trunc, det_reason = detect_truncation(output, tool_name=ev_call.tool_name)
             ev_call.truncated = bool(record.get("truncated", False)) or det_trunc
             ev_call.truncation_reason = (
                 safe_str(record.get("truncation_reason")) or det_reason or None
             )
-            pag = detect_pagination(
-                event_id=ev_call.event_id,
-                event_index=ev_call.event_index,
-                tool_name=ev_call.tool_name,
-                timestamp=ev_call.timestamp,
-                raw_input=ev_call.raw_input,
-                raw_output=output,
-                is_error=is_error,
-            )
-            if pag is not None:
-                pag.truncated = ev_call.truncated
-                pag.truncation_reason = ev_call.truncation_reason
-                transcript.paginations.append(pag)
+            if not is_error:
+                pag = detect_pagination(
+                    event_id=ev_call.event_id,
+                    event_index=ev_call.event_index,
+                    tool_name=ev_call.tool_name,
+                    timestamp=ev_call.timestamp,
+                    raw_input=ev_call.raw_input,
+                    raw_output=output,
+                    is_error=False,
+                )
+                if pag is not None:
+                    pag.truncated = ev_call.truncated
+                    pag.truncation_reason = ev_call.truncation_reason
+                    transcript.paginations.append(pag)
             continue
 
         if rec_type:
-            transcript.parse_warnings.append(
-                f"Line {line_no}: unrecognized generic record type {rec_type!r}"
-            )
+            if unrecognized_warnings < MAX_PARSE_WARNINGS:
+                transcript.parse_warnings.append(
+                    f"Line {line_no}: unrecognized generic record type {rec_type!r}"
+                )
+                unrecognized_warnings += 1
+            else:
+                suppressed_unrecognized += 1
+
+    if suppressed_unrecognized:
+        transcript.parse_warnings.append(
+            f"... and {suppressed_unrecognized} additional unrecognized record warnings"
+        )
 
     mark_followed_cursors(transcript.events, transcript.paginations)
 

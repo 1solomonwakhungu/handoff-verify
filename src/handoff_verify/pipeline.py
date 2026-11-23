@@ -29,7 +29,14 @@ def build_scope_receipt(transcript: ParsedTranscript) -> ScopeReceipt:
     searched_roots: list[str] = []
     excluded_dirs: list[str] = []
     for search in transcript.searches:
-        searched_roots.append(search.search_path if search.search_path else ".")
+        if not search.has_result or search.is_error:
+            continue
+        if search.search_paths:
+            searched_roots.extend(search.search_paths)
+        elif search.search_path:
+            searched_roots.append(search.search_path)
+        else:
+            searched_roots.append(".")
         excluded_dirs.extend(search.excluded_dirs)
 
     truncated_outputs: list[dict[str, object]] = []
@@ -40,7 +47,12 @@ def build_scope_receipt(transcript: ParsedTranscript) -> ScopeReceipt:
         + list(transcript.file_reads)
         + list(transcript.commands)
     ):
-        if ev.truncated and ev.event_index not in seen_trunc_indices:
+        if (
+            ev.has_result
+            and not ev.is_error
+            and ev.truncated
+            and ev.event_index not in seen_trunc_indices
+        ):
             seen_trunc_indices.add(ev.event_index)
             truncated_outputs.append(
                 {
@@ -53,7 +65,7 @@ def build_scope_receipt(transcript: ParsedTranscript) -> ScopeReceipt:
 
     unread_cursors: list[dict[str, object]] = []
     for pag in transcript.paginations:
-        if (pag.has_more or pag.next_cursor) and not pag.cursor_followed:
+        if pag.has_result and not pag.is_error and pag.has_more and not pag.cursor_followed:
             unread_cursors.append(
                 {
                     "event_index": pag.event_index,
@@ -65,9 +77,19 @@ def build_scope_receipt(transcript: ParsedTranscript) -> ScopeReceipt:
                 }
             )
 
-    files_read = _dedupe_preserve_order([r.file_path for r in transcript.file_reads if r.file_path])
+    files_read = _dedupe_preserve_order(
+        [
+            r.file_path
+            for r in transcript.file_reads
+            if r.file_path and r.has_result and not r.is_error
+        ]
+    )
     files_edited = _dedupe_preserve_order(
-        [e.file_path for e in transcript.file_edits if e.file_path]
+        [
+            e.file_path
+            for e in transcript.file_edits
+            if e.file_path and e.has_result and not e.is_error
+        ]
     )
 
     return ScopeReceipt(

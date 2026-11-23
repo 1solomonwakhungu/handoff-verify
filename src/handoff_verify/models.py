@@ -47,6 +47,7 @@ class ToolEvent(_SerializableMixin):
     raw_input: dict[str, Any] = field(default_factory=dict)
     raw_output: str = ""
     is_error: bool = False
+    has_result: bool = True
     truncated: bool = False
     truncation_reason: str | None = None
 
@@ -69,7 +70,7 @@ class FileEditEvent(ToolEvent):
     """Structured event for a file modification, creation, or deletion."""
 
     file_path: str = ""
-    operation: str = "edit"
+    operation: FileEditOperation | str = "edit"
     old_text: str | None = None
     new_text: str | None = None
     content: str | None = None
@@ -81,6 +82,7 @@ class SearchEvent(ToolEvent):
 
     query: str = ""
     search_path: str | None = None
+    search_paths: list[str] = field(default_factory=list)
     glob_pattern: str | None = None
     excluded_dirs: list[str] = field(default_factory=list)
     match_count: int | None = None
@@ -121,11 +123,22 @@ class AssistantMessage(_SerializableMixin):
     text: str = ""
     timestamp: str | None = None
     is_final: bool = False
+    after_event_index: int | None = None
 
 
 @dataclass
 class ParsedTranscript(_SerializableMixin):
-    """Unified normalized representation of a parsed agent transcript."""
+    """Unified normalized representation of a parsed agent transcript.
+
+    Invariant:
+        - `events` contains every observed tool call in chronological order, including
+          unresolved (`has_result=False`) and errored (`is_error=True`) calls.
+        - `file_reads`, `file_edits`, `searches`, and `paginations` contain only completed,
+          non-errored evidence events (so downstream verifiers never treat failed or
+          unreturned calls as observed evidence).
+        - `commands` contains completed shell command executions (`has_result=True`),
+          preserving non-zero `exit_code` and `is_error` for command-output verification.
+    """
 
     source_format: str = "unknown"
     transcript_path: str | None = None

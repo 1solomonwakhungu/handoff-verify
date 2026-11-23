@@ -12,11 +12,26 @@ from handoff_verify.parsers.codex import parse_codex
 from handoff_verify.parsers.generic import parse_generic
 
 _CLAUDE_TOP_TYPES = frozenset(
-    {"assistant", "user", "system", "progress", "summary", "file-history-snapshot"}
+    {
+        "assistant",
+        "user",
+        "system",
+        "progress",
+        "summary",
+        "file-history-snapshot",
+        "queue-operation",
+    }
 )
 _CODEX_MODERN_TYPES = frozenset({"response_item", "session_meta", "event_msg", "turn_context"})
 _CODEX_LEGACY_TYPES = frozenset(
-    {"function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output"}
+    {
+        "function_call",
+        "function_call_output",
+        "custom_tool_call",
+        "custom_tool_call_output",
+        "local_shell_call",
+        "local_shell_call_output",
+    }
 )
 _GENERIC_RECORD_TYPES = frozenset(
     {
@@ -32,7 +47,7 @@ _GENERIC_RECORD_TYPES = frozenset(
 )
 
 
-def _iter_sample_lines(source: str | Path | Iterable[str], max_valid: int = 50) -> list[dict]:
+def _iter_sample_lines(source: str | Path | Iterable[str], max_valid: int = 200) -> list[dict]:
     """Read up to `max_valid` valid JSON object lines from a path or line iterable."""
     records: list[dict] = []
 
@@ -43,7 +58,7 @@ def _iter_sample_lines(source: str | Path | Iterable[str], max_valid: int = 50) 
                 continue
             try:
                 parsed = json.loads(stripped)
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):
                 continue
             if isinstance(parsed, dict):
                 records.append(parsed)
@@ -96,6 +111,11 @@ def detect_format(path_or_lines: str | Path | Iterable[str]) -> SourceFormat:
                 for b in content
             ):
                 scores["claude_code"] += 3
+            continue
+        if (
+            rec_type == "summary" and isinstance(rec.get("summary"), str) and "leafUuid" in rec
+        ) or (rec_type == "file-history-snapshot" and "snapshot" in rec):
+            scores["claude_code"] += 3
             continue
         if any(k in rec for k in ("sessionId", "parentUuid", "toolUseResult", "isSidechain")):
             scores["claude_code"] += 3
