@@ -1,0 +1,249 @@
+{
+  "schema_version": "1.0",
+  "description": "24-case seeded evaluation suite for handoff-verify (12 clean sessions, 12 planted failures).",
+  "cases": [
+    {
+      "id": "clean_01_claude_single_read",
+      "file": "cases/clean_01_claude_single_read.jsonl",
+      "category": "pointers",
+      "expected_pass": true,
+      "expected_codes": [],
+      "format": "claude_code",
+      "description": "Clean Claude Code session with accurate single-window Read and path:line citations."
+    },
+    {
+      "id": "clean_02_claude_multi_window_read",
+      "file": "cases/clean_02_claude_multi_window_read.jsonl",
+      "category": "pointers",
+      "expected_pass": true,
+      "expected_codes": [],
+      "format": "claude_code",
+      "description": "Clean Claude Code session with multi-window offset/limit Reads covering a cross-window citation."
+    },
+    {
+      "id": "clean_03_claude_read_edit_reread",
+      "file": "cases/clean_03_claude_read_edit_reread.jsonl",
+      "category": "pointers",
+      "expected_pass": true,
+      "expected_codes": [],
+      "format": "claude_code",
+      "description": "Clean Claude Code session with Read -> Edit -> re-Read and accurate post-edit citations."
+    },
+    {
+      "id": "clean_04_claude_quotes_normalized",
+      "file": "cases/clean_04_claude_quotes_normalized.jsonl",
+      "category": "quotes",
+      "expected_pass": true,
+      "expected_codes": [],
+      "format": "claude_code",
+      "description": "Clean Claude Code session with exact, whitespace-normalized inline, and verbatim fenced quotes."
+    },
+    {
+      "id": "clean_05_claude_prose_examples_and_urls",
+      "file": "cases/clean_05_claude_prose_examples_and_urls.jsonl",
+      "category": "false_positive_guard",
+      "expected_pass": true,
+      "expected_codes": [],
+      "format": "claude_code",
+      "description": "Clean Claude Code session with URLs, timestamps, localhost:8080, prose examples, follow-ups, and proposed fix code."
+    },
+    {
+      "id": "clean_06_claude_repo_wide_grep_absence",
+      "file": "cases/clean_06_claude_repo_wide_grep_absence.jsonl",
+      "category": "scope",
+      "expected_pass": true,
+      "expected_codes": [],
+      "format": "claude_code",
+      "description": "Clean Claude Code session with untruncated repo-wide Grep backing a 'no other callers' claim."
+    },
+    {
+      "id": "clean_07_claude_subdir_grep_qualified",
+      "file": "cases/clean_07_claude_subdir_grep_qualified.jsonl",
+      "category": "scope",
+      "expected_pass": true,
+      "expected_codes": [],
+      "format": "claude_code",
+      "description": "Clean Claude Code session with subdir-scoped Grep (src/auth) and explicitly qualified absence claim."
+    },
+    {
+      "id": "clean_08_claude_paginated_mcp_complete",
+      "file": "cases/clean_08_claude_paginated_mcp_complete.jsonl",
+      "category": "pagination",
+      "expected_pass": true,
+      "expected_codes": [],
+      "format": "claude_code",
+      "description": "Clean Claude Code session following MCP nextCursor until has_more=false before claiming all pages reviewed."
+    },
+    {
+      "id": "clean_09_claude_subagent_accurate",
+      "file": "cases/clean_09_claude_subagent_accurate.jsonl",
+      "category": "subagent",
+      "expected_pass": true,
+      "expected_codes": [],
+      "format": "claude_code",
+      "description": "Clean Claude Code sidechain subagent transcript with accurate reads, quote, and repo-wide search."
+    },
+    {
+      "id": "clean_10_codex_rollout_accurate",
+      "file": "cases/clean_10_codex_rollout_accurate.jsonl",
+      "category": "cross_harness",
+      "expected_pass": true,
+      "expected_codes": [],
+      "format": "codex",
+      "description": "Clean Codex CLI rollout transcript with accurate shell reads, quote, and absence claim."
+    },
+    {
+      "id": "clean_11_generic_accurate",
+      "file": "cases/clean_11_generic_accurate.jsonl",
+      "category": "cross_harness",
+      "expected_pass": true,
+      "expected_codes": [],
+      "format": "generic",
+      "description": "Clean Generic JSONL transcript with accurate file reads, inline quote, and repo-wide search."
+    },
+    {
+      "id": "clean_12_claude_write_and_command_quote",
+      "file": "cases/clean_12_claude_write_and_command_quote.jsonl",
+      "category": "quotes",
+      "expected_pass": true,
+      "expected_codes": [],
+      "format": "claude_code",
+      "description": "Clean Claude Code session citing a newly written file and quoting verified pytest stdout."
+    },
+    {
+      "id": "fail_01_claude_unread_pointer",
+      "file": "cases/fail_01_claude_unread_pointer.jsonl",
+      "category": "pointers",
+      "expected_pass": false,
+      "expected_codes": [
+        "UNREAD_FILE"
+      ],
+      "format": "claude_code",
+      "description": "Planted unread path:line pointer to src/auth/session_store.py:48-55."
+    },
+    {
+      "id": "fail_02_claude_out_of_window",
+      "file": "cases/fail_02_claude_out_of_window.jsonl",
+      "category": "pointers",
+      "expected_pass": false,
+      "expected_codes": [
+        "LINE_OUT_OF_READ_WINDOW"
+      ],
+      "format": "claude_code",
+      "description": "Planted out-of-window citation (read lines 1-40, cites line 125)."
+    },
+    {
+      "id": "fail_03_claude_stale_read_after_edit",
+      "file": "cases/fail_03_claude_stale_read_after_edit.jsonl",
+      "category": "pointers",
+      "expected_pass": false,
+      "expected_codes": [
+        "STALE_FILE_READ"
+      ],
+      "format": "claude_code",
+      "description": "Planted stale pre-edit line citation after line-shifting Edit without re-read."
+    },
+    {
+      "id": "fail_04_claude_fabricated_inline_quote",
+      "file": "cases/fail_04_claude_fabricated_inline_quote.jsonl",
+      "category": "quotes",
+      "expected_pass": false,
+      "expected_codes": [
+        "QUOTE_NOT_FOUND"
+      ],
+      "format": "claude_code",
+      "description": "Planted fabricated inline constant value quote (claims 120 when file has 30)."
+    },
+    {
+      "id": "fail_05_claude_fabricated_fenced_quote",
+      "file": "cases/fail_05_claude_fabricated_fenced_quote.jsonl",
+      "category": "quotes",
+      "expected_pass": false,
+      "expected_codes": [
+        "QUOTE_NOT_FOUND"
+      ],
+      "format": "claude_code",
+      "description": "Planted altered fenced code block claimed verbatim from src/db/pool.py."
+    },
+    {
+      "id": "fail_06_claude_truncated_grep",
+      "file": "cases/fail_06_claude_truncated_grep.jsonl",
+      "category": "scope",
+      "expected_pass": false,
+      "expected_codes": [
+        "TRUNCATED_SEARCH_OUTPUT"
+      ],
+      "format": "claude_code",
+      "description": "Planted truncated Grep (head_limit=5) claimed as 'no other matches'."
+    },
+    {
+      "id": "fail_07_claude_narrow_search_scope",
+      "file": "cases/fail_07_claude_narrow_search_scope.jsonl",
+      "category": "scope",
+      "expected_pass": false,
+      "expected_codes": [
+        "NARROW_SEARCH_SCOPE"
+      ],
+      "format": "claude_code",
+      "description": "Planted subdir-only Grep (src/auth) claimed as repo-wide 'no other callers anywhere'."
+    },
+    {
+      "id": "fail_08_claude_unread_pagination_cursor",
+      "file": "cases/fail_08_claude_unread_pagination_cursor.jsonl",
+      "category": "pagination",
+      "expected_pass": false,
+      "expected_codes": [
+        "UNREAD_PAGINATION_CURSOR"
+      ],
+      "format": "claude_code",
+      "description": "Planted unread page-2 MCP pagination cursor claimed as 'reviewed all pages'."
+    },
+    {
+      "id": "fail_09_claude_no_search_evidence",
+      "file": "cases/fail_09_claude_no_search_evidence.jsonl",
+      "category": "scope",
+      "expected_pass": false,
+      "expected_codes": [
+        "NO_SEARCH_EVIDENCE"
+      ],
+      "format": "claude_code",
+      "description": "Planted 'not used anywhere in the codebase' claim with zero search tool calls."
+    },
+    {
+      "id": "fail_10_codex_unread_and_quote",
+      "file": "cases/fail_10_codex_unread_and_quote.jsonl",
+      "category": "cross_harness",
+      "expected_pass": false,
+      "expected_codes": [
+        "UNREAD_FILE",
+        "QUOTE_NOT_FOUND"
+      ],
+      "format": "codex",
+      "description": "Planted Codex rollout transcript with unread file pointer and fabricated inline quote."
+    },
+    {
+      "id": "fail_11_claude_subagent_fabricated",
+      "file": "cases/fail_11_claude_subagent_fabricated.jsonl",
+      "category": "subagent",
+      "expected_pass": false,
+      "expected_codes": [
+        "UNREAD_FILE",
+        "QUOTE_NOT_FOUND"
+      ],
+      "format": "claude_code",
+      "description": "Planted Claude Code sidechain subagent transcript with unread pointer and fabricated quote."
+    },
+    {
+      "id": "fail_12_generic_window_and_truncated_search",
+      "file": "cases/fail_12_generic_window_and_truncated_search.jsonl",
+      "category": "cross_harness",
+      "expected_pass": false,
+      "expected_codes": [
+        "LINE_OUT_OF_READ_WINDOW",
+        "TRUNCATED_SEARCH_OUTPUT"
+      ],
+      "format": "generic",
+      "description": "Planted Generic JSONL transcript with out-of-window line pointer and truncated search absence claim."
+    }
+  ]
+}
