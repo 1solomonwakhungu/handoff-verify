@@ -228,7 +228,7 @@ def _cmd_eval(args: argparse.Namespace) -> int:
     cases_dir = Path(args.cases_dir) if args.cases_dir is not None else None
     try:
         summary = run_eval_suite(cases_dir=cases_dir, strict=bool(args.strict))
-    except (EvalSuiteError, OSError, ValueError) as exc:
+    except (EvalSuiteError, OSError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 

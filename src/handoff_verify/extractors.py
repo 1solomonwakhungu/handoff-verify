@@ -504,6 +504,16 @@ _NEGATED_READ_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
+_NEGATED_READ_SUFFIX_RE = re.compile(
+    r"\b(?:"
+    r"(?:was|is|were|are)\s+(?:out\s+of\s+scope|not\s+(?:read|opened|inspected|checked)|"
+    r"left\s+unread|skipped|untouched)|"
+    r"(?:I|we)\s+(?:did\s+not|didn't|have\s+not|haven't)\s+"
+    r"(?:read|open|inspect|check|look\s+at)\s+(?:it|that\s+file|them)"
+    r")\b",
+    re.IGNORECASE,
+)
+
 _UNTOUCHED_SUFFIX_RE = re.compile(
     r"\b(?:untouched|unchanged|unmodified|as[- ]is|skipped|unread|unopened)\b",
     re.IGNORECASE,
@@ -549,6 +559,14 @@ def _is_hypothetical_pointer(
         return True
 
     if _NEGATED_READ_PREFIX_RE.search(prefix):
+        return True
+
+    clause_suffix = sentence[match_end : min(len(sentence), match_end + 90)]
+    for sep in (";", ".", " — ", "\n"):
+        idx = clause_suffix.find(sep)
+        if idx != -1:
+            clause_suffix = clause_suffix[:idx]
+    if _NEGATED_READ_SUFFIX_RE.search(clause_suffix):
         return True
 
     if _PROSPECTIVE_PREFIX_RE.search(prefix) and not re.search(
@@ -1365,6 +1383,12 @@ _ABSENCE_CONTEXTUAL_PATTERNS: tuple[re.Pattern[str], ...] = (
     ),
     re.compile(r"\bno\s+(?:todos?|fixmes?)\b", re.IGNORECASE),
     re.compile(r"\bnone\s+found\b", re.IGNORECASE),
+    re.compile(
+        r"\bnone\s+of\s+(?:the\s+)?(?:(?:open|remaining|matching|active|returned|\d+)\s+)?"
+        r"(?:issues?|items?|files?|prs?|pull\s+requests?|records?|pages?|tickets?|"
+        r"results?|matches|callers?|references?|entries)\b",
+        re.IGNORECASE,
+    ),
 )
 
 _NON_SEARCH_ABSENCE_AFTER_RE = re.compile(
@@ -1385,7 +1409,7 @@ _SEARCH_OR_LISTING_VERB_RE = re.compile(
     r"\b(?:search(?:ed|ing)?|grep(?:ped|ping)?|rg|list(?:ed|ing)?|"
     r"reviewed\s+all|checked\s+all|scanned|audited|returned|shows?|showed|matching|"
     r"repo|repository|codebase|project|anywhere|elsewhere|pages?|cursors?|"
-    r"gh\s+issue|gh\s+pr|tickets?|prs?|pull\s+requests?)\b",
+    r"gh\s+issue|gh\s+pr|open\s+issues?|tickets?|prs?|pull\s+requests?)\b",
     re.IGNORECASE,
 )
 
@@ -1657,6 +1681,15 @@ def _has_hedging(sentence: str, match_start: int, match_end: int) -> bool:
     return bool(_HEDGING_AFTER_RE.search(suffix))
 
 
+_ANAPHORIC_SCOPE_RE = re.compile(
+    r"\b(?:there|in\s+that\s+(?:dir|directory|folder|package|module|subdir|subdirectory|path)|"
+    r"within\s+that\s+(?:dir|directory|folder|package|module)|"
+    r"in\s+those\s+(?:files|dirs|directories|folders|packages|modules))\b",
+    re.IGNORECASE,
+)
+_THIS_FILE_REF_RE = re.compile(r"\b(?:in|within)\s+this\s+file\b", re.IGNORECASE)
+
+
 def extract_scope_claims(
     text: str,
     *,
@@ -1667,10 +1700,24 @@ def extract_scope_claims(
     prose_chunks, _ = _segment_markdown(text)
     claims: list[Claim] = []
     seen: set[tuple[str, str]] = set()
+    last_qualifiers: list[str] = []
+    last_file_path: str | None = None
 
     for chunk in prose_chunks:
         for _, _, sentence in _iter_sentences(chunk.text):
+            sent_ptrs = extract_pointer_claims(sentence, base_dirs=base_dirs)
+            for ptr in sent_ptrs:
+                if ptr.file_path:
+                    last_file_path = ptr.file_path
+
             qualifiers = extract_scope_qualifiers(sentence, base_dirs=base_dirs)
+            if qualifiers:
+                last_qualifiers = qualifiers
+            elif not has_explicit_repo_wide_wording(sentence):
+                if _THIS_FILE_REF_RE.search(sentence) and last_file_path:
+                    qualifiers = [last_file_path]
+                elif _ANAPHORIC_SCOPE_RE.search(sentence) and last_qualifiers:
+                    qualifiers = list(last_qualifiers)
             primary_scope = qualifiers[0] if qualifiers else None
 
             # Absence claims: strong patterns first, then contextual patterns

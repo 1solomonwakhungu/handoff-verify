@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib.resources
 import json
 import math
 import statistics
@@ -18,6 +19,7 @@ EvalOutcome = Literal["TP", "TN", "FP", "FN"]
 
 DEFAULT_RECALL_TARGET = 0.90
 DEFAULT_MAX_FP = 0
+DEFAULT_MAX_MEDIAN_MS = 50.0
 
 
 class EvalSuiteError(ValueError):
@@ -139,6 +141,7 @@ class EvalSummary:
             "targets": {
                 "max_false_positives": DEFAULT_MAX_FP,
                 "min_recall": DEFAULT_RECALL_TARGET,
+                "max_median_ms": DEFAULT_MAX_MEDIAN_MS,
             },
             "metrics": {
                 "total": self.total,
@@ -161,12 +164,28 @@ class EvalSummary:
         }
 
 
+def _find_bundled_evals_dir() -> Path | None:
+    """Return bundled ``handoff_verify/_evals`` directory inside an installed wheel if present."""
+    try:
+        traversable = importlib.resources.files("handoff_verify").joinpath("_evals")
+        manifest = traversable.joinpath("manifest.json")
+        if manifest.is_file():
+            candidate = Path(str(traversable)).resolve()
+            if (candidate / "manifest.json").is_file():
+                return candidate
+    except (FileNotFoundError, ModuleNotFoundError, OSError, TypeError):
+        return None
+    return None
+
+
 def resolve_evals_dir(cases_dir: Path | None = None) -> Path:
     """Resolve the evals directory containing ``manifest.json``.
 
     Search order when ``cases_dir`` is omitted:
-    1. ``./evals`` relative to the current working directory.
-    2. ``<repo_root>/evals`` relative to the installed ``handoff_verify`` package.
+    1. Bundled wheel package data (``handoff_verify/_evals/manifest.json``).
+    2. Editable source checkout root (``<repo_root>/evals/manifest.json`` alongside
+       ``pyproject.toml``).
+    3. ``./evals/manifest.json`` relative to the current working directory.
     """
     if cases_dir is not None:
         candidate = cases_dir.expanduser().resolve()
@@ -179,19 +198,24 @@ def resolve_evals_dir(cases_dir: Path | None = None) -> Path:
             f"eval manifest not found in {candidate} (expected {candidate / 'manifest.json'})"
         )
 
+    bundled = _find_bundled_evals_dir()
+    if bundled is not None:
+        return bundled
+
+    pkg_path = Path(__file__).resolve()
+    if len(pkg_path.parents) >= 3:
+        repo_root = pkg_path.parents[2]
+        repo_evals = repo_root / "evals"
+        if (repo_root / "pyproject.toml").is_file() and (repo_evals / "manifest.json").is_file():
+            return repo_evals
+
     cwd_evals = (Path.cwd() / "evals").resolve()
     if (cwd_evals / "manifest.json").is_file():
         return cwd_evals
 
-    pkg_path = Path(__file__).resolve()
-    for parent in pkg_path.parents[:4]:
-        candidate = parent / "evals"
-        if (candidate / "manifest.json").is_file():
-            return candidate
-
     raise EvalSuiteError(
-        "could not locate evals/manifest.json (checked ./evals and package root); "
-        "pass --cases-dir <path>"
+        "could not locate evals/manifest.json (checked bundled package data, source checkout, "
+        "and ./evals); pass --cases-dir <path>"
     )
 
 
@@ -226,7 +250,7 @@ def load_eval_manifest(evals_dir: Path) -> list[EvalCaseSpec]:
         if not isinstance(item, dict):
             raise EvalSuiteError(f"manifest case #{idx} must be a JSON object")
 
-        case_id = item.get("id")
+        raw_id = item.get("id")
         rel_file = item.get("file")
         category = item.get("category")
         expected_pass = item.get("expected_pass")
@@ -234,8 +258,9 @@ def load_eval_manifest(evals_dir: Path) -> list[EvalCaseSpec]:
         fmt = item.get("format")
         description = item.get("description")
 
-        if not isinstance(case_id, str) or not case_id.strip():
+        if not isinstance(raw_id, str) or not raw_id.strip():
             raise EvalSuiteError(f"manifest case #{idx} missing non-empty string 'id'")
+        case_id = raw_id.strip()
         if case_id in seen_ids:
             raise EvalSuiteError(f"duplicate eval case id in manifest: {case_id!r}")
         seen_ids.add(case_id)
@@ -265,7 +290,7 @@ def load_eval_manifest(evals_dir: Path) -> list[EvalCaseSpec]:
                 f"manifest case {case_id!r} missing non-empty string 'description'"
             )
 
-        case_path = (resolved_root / rel_file).resolve()
+        case_path = (resolved_root / rel_file.strip()).resolve()
         try:
             case_path.relative_to(resolved_root)
         except ValueError as exc:
@@ -277,7 +302,7 @@ def load_eval_manifest(evals_dir: Path) -> list[EvalCaseSpec]:
 
         specs.append(
             EvalCaseSpec(
-                id=case_id.strip(),
+                id=case_id,
                 file=rel_file.strip(),
                 category=category.strip(),
                 expected_pass=expected_pass,
@@ -315,6 +340,7 @@ def run_eval_suite(
     tp = tn = fp = fn = 0
     clean_total = failure_total = 0
     failure_codes_matched = 0
+    format_mismatches = 0
 
     for spec in specs:
         case_path = (evals_dir / spec.file).resolve()
@@ -329,6 +355,9 @@ def run_eval_suite(
         report = verify_transcript(transcript, strict=strict)
         elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 3)
         durations.append(elapsed_ms)
+
+        if transcript.source_format != spec.format:
+            format_mismatches += 1
 
         actual_pass = report.passed
         actual_codes = sorted({f.code for f in report.findings})
@@ -360,7 +389,10 @@ def run_eval_suite(
                 fn += 1
                 cat.fn += 1
             expected_set = set(spec.expected_codes)
-            codes_matched = (not actual_pass) and expected_set.issubset(set(actual_codes))
+            if expected_set:
+                codes_matched = (not actual_pass) and (set(actual_codes) == expected_set)
+            else:
+                codes_matched = not actual_pass
             if codes_matched:
                 failure_codes_matched += 1
                 cat.codes_matched += 1
@@ -387,8 +419,7 @@ def run_eval_suite(
         )
 
     total = len(results)
-    precision = round(tp / (tp + fp), 4) if (tp + fp) > 0 else (1.0 if fp == 0 else 0.0)
-
+    precision = round(tp / (tp + fp), 4) if (tp + fp) > 0 else 1.0
     recall = round(tp / (tp + fn), 4) if (tp + fn) > 0 else 1.0
     false_positive_rate = round(fp / clean_total, 4) if clean_total > 0 else 0.0
     expected_code_match_rate = (
@@ -399,8 +430,12 @@ def run_eval_suite(
     p95_ms = _percentile_ms(durations, 95.0)
     max_ms = round(max(durations), 3) if durations else 0.0
 
-    passed_targets = (fp <= DEFAULT_MAX_FP) and (
-        recall >= DEFAULT_RECALL_TARGET if failure_total > 0 else True
+    passed_targets = (
+        fp <= DEFAULT_MAX_FP
+        and (recall >= DEFAULT_RECALL_TARGET if failure_total > 0 else True)
+        and (expected_code_match_rate == 1.0 if failure_total > 0 else True)
+        and format_mismatches == 0
+        and median_ms < DEFAULT_MAX_MEDIAN_MS
     )
 
     return EvalSummary(
@@ -431,6 +466,14 @@ def format_eval_json(summary: EvalSummary) -> str:
     return json.dumps(summary.to_dict(), indent=2)
 
 
+def _is_mismatch(result: EvalCaseResult) -> bool:
+    return (
+        result.outcome in ("FP", "FN")
+        or not result.codes_matched
+        or result.detected_format != result.expected_format
+    )
+
+
 def format_eval_text(summary: EvalSummary, *, verbose: bool = False) -> str:
     """Format an EvalSummary as concise plain text."""
     status = "PASS" if summary.passed_targets else "FAIL"
@@ -456,17 +499,17 @@ def format_eval_text(summary: EvalSummary, *, verbose: bool = False) -> str:
             f"TP={cat.tp} TN={cat.tn} FP={cat.fp} FN={cat.fn}"
         )
 
-    mismatches = [r for r in summary.results if r.outcome in ("FP", "FN") or not r.codes_matched]
+    mismatches = [r for r in summary.results if _is_mismatch(r)]
     if verbose:
         lines.append("")
         lines.append("Case results:")
         for r in summary.results:
             exp_label = "CLEAN" if r.expected_pass else f"FAIL({','.join(r.expected_codes)})"
             got_label = "PASS" if r.actual_pass else f"FAIL({','.join(r.actual_codes)})"
-            code_mark = "ok" if r.codes_matched else "code-mismatch"
+            mark = "ok" if not _is_mismatch(r) else "mismatch"
             lines.append(
                 f"  [{r.outcome}] {r.case_id:<44} {r.detected_format:<11} "
-                f"exp={exp_label:<32} got={got_label:<32} ({code_mark}, {r.duration_ms:.2f}ms)"
+                f"exp={exp_label:<32} got={got_label:<32} ({mark}, {r.duration_ms:.2f}ms)"
             )
     elif mismatches:
         lines.append("")
@@ -474,6 +517,7 @@ def format_eval_text(summary: EvalSummary, *, verbose: bool = False) -> str:
         for r in mismatches:
             lines.append(
                 f"  [{r.outcome}] {r.case_id}: expected_pass={r.expected_pass} "
+                f"expected_format={r.expected_format} detected_format={r.detected_format} "
                 f"expected_codes={r.expected_codes} actual_pass={r.actual_pass} "
                 f"actual_codes={r.actual_codes}"
             )
@@ -513,11 +557,7 @@ def format_eval_markdown(summary: EvalSummary, *, verbose: bool = False) -> str:
             f"| {cat.tp} | {cat.tn} | {cat.fp} | {cat.fn} |"
         )
 
-    rows_to_show = (
-        summary.results
-        if verbose
-        else [r for r in summary.results if r.outcome in ("FP", "FN") or not r.codes_matched]
-    )
+    rows_to_show = summary.results if verbose else [r for r in summary.results if _is_mismatch(r)]
     if rows_to_show:
         heading = "#### All Cases" if verbose else "#### Mismatches"
         lines.extend(

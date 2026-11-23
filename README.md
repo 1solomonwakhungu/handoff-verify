@@ -10,7 +10,7 @@ AI coding agents and subagents frequently hand back confident reports containing
 - **Verbatim quotes (inline & fenced):** Does the quoted snippet actually appear in what the agent read, wrote, or observed in command output (exact or whitespace/operator-normalized)?
 - **Absence & completeness scope receipts:** When an agent claims *"no other callers"*, *"no matches"*, *"not used anywhere"*, or *"reviewed all pages"*, did it actually run an untruncated search across the claimed scope, and were all pagination cursors followed?
 
-**Zero LLM calls. Zero third-party runtime dependencies (Python 3.11+ stdlib only). Sub-millisecond verification. Quiet when clean, loud on anomalies.**
+**Zero LLM calls. Zero third-party runtime dependencies (Python 3.11+ stdlib only). Fast linear-time verification (sub-millisecond on small transcripts; tens of milliseconds on multi-megabyte transcripts). Quiet when clean, loud on anomalies.**
 
 ---
 
@@ -19,8 +19,9 @@ AI coding agents and subagents frequently hand back confident reports containing
 Requires Python `>=3.11`.
 
 ```bash
-# Run directly without installing
+# Run directly from PyPI once published (or via git URL)
 uvx handoff-verify --version
+uvx --from git+https://github.com/1solomonwakhungu/handoff-verify.git handoff-verify --version
 
 # Install globally as a CLI tool with uv
 uv tool install handoff-verify
@@ -69,13 +70,16 @@ handoff-verify check session.jsonl --format markdown
 handoff-verify check session.jsonl --format json
 ```
 
-Run the built-in 24-case seeded evaluation suite:
+Run the bundled 24-case seeded regression suite (shipped in both source checkouts and built wheels; pass `--cases-dir <path>` to run a custom suite):
 
 ```bash
+# Exit 0 when all targets pass, exit 1 if targets are missed, exit 2 on missing/invalid manifest
 handoff-verify eval
 handoff-verify eval --verbose
+handoff-verify eval --strict
 handoff-verify eval --format markdown
 handoff-verify eval --format json
+handoff-verify eval --cases-dir ./custom-evals
 ```
 
 ---
@@ -207,6 +211,16 @@ $ handoff-verify check evals/cases/fail_11_claude_subagent_fabricated.jsonl --fo
   "claims": [
     {
       "kind": "pointer",
+      "text": "`src/auth/tokens.py:3-6`",
+      "file_path": "src/auth/tokens.py",
+      "start_line": 3,
+      "end_line": 6,
+      "snippet": null,
+      "context": "Bearer headers are parsed in `src/auth/tokens.py:3-6`.",
+      "message_index": 0
+    },
+    {
+      "kind": "pointer",
       "text": "`src/auth/session_store.py:48-55`",
       "file_path": "src/auth/session_store.py",
       "start_line": 48,
@@ -263,17 +277,17 @@ $ handoff-verify check evals/cases/fail_11_claude_subagent_fabricated.jsonl --fo
 
 ## 24-Case Seeded Eval Results
 
-Measured via `uv run handoff-verify eval --format markdown` on the bundled 24-case eval suite (`evals/manifest.json` + `evals/cases/`, 12 clean sessions and 12 planted failure modes across Claude Code, Codex CLI, and Generic JSONL):
+Measured via `uv run handoff-verify eval --format markdown` on the bundled 24-case **seeded regression suite** (`evals/manifest.json` + `evals/cases/`, 12 synthetic clean sessions and 12 planted failure modes across Claude Code, Codex CLI, and Generic JSONL). Because these cases were authored alongside the verifier as a deterministic regression benchmark rather than a held-out production corpus, treat the table below as baseline regression coverage rather than a guarantee on arbitrary real-world phrasings. Latency numbers vary slightly by machine and scale linearly with transcript size.
 
-| Metric | Measured | Target |
+| Metric | Measured (macOS / Python 3.13) | Target |
 | --- | ---: | ---: |
-| Cases | 24 (12 clean / 12 failures) | 24 |
+| Cases | 24 (12 clean / 12 failures) | — |
 | Precision | **100.0%** (12 TP, 0 FP) | 100.0% |
 | Recall | **100.0%** (12/12) | >= 90.0% |
 | False Positive Rate | **0.0%** (0/12) | 0.0% |
 | Expected Code Match | **100.0%** | 100.0% |
-| Median Latency | **0.40 ms** | < 50.0 ms |
-| P95 / Max Latency | **0.82 ms / 1.15 ms** | — |
+| Median Latency | **~0.4–0.6 ms** | < 50.0 ms |
+| P95 / Max Latency | **~0.8–1.2 ms / ~1.2–4.3 ms** | — |
 
 | Category | Total | Clean | Failures | TP | TN | FP | FN |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
