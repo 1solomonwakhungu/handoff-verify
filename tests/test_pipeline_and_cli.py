@@ -1,4 +1,4 @@
-"""Unit and integration tests for pipeline stub and CLI commands."""
+"""Unit and integration tests for verification pipeline and CLI commands."""
 
 from __future__ import annotations
 
@@ -48,15 +48,48 @@ def _write_sample_transcript(path: Path) -> Path:
     return path
 
 
+def _write_clean_transcript(path: Path, repo_root: Path | None = None) -> Path:
+    content = "\n".join(f"line_{i} = {i}" for i in range(1, 11))
+    if repo_root is not None:
+        src_dir = repo_root / "src"
+        src_dir.mkdir(parents=True, exist_ok=True)
+        (src_dir / "app.py").write_text(content + "\n", encoding="utf-8")
+    records = [
+        {"type": "meta", "cwd": str(repo_root) if repo_root else "/repo"},
+        {
+            "type": "file_read",
+            "file_path": "src/app.py",
+            "start_line": 1,
+            "end_line": 10,
+            "content": content,
+        },
+        {
+            "type": "search",
+            "tool_name": "grep",
+            "query": "line_1",
+            "search_path": ".",
+            "matched_files": ["src/app.py"],
+            "truncated": False,
+        },
+        {"type": "assistant", "text": "Checked src/app.py:1-10 and found no other callers."},
+    ]
+    path.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
+    return path
+
+
 def test_verify_transcript_builds_scope_receipt(tmp_path: Path) -> None:
     transcript_file = _write_sample_transcript(tmp_path / "session.jsonl")
     parsed = auto_parse(transcript_file)
     report = verify_transcript(parsed, repo_root=tmp_path, strict=False)
 
     assert report.schema_version == "1.0"
-    assert report.passed is True
-    assert report.claims == []
-    assert report.findings == []
+    assert report.passed is False
+    assert len(report.claims) >= 2
+    codes = {f.code for f in report.findings}
+    assert "TRUNCATED_SEARCH_OUTPUT" in codes
+    assert "NARROW_SEARCH_SCOPE" in codes
+    assert "EXCLUDED_SEARCH_DIRS" in codes
+    assert "FILE_NOT_FOUND" in codes
     assert report.duration_ms >= 0.0
     assert report.scope_receipt.files_read == ["src/app.py"]
     assert report.scope_receipt.searched_roots == ["src"]
@@ -94,7 +127,7 @@ def test_cli_inspect_text_and_json(tmp_path: Path, capsys) -> None:
 
 
 def test_cli_check_formats_and_quiet_on_pass(tmp_path: Path, capsys) -> None:
-    transcript_file = _write_sample_transcript(tmp_path / "session.jsonl")
+    transcript_file = _write_clean_transcript(tmp_path / "clean.jsonl", repo_root=tmp_path)
 
     rc_text = main(["check", str(transcript_file), "--repo", str(tmp_path)])
     assert rc_text == 0
@@ -114,6 +147,12 @@ def test_cli_check_formats_and_quiet_on_pass(tmp_path: Path, capsys) -> None:
     assert rc_quiet == 0
     assert capsys.readouterr().out == ""
 
+    # Failing transcript exits 1 and outputs FAIL
+    bad_file = _write_sample_transcript(tmp_path / "bad.jsonl")
+    rc_fail = main(["check", str(bad_file)])
+    assert rc_fail == 1
+    assert capsys.readouterr().out.startswith("FAIL:")
+
 
 def test_cli_error_exit_codes(tmp_path: Path, capsys) -> None:
     missing = tmp_path / "does_not_exist.jsonl"
@@ -132,7 +171,7 @@ def test_cli_error_exit_codes(tmp_path: Path, capsys) -> None:
 
 
 def test_console_entrypoint_subprocess(tmp_path: Path) -> None:
-    transcript_file = _write_sample_transcript(tmp_path / "session.jsonl")
+    transcript_file = _write_clean_transcript(tmp_path / "clean.jsonl")
     proc = subprocess.run(
         [
             sys.executable,
