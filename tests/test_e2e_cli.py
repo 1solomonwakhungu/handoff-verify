@@ -186,12 +186,45 @@ def test_e2e_init_print_and_write(tmp_path: Path) -> None:
     assert cmd == "handoff-verify hook claude-code --mode block"
 
 
+def test_e2e_claude_code_hook_fail_open_fail_closed_and_subagent_isolation() -> None:
+    # Malformed stdin fails open (exit 0) by default, and fails closed (exit 2) with --fail-closed
+    proc_open = _run_cli("hook", "claude-code", "--mode", "block", stdin="{not valid json")
+    assert proc_open.returncode == 0
+    assert proc_open.stdout == ""
+    assert "handoff-verify hook:" in proc_open.stderr
+
+    proc_closed = _run_cli(
+        "hook", "claude-code", "--mode", "block", "--fail-closed", stdin="{not valid json"
+    )
+    assert proc_closed.returncode == 2
+    assert "handoff-verify hook:" in proc_closed.stderr
+
+    # SubagentStop without agent_transcript_path MUST NOT fall back to failing parent transcript
+    parent_fail = EVALS_CASES / "fail_01_claude_unread_pointer.jsonl"
+    missing_subagent_payload = json.dumps(
+        {
+            "hook_event_name": "SubagentStop",
+            "transcript_path": str(parent_fail),
+            "stop_hook_active": False,
+        }
+    )
+    proc_iso = _run_cli("hook", "claude-code", "--mode", "block", stdin=missing_subagent_payload)
+    assert proc_iso.returncode == 0
+    assert "agent_transcript_path" in proc_iso.stderr
+    assert "UNREAD_FILE" not in proc_iso.stderr
+
+
 def test_e2e_eval_subcommand(tmp_path: Path) -> None:
     proc_text = _run_cli("eval")
     assert proc_text.returncode == 0
     assert "EVAL PASS: 24 cases" in proc_text.stdout
     assert "Precision:        100.0%" in proc_text.stdout
     assert "Recall:           100.0%" in proc_text.stdout
+
+    proc_strict_verbose = _run_cli("eval", "--strict", "--verbose")
+    assert proc_strict_verbose.returncode == 0
+    assert "Case results:" in proc_strict_verbose.stdout
+    assert "clean_01_claude_single_read" in proc_strict_verbose.stdout
 
     proc_json = _run_cli("eval", "--format", "json")
     assert proc_json.returncode == 0
