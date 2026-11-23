@@ -136,6 +136,7 @@ class _LazyCorpusEntry:
     event_index: int
     tool_name: str
     raw_text: str
+    output_parts: tuple[str, ...] = ()  # command stdout/stderr without the command string
     _prepared: _NormalizedText | None = None
 
     def prepared(self) -> _NormalizedText:
@@ -372,6 +373,7 @@ def _build_lazy_corpus(
                 event_index=cmd.event_index,
                 tool_name=cmd.tool_name,
                 raw_text=combined,
+                output_parts=tuple(p for p in (cmd.stdout, cmd.stderr) if p),
             )
         )
 
@@ -391,6 +393,37 @@ def _build_lazy_corpus(
             )
 
     return entries
+
+
+def _observed_in_unattributed_output(
+    snippet: _NormalizedText,
+    corpus: list[_LazyCorpusEntry],
+) -> bool:
+    """Return True if the snippet was printed by a command/tool whose source file is unknown.
+
+    Agents read code through shell pipelines the parser cannot attribute to a path
+    (`git show rev:f | sed -n 10,40p`, `cat a b`, several commands joined with `;`). A snippet
+    found verbatim in that output was observed; which file it came from is unverifiable, so
+    it must not be reported as fabricated or misattributed. The command string itself never
+    counts, otherwise grepping for a snippet would be enough to "observe" it.
+    """
+    for entry in corpus:
+        if entry.file_path is not None or entry.source_kind not in ("command", "tool", "search"):
+            continue
+        if not _matches(snippet, entry):
+            continue
+        if entry.source_kind != "command":
+            return True
+        output_only = _LazyCorpusEntry(
+            source_kind="command",
+            file_path=None,
+            event_index=entry.event_index,
+            tool_name=entry.tool_name,
+            raw_text="\n".join(entry.output_parts),
+        )
+        if entry.output_parts and _matches(snippet, output_only):
+            return True
+    return False
 
 
 def _entries_for_file(
@@ -495,6 +528,9 @@ def verify_quotes(
                         continue
 
             if any(_matches(snippet_norm, entry) for entry in file_entries):
+                continue
+
+            if _observed_in_unattributed_output(snippet_norm, corpus):
                 continue
 
             # Not found in the cited file; check if it actually appeared in a DIFFERENT file

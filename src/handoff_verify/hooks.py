@@ -9,18 +9,21 @@ import os
 import shlex
 import stat
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 from handoff_verify.formatters import format_hook_feedback
-from handoff_verify.models import VerificationReport
+from handoff_verify.models import AssistantMessage, ParsedTranscript, VerificationReport
 from handoff_verify.parsers import auto_parse
 from handoff_verify.pipeline import verify_transcript
 
 HookMode = Literal["advise", "block"]
 
 CLAUDE_CODE_EVENTS: tuple[str, ...] = ("SubagentStop", "Stop")
+DEFAULT_TRANSCRIPT_WAIT_SECONDS = 1.0
+_TRANSCRIPT_POLL_INTERVAL_SECONDS = 0.05
 DEFAULT_CLAUDE_SETTINGS_PATH = Path(".claude/settings.json")
 _SHELL_COMPOUND_OPERATORS = frozenset({"&&", "||", ";", "|", "|&", "&", "\n"})
 
@@ -137,6 +140,66 @@ def _select_transcript_path(
     return candidate, None
 
 
+def _collapse_ws(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _transcript_has_final_message(transcript: ParsedTranscript, last_message: str) -> bool:
+    """Return True if the transcript's final-turn assistant text already holds `last_message`."""
+    want = _collapse_ws(last_message)
+    if not want:
+        return True
+    final_turn = [
+        m.text
+        for m in transcript.assistant_messages
+        if m.after_event_index == transcript.assistant_messages[-1].after_event_index
+    ]
+    have = _collapse_ws("\n".join(final_turn) or transcript.final_text)
+    return want in have
+
+
+def _load_transcript_with_final_message(
+    transcript_path: Path,
+    last_message: str | None,
+    *,
+    wait_seconds: float,
+) -> ParsedTranscript:
+    """Parse the hook transcript, reconciling it with the payload's `last_assistant_message`.
+
+    Claude Code fires Stop/SubagentStop before the final assistant message is reliably
+    flushed to the JSONL transcript, so a hook that only reads the file can verify the
+    previous message (or nothing at all) and pass a fabricated handoff. The payload carries
+    the final text as `last_assistant_message`: wait briefly for the file to catch up, and
+    if it never does, verify the payload text against the tool evidence already on disk.
+    """
+    transcript = auto_parse(transcript_path)
+    if last_message is None or _transcript_has_final_message(transcript, last_message):
+        return transcript
+
+    deadline = time.monotonic() + max(0.0, wait_seconds)
+    while time.monotonic() < deadline:
+        time.sleep(_TRANSCRIPT_POLL_INTERVAL_SECONDS)
+        transcript = auto_parse(transcript_path)
+        if _transcript_has_final_message(transcript, last_message):
+            return transcript
+
+    last_event_index = transcript.events[-1].event_index if transcript.events else None
+    for message in transcript.assistant_messages:
+        message.is_final = False
+    transcript.assistant_messages.append(
+        AssistantMessage(
+            index=len(transcript.assistant_messages),
+            text=last_message,
+            is_final=True,
+            after_event_index=last_event_index,
+        )
+    )
+    transcript.final_text = last_message
+    if transcript.source_format == "unknown":
+        transcript.source_format = "claude_code"
+    return transcript
+
+
 def _build_hook_json(
     feedback: str,
     hook_event_name: str | None,
@@ -180,10 +243,14 @@ def run_claude_code_hook(
     strict: bool = False,
     repo_root: Path | None = None,
     fail_closed: bool = False,
+    transcript_wait_seconds: float = DEFAULT_TRANSCRIPT_WAIT_SECONDS,
 ) -> HookResult:
     """Execute the Claude Code Stop / SubagentStop verification hook.
 
     Behavior:
+    - Final message source: the payload's ``last_assistant_message`` is authoritative.
+      If the transcript file has not caught up with it yet, the hook waits up to
+      ``transcript_wait_seconds`` and then verifies the payload text directly.
     - Clean verification (``report.passed`` with zero findings): exits ``0`` silently.
     - Loop guard (``stop_hook_active=True``): NEVER exits ``2`` and NEVER emits
       ``hookSpecificOutput.additionalContext`` (which continues the turn in Claude
@@ -245,7 +312,11 @@ def run_claude_code_hook(
                 fail_closed=fail_closed,
             )
 
-        transcript = auto_parse(transcript_path)
+        transcript = _load_transcript_with_final_message(
+            transcript_path,
+            hook_input.last_assistant_message,
+            wait_seconds=transcript_wait_seconds,
+        )
         if not transcript.events and not transcript.assistant_messages:
             return _fail_result(
                 f"empty or unrecognized transcript: {transcript_path} "

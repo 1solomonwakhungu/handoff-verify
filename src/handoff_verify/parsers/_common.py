@@ -1629,6 +1629,28 @@ def analyze_shell_command(
                     )
             continue
 
+        if not has_write_redirect and not is_error and exit_code in (None, 0):
+            opaque_paths: list[str] = []
+            if cmd_name == "git" and subcmd in _GIT_CONTENT_SUBCOMMANDS:
+                opaque_paths = _git_displayed_paths(subcmd, first_tokens[2:])
+            elif cmd_name in ("awk", "gawk", "mawk"):
+                opaque_paths = _awk_input_paths(first_tokens[1:])
+            for raw_path in opaque_paths:
+                derived.file_reads.append(
+                    FileReadEvent(
+                        event_id=event_id,
+                        event_index=event_index,
+                        tool_name=f"{tool_name}:{cmd_name}",
+                        timestamp=timestamp,
+                        raw_input=raw_input,
+                        raw_output=raw_output,
+                        has_result=True,
+                        truncated=truncated,
+                        truncation_reason=truncation_reason,
+                        file_path=_resolve_path_with_cd(raw_path, active_subdir) or raw_path,
+                    )
+                )
+
         if cmd_name in ("rg", "grep", "egrep", "fgrep", "ag", "ack"):
             _analyze_search_tokens(
                 derived=derived,
@@ -1787,7 +1809,89 @@ def analyze_shell_command(
                                 )
                             )
 
+    # A target such as `$D/install.sh` names an unknown location (usually a scratch copy), so
+    # it must not be matched by suffix against repository files the handoff cites.
+    derived.file_edits = [e for e in derived.file_edits if not _has_unexpanded_shell_var(e)]
     return derived
+
+
+def _has_unexpanded_shell_var(edit: FileEditEvent) -> bool:
+    return "$" in edit.file_path or "`" in edit.file_path
+
+
+_GIT_CONTENT_SUBCOMMANDS = frozenset({"show", "diff", "blame", "log"})
+_GIT_NO_CONTENT_FLAGS = frozenset(
+    {
+        "--stat",
+        "--shortstat",
+        "--numstat",
+        "--dirstat",
+        "--name-only",
+        "--name-status",
+        "--summary",
+        "--no-patch",
+        "--quiet",
+        "-s",
+        "-q",
+    }
+)
+_GLOB_CHARS = frozenset("*?[]{}")
+
+
+def _looks_like_file_arg(token: str) -> bool:
+    """Return True for a shell token that plausibly names one concrete file."""
+    if not token or token.startswith(("-", ":", "$", "<", ">")) or _GLOB_CHARS & set(token):
+        return False
+    base = token.rstrip("/").rsplit("/", 1)[-1]
+    return "." in base.strip(".") or base in ("Makefile", "Dockerfile", "LICENSE")
+
+
+def _git_displayed_paths(subcmd: str, tokens: list[str]) -> list[str]:
+    """Return files whose content `git show|diff|blame|log` printed, per the command line.
+
+    The output cannot be mapped back to line numbers (other revisions, piped through
+    `sed`/`grep`), so callers record these as reads with an unknown line window: enough to
+    know the agent looked at the file, not enough to vouch for a specific line.
+    """
+    flags = {t.split("=", 1)[0] for t in tokens if t.startswith("-")}
+    if flags & _GIT_NO_CONTENT_FLAGS:
+        return []
+    if subcmd == "log" and not flags & {"-p", "-u", "--patch", "-L"}:
+        return []
+    paths: list[str] = []
+    if "--" in tokens:
+        paths.extend(t for t in tokens[tokens.index("--") + 1 :] if _looks_like_file_arg(t))
+        tokens = tokens[: tokens.index("--")]
+    if subcmd == "show":
+        for tok in tokens:
+            if not tok.startswith("-") and ":" in tok:
+                candidate = tok.split(":", 1)[1]
+                if _looks_like_file_arg(candidate):
+                    paths.append(candidate)
+    elif subcmd == "blame":
+        positionals = [t for t in tokens if _looks_like_file_arg(t)]
+        if positionals:
+            paths.append(positionals[-1])
+    return paths
+
+
+def _awk_input_paths(tokens: list[str]) -> list[str]:
+    """Return the input files of an `awk 'program' file...` invocation."""
+    positionals: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok in ("-F", "-v", "-f") and i + 1 < len(tokens):
+            if tok == "-f":
+                positionals.append("")  # program comes from a file, so no inline program token
+            i += 2
+            continue
+        if tok.startswith("-") and len(tok) > 1:
+            i += 1
+            continue
+        positionals.append(tok)
+        i += 1
+    return [t for t in positionals[1:] if _looks_like_file_arg(t) and "=" not in t]
 
 
 def _extract_sed_inplace_edits(
