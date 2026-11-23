@@ -10,17 +10,20 @@ from pathlib import Path
 from handoff_verify.models import Claim, Finding, ParsedTranscript
 from handoff_verify.parsers._common import split_lf_lines
 from handoff_verify.verifiers._paths import (
+    KNOWN_EXTENSIONLESS_FILES,
     build_base_dirs,
+    is_basename_path_match,
     is_exact_path_match,
     is_suffix_path_match,
     normalize_path,
-    paths_match,
 )
+from handoff_verify.verifiers._redirects import collect_redirected_reads
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _ARROW_PREFIX_RE = re.compile(r"^\s*\d+→")
 _TAB_NUM_PREFIX_RE = re.compile(r"^\s*\d+\t")
 _GREP_PREFIX_RE = re.compile(r"^[^\s:][^:\n]*:\d+[:-]")
+_GREP_CONTEXT_PREFIX_RE = re.compile(r"^([^\s:-][^\s:]*?)-\d+-")
 _GREP_NO_LINENUM_RE = re.compile(r"^([^\s:]+):(.*)$")
 _BARE_LINENUM_PREFIX_RE = re.compile(r"^\d+[:-]")
 _COLON_NUM_PREFIX_RE = re.compile(r"^\s*\d+\s*[:|]\s?")
@@ -41,6 +44,20 @@ _CALL_SHORTHAND_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.]*)\(([^()]*)\)$")
 _IDENT_TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
+def _strip_grep_any_prefix(line: str) -> str | None:
+    """Strip `file:line:` or `file-line-` prefix from a grep/rg output line if present."""
+    if _GREP_PREFIX_RE.match(line):
+        return _GREP_PREFIX_RE.sub("", line, count=1)
+    m_ctx = _GREP_CONTEXT_PREFIX_RE.match(line)
+    if m_ctx:
+        cand = m_ctx.group(1)
+        base = posixpath.basename(cand)
+        _, ext = posixpath.splitext(base)
+        if base in KNOWN_EXTENSIONLESS_FILES or (ext and len(ext) <= 12 and ext[1:].isalnum()):
+            return line[m_ctx.end() :]
+    return None
+
+
 def _strip_line_prefixes(lines: list[str]) -> list[str]:
     """Strip consistent line-number prefixes (e.g. `12→`, `12\\t`, `file.py:12:`) from lines."""
     if not lines:
@@ -53,6 +70,9 @@ def _strip_line_prefixes(lines: list[str]) -> list[str]:
     for pat in (_ARROW_PREFIX_RE, _TAB_NUM_PREFIX_RE, _GREP_PREFIX_RE):
         if all(pat.match(ln) for ln in non_empty):
             return [pat.sub("", ln, count=1) if ln.strip() else ln for ln in lines]
+
+    if all(_strip_grep_any_prefix(ln) is not None for ln in non_empty):
+        return [(_strip_grep_any_prefix(ln) or ln) if ln.strip() else ln for ln in lines]
 
     if len(non_empty) >= 2 and all(_COLON_NUM_PREFIX_RE.match(ln) for ln in non_empty):
         return [_COLON_NUM_PREFIX_RE.sub("", ln, count=1) if ln.strip() else ln for ln in lines]
@@ -231,12 +251,106 @@ def _matches(
     return False
 
 
+def _append_grep_and_diff_entries(
+    entries: list[_LazyCorpusEntry],
+    text: str,
+    *,
+    event_index: int,
+    tool_name: str,
+    base_dirs: tuple[str, ...],
+    single_file_target: str | None = None,
+) -> None:
+    """Attribute grep/rg (including `-C`/`-A`/`-B` context) and unified diff lines per file."""
+    if not text:
+        return
+
+    # 1. Unified diff hunks (`+++ b/<path>`)
+    if "+++ b/" in text or "diff --git " in text or ("+++ " in text and "@@ -" in text):
+        diff_by_file: dict[str, list[str]] = {}
+        cur_file: str | None = None
+        for ln in split_lf_lines(text):
+            if ln.startswith("+++ b/"):
+                cur_file = normalize_path(ln[6:].strip(), base_dirs=base_dirs)
+                continue
+            if ln.startswith("+++ ") and not ln.startswith("+++ /dev/null"):
+                cur_file = normalize_path(ln[4:].strip(), base_dirs=base_dirs)
+                continue
+            if ln.startswith(("diff --git ", "--- ", "@@ ")):
+                continue
+            if cur_file and ln and ln[0] in ("+", " "):
+                diff_by_file.setdefault(cur_file, []).append(ln[1:])
+        for norm_fp, dlines in diff_by_file.items():
+            entries.append(
+                _LazyCorpusEntry(
+                    source_kind="command_diff",
+                    file_path=norm_fp,
+                    event_index=event_index,
+                    tool_name=tool_name,
+                    raw_text="\n".join(dlines),
+                )
+            )
+
+    # 2. Grep / rg output lines (`file:line:content` and `file-line-content`)
+    by_file: dict[str, list[str]] = {}
+    seen_files: set[str] = set()
+    for ln in split_lf_lines(text):
+        if _GREP_PREFIX_RE.match(ln):
+            path_part = ln.split(":", 1)[0].strip()
+            norm_fp = normalize_path(path_part, base_dirs=base_dirs)
+            seen_files.add(path_part)
+            content_part = _GREP_PREFIX_RE.sub("", ln, count=1)
+            by_file.setdefault(norm_fp, []).append(content_part)
+            continue
+        m_ctx = _GREP_CONTEXT_PREFIX_RE.match(ln)
+        if m_ctx:
+            cand = m_ctx.group(1)
+            base = posixpath.basename(cand)
+            _, ext = posixpath.splitext(base)
+            if (
+                cand in seen_files
+                or base in KNOWN_EXTENSIONLESS_FILES
+                or (ext and len(ext) <= 12 and ext[1:].isalnum())
+            ):
+                norm_fp = normalize_path(cand, base_dirs=base_dirs)
+                by_file.setdefault(norm_fp, []).append(ln[m_ctx.end() :])
+                continue
+        if single_file_target and _BARE_LINENUM_PREFIX_RE.match(ln):
+            content_part = _BARE_LINENUM_PREFIX_RE.sub("", ln, count=1)
+            by_file.setdefault(single_file_target, []).append(content_part)
+            continue
+        m_noln = _GREP_NO_LINENUM_RE.match(ln)
+        if m_noln:
+            cand_p = m_noln.group(1).strip()
+            cand_base = posixpath.basename(cand_p)
+            if (
+                ("/" in cand_p or "." in cand_base)
+                and not cand_p.startswith(("http", "https"))
+                and "." in cand_base
+                and not cand_base.startswith(".")
+            ):
+                norm_fp = normalize_path(cand_p, base_dirs=base_dirs)
+                by_file.setdefault(norm_fp, []).append(m_noln.group(2))
+
+    for norm_fp, flines in by_file.items():
+        entries.append(
+            _LazyCorpusEntry(
+                source_kind="search",
+                file_path=norm_fp,
+                event_index=event_index,
+                tool_name=tool_name,
+                raw_text="\n".join(flines),
+            )
+        )
+
+
 def _build_lazy_corpus(
     transcript: ParsedTranscript,
     base_dirs: tuple[str, ...],
 ) -> list[_LazyCorpusEntry]:
     """Build lightweight raw corpus entries; normalization happens lazily per entry on demand."""
     entries: list[_LazyCorpusEntry] = []
+
+    synthesized_redirect_reads, redirected_reads = collect_redirected_reads(transcript, base_dirs)
 
     for r in transcript.file_reads:
         if not r.has_result or r.is_error:
@@ -254,6 +368,45 @@ def _build_lazy_corpus(
                 raw_text=body,
             )
         )
+
+    # Credit redirected command outputs that were subsequently read back to their source file(s)
+    # and/or as unattributed command output (so reading `/tmp/x.log` doesn't cause QUOTE_MISMATCH).
+    for r in synthesized_redirect_reads:
+        body = r.content or r.raw_output
+        if not body or not r.file_path:
+            continue
+        entries.append(
+            _LazyCorpusEntry(
+                source_kind="file_read",
+                file_path=normalize_path(r.file_path, base_dirs=base_dirs),
+                event_index=r.event_index,
+                tool_name=r.tool_name,
+                raw_text=body,
+            )
+        )
+
+    for read_ev, prov in redirected_reads:
+        body = read_ev.content or read_ev.raw_output
+        if not body:
+            continue
+        if prov.is_unattributed_output:
+            _append_grep_and_diff_entries(
+                entries,
+                body,
+                event_index=read_ev.event_index,
+                tool_name=read_ev.tool_name,
+                base_dirs=base_dirs,
+            )
+            entries.append(
+                _LazyCorpusEntry(
+                    source_kind="command",
+                    file_path=None,
+                    event_index=read_ev.event_index,
+                    tool_name=read_ev.tool_name,
+                    raw_text=body,
+                    output_parts=(body,),
+                )
+            )
 
     for e in transcript.file_edits:
         if not e.has_result or e.is_error:
@@ -284,7 +437,6 @@ def _build_lazy_corpus(
     for s in transcript.searches:
         if not s.has_result or s.is_error or not s.output:
             continue
-        by_file: dict[str, list[str]] = {}
         roots = s.search_paths or ([s.search_path] if s.search_path else [])
         single_file_target: str | None = None
         if len(roots) == 1:
@@ -292,40 +444,14 @@ def _build_lazy_corpus(
             if "." in base and not base.startswith("."):
                 single_file_target = normalize_path(roots[0], base_dirs=base_dirs)
 
-        for ln in split_lf_lines(s.output):
-            if _GREP_PREFIX_RE.match(ln):
-                path_part = ln.split(":", 1)[0].strip()
-                norm_fp = normalize_path(path_part, base_dirs=base_dirs)
-                content_part = _GREP_PREFIX_RE.sub("", ln, count=1)
-                by_file.setdefault(norm_fp, []).append(content_part)
-            elif single_file_target and _BARE_LINENUM_PREFIX_RE.match(ln):
-                # R2-7: single-file `grep -n` / `rg -n` prints `42:content` without filename
-                content_part = _BARE_LINENUM_PREFIX_RE.sub("", ln, count=1)
-                by_file.setdefault(single_file_target, []).append(content_part)
-            else:
-                # R2-7: `grep -r` without `-n` prints `path/file.py:content`
-                m_noln = _GREP_NO_LINENUM_RE.match(ln)
-                if m_noln:
-                    cand_p = m_noln.group(1).strip()
-                    cand_base = posixpath.basename(cand_p)
-                    if (
-                        ("/" in cand_p or "." in cand_base)
-                        and not cand_p.startswith(("http", "https"))
-                        and "." in cand_base
-                        and not cand_base.startswith(".")
-                    ):
-                        norm_fp = normalize_path(cand_p, base_dirs=base_dirs)
-                        by_file.setdefault(norm_fp, []).append(m_noln.group(2))
-        for norm_fp, flines in by_file.items():
-            entries.append(
-                _LazyCorpusEntry(
-                    source_kind="search",
-                    file_path=norm_fp,
-                    event_index=s.event_index,
-                    tool_name=s.tool_name,
-                    raw_text="\n".join(flines),
-                )
-            )
+        _append_grep_and_diff_entries(
+            entries,
+            s.output,
+            event_index=s.event_index,
+            tool_name=s.tool_name,
+            base_dirs=base_dirs,
+            single_file_target=single_file_target,
+        )
         entries.append(
             _LazyCorpusEntry(
                 source_kind="search",
@@ -339,28 +465,14 @@ def _build_lazy_corpus(
     for cmd in transcript.commands:
         if not cmd.has_result:
             continue
-        # R2-7: credit unified `git diff` / `git show` hunks to each file `+++ b/<path>`
-        if cmd.stdout and ("+++ b/" in cmd.stdout or "diff --git " in cmd.stdout):
-            diff_by_file: dict[str, list[str]] = {}
-            cur_file: str | None = None
-            for ln in split_lf_lines(cmd.stdout):
-                if ln.startswith("+++ b/"):
-                    cur_file = normalize_path(ln[6:].strip(), base_dirs=base_dirs)
-                    continue
-                if ln.startswith(("diff --git ", "--- ", "@@ ")):
-                    continue
-                if cur_file and ln and ln[0] in ("+", " "):
-                    diff_by_file.setdefault(cur_file, []).append(ln[1:])
-            for norm_fp, dlines in diff_by_file.items():
-                entries.append(
-                    _LazyCorpusEntry(
-                        source_kind="command_diff",
-                        file_path=norm_fp,
-                        event_index=cmd.event_index,
-                        tool_name=cmd.tool_name,
-                        raw_text="\n".join(dlines),
-                    )
-                )
+        if cmd.stdout:
+            _append_grep_and_diff_entries(
+                entries,
+                cmd.stdout,
+                event_index=cmd.event_index,
+                tool_name=cmd.tool_name,
+                base_dirs=base_dirs,
+            )
 
         # B7: include executed command string as well as stdout/stderr so command mentions match
         combined = "\n".join(p for p in (cmd.command, cmd.stdout, cmd.stderr) if p)
@@ -454,9 +566,16 @@ def _entries_for_file(
         distinct = {e.file_path for e in suffix}
         if len(distinct) == 1:
             return suffix
-    return [
-        e for e in eligible if paths_match(claimed_path, e.file_path or "", base_dirs=base_dirs)
+    basename = [
+        e
+        for e in eligible
+        if is_basename_path_match(claimed_path, e.file_path or "", base_dirs=base_dirs)
     ]
+    if basename:
+        distinct_base = {e.file_path for e in basename}
+        if len(distinct_base) == 1:
+            return basename
+    return []
 
 
 def verify_quotes(

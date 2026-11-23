@@ -2507,16 +2507,27 @@ def _analyze_find_tokens(
 def _pipe_allows_exact_read_window(pipe_segments: list[str]) -> tuple[bool, int | None]:
     """Return (is_exact_window, head_limit) for a read command's downstream pipe stages.
 
-    Only unpiped reads or a single `| head -n K` preserve 1-based line windows.
-    Piping through `grep`, `tail`, `awk`, `sed`, etc. breaks the line-number mapping.
+    Only unpiped reads, pass-through `| tee ...`, or a single `| head -n K` preserve
+    1-based line windows. Piping through `grep`, `tail`, `awk`, `sed`, etc. breaks the
+    line-number mapping.
     """
     if len(pipe_segments) == 1:
         return True, None
-    if len(pipe_segments) == 2:
-        tokens = _safe_shlex_split(pipe_segments[1])
-        if tokens and Path(tokens[0]).name == "head":
-            return True, _extract_head_limit(pipe_segments)
-    return False, None
+    head_limit: int | None = None
+    saw_head = False
+    for seg in pipe_segments[1:]:
+        tokens = _safe_shlex_split(seg)
+        if not tokens:
+            continue
+        prog = Path(tokens[0]).name
+        if prog == "tee":
+            continue
+        if prog == "head" and not saw_head:
+            saw_head = True
+            head_limit = _extract_head_limit(["", seg])
+            continue
+        return False, None
+    return True, head_limit
 
 
 def _analyze_read_tokens(

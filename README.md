@@ -18,6 +18,21 @@ AI coding agents and subagents frequently hand back confident reports containing
 
 Requires Python `>=3.11`. No runtime dependencies.
 
+### As a Claude Code plugin (bundled hooks + skill)
+
+```bash
+claude plugin marketplace add 1solomonwakhungu/handoff-verify
+claude plugin install handoff-verify@handoff-verify
+```
+
+Or test locally from a clone without installing:
+
+```bash
+claude --plugin-dir /path/to/handoff-verify
+```
+
+The plugin bundles `Stop` and `SubagentStop` hooks (`hooks/hooks.json`), a standalone `bin/handoff-verify` launcher (uses system Python 3.11+ or `uv`-managed Python against the bundled `src/`), and `skills/handoff-verify/SKILL.md`.
+
 ### From source (works today)
 
 ```bash
@@ -25,6 +40,7 @@ git clone https://github.com/1solomonwakhungu/handoff-verify.git
 cd handoff-verify
 uv tool install .            # puts `handoff-verify` on your PATH
 handoff-verify --version
+handoff-verify doctor        # verify PATH, Python >= 3.11, and Claude hook config
 ```
 
 To try it without installing, run `uvx --from . handoff-verify --version` inside the clone.
@@ -87,7 +103,7 @@ handoff-verify check session.jsonl --json          # same as --format json
 
 Every subcommand's `--help` ends with examples and the exit codes.
 
-Run the bundled 24-case seeded regression suite (shipped in both source checkouts and built wheels; the bundled suite runs by default, so pass `--cases-dir <path>` when running a custom local suite):
+Run the bundled 32-case evaluation suite (24 seeded cases + 8 realistic messy-session cases, shipped in both source checkouts and built wheels; pass `--cases-dir <path>` to run a custom local suite):
 
 ```bash
 # Exit 0 when all targets pass, exit 1 if targets are missed, exit 2 on missing/invalid manifest
@@ -97,6 +113,13 @@ handoff-verify eval --strict
 handoff-verify eval --format markdown
 handoff-verify eval --format json
 handoff-verify eval --cases-dir ./custom-evals
+```
+
+Verify your local setup (PATH, Python version, and `.claude/settings.json` hook config):
+
+```bash
+handoff-verify doctor
+handoff-verify doctor --json
 ```
 
 ---
@@ -159,11 +182,11 @@ Generated configuration (`handoff-verify init`):
 
 - **`SubagentStop` vs `Stop` isolation:** On `SubagentStop`, `handoff-verify` strictly reads `agent_transcript_path` (never falling back to the parent session's `transcript_path`). On `Stop`, it reads `transcript_path`.
 - **Verifies the message Claude Code is about to hand back:** Claude Code can fire `Stop` / `SubagentStop` before the final assistant message is written to the transcript file. The hook compares the transcript with the payload's `last_assistant_message`, waits up to one second for the file to catch up, and otherwise verifies the payload text against the tool evidence already on disk.
-- **Quiet when clean:** When verification passes with zero findings, the hook exits `0` with empty stdout and stderr.
-- **`--mode advise` (default):** On failing claims, exits `0` and emits structured Claude Code JSON (`systemMessage` + `hookSpecificOutput.additionalContext`) with concise, bounded Markdown feedback.
+- **Quiet when clean and on warning-only reports:** When verification passes with zero findings — or with warning-only findings (unless `--include-warnings` or `--strict` is passed) — the hook exits `0` with empty stdout and stderr.
+- **`--mode advise` (default):** On error-level findings (or warnings with `--strict`), exits `0` and emits structured Claude Code JSON (`systemMessage` + `hookSpecificOutput.additionalContext`) with concise, bounded Markdown feedback.
 - **`--mode block`:** On failing claims, writes the concise actionable receipt to stderr and exits `2` so the agent fixes the ungrounded claim before stopping.
 - **Infinite-loop guard (`stop_hook_active`):** When Claude Code sets `stop_hook_active: true`, the hook **never** exits `2` and **never** emits `hookSpecificOutput.additionalContext` — it emits `systemMessage` only and exits `0`, guaranteeing the agent can always stop after at most one verification retry.
-- **Fail-open by default:** Parse, I/O, missing-file, or internal errors log a single diagnostic line to stderr and exit `0` so a hook failure never bricks a coding session. Pass `--fail-closed` to exit `2` on errors instead.
+- **Fail-open with visible diagnostics by default:** Parse, I/O, missing-file, usage, or internal errors log a single diagnostic line to stderr and exit `1` (non-blocking in Claude Code while surfacing stderr, instead of silently hiding errors behind exit `0`). Pass `--fail-closed` to exit `2` (blocking) on errors instead.
 
 ---
 
@@ -191,26 +214,26 @@ naming the read or search that would ground it.
 
 ## How it behaves on real sessions
 
-The seeded eval suite below is a regression benchmark. As a calibration check, the verifier
-was also run over 1,571 real Claude Code transcripts from one developer's machine (972 main
-sessions, 599 subagents; mostly code-review and implementation work):
+The bundled eval suite below is a deterministic regression benchmark. As a calibration check, the verifier was also run over 1,571 real Claude Code transcripts from one developer's machine (972 main sessions, 599 subagents; mostly code-review and implementation work):
 
-| | Transcripts with an error-level finding |
+| Stage | Transcripts with an error-level finding |
 | --- | ---: |
-| As first tagged `0.1.0` | 512 (32.6%) |
-| With the shell-read and scratch-copy fixes | 343 (21.8%) |
+| As first tagged `0.1.0` | 512 / 1,571 (32.6%) |
+| After shell-read & scratch-copy fixes | 343 / 1,571 (21.8%) |
 
-Sampling the remaining findings shows most are not fabrications. They are citations of files
-the agent did look at, through a route the verifier cannot map to line numbers:
+Follow-up fixes addressed the top remaining false-alarm classes observed in that corpus:
 
-- output redirected to a log that is read back later (`sed -n 1,40p a.py > /tmp/x.log`)
-- `grep -n` hits where the cited line sits next to, not on, a printed line
-- a parent agent relaying `path:line` from a subagent report under a slightly different path
-- files produced by a script and then linked in the report
+- shell output redirected to a temp/log file (`> /tmp/x.log`, `| tee ...`) and subsequently read back
+- `grep -n` / `rg -n` context lines (`-C`/`-A`/`-B` `file-line-content`) and lines immediately adjacent to matched hits
+- parent agents relaying `Agent`/`Task` subagent `path:line` ranges under alternate path spellings or unambiguous basenames
+- negated existence mentions (*"`src/app.py:99` does not exist"*, *"there is no `foo.py:42`"*, *"`bar.py` wasn't found"*)
+- non-code absence phrases (*"no usage limit"*, *"no open issue"*, *"no open PRs"*, *"no errors"*, *"no warnings"*, *"no changes"*)
 
-So treat a finding as "the transcript does not show this", not "this is false". `advise`
-mode costs the agent one extra read when it is a false alarm; `block` mode would have
-held up the final stop of roughly one of these sessions in five.
+Remaining caveats to keep in mind:
+
+- Reads through arbitrary scripts (`python - <<EOF` generating or slicing files) cannot always be mapped back to exact line numbers, and files generated by a script that are linked in prose may still be flagged until read directly.
+- `--latest` currently discovers Claude Code session directories; for Codex CLI rollouts pass the transcript path explicitly.
+- Treat any finding as *"the transcript does not show this"*, not *"this is false"*. Start with the default `advise` mode before opting into `block` mode.
 
 ---
 
@@ -347,16 +370,16 @@ $ handoff-verify check evals/cases/fail_11_claude_subagent_fabricated.jsonl --fo
 
 ---
 
-## 24-Case Seeded Eval Results
+## 32-Case Eval Results
 
-Measured via `uv run handoff-verify eval --format markdown` on the bundled 24-case **seeded regression suite** (`evals/manifest.json` + `evals/cases/`, 12 synthetic clean sessions and 12 planted failure modes across Claude Code, Codex CLI, and Generic JSONL). Because these cases were authored alongside the verifier as a deterministic regression benchmark rather than a held-out production corpus, treat the table below as baseline regression coverage rather than a guarantee on arbitrary real-world phrasings. Latency numbers vary slightly by machine and scale linearly with transcript size.
+Measured via `uv run handoff-verify eval --format markdown` on the bundled 32-case evaluation suite (`evals/manifest.json` + `evals/cases/`: 16 clean sessions and 16 planted failures across Claude Code, Codex CLI, and Generic JSONL, including 8 realistic messy-session `real_session` cases covering redirected log readbacks, `rg -n -C` / adjacent grep lines, parent/subagent path relays, negated mentions, and non-code absence phrases). Latency numbers vary slightly by machine and scale linearly with transcript size.
 
 | Metric | Measured (macOS / Python 3.13) | Target |
 | --- | ---: | ---: |
-| Cases | 24 (12 clean / 12 failures) | — |
-| Precision | **100.0%** (12 TP, 0 FP) | 100.0% |
-| Recall | **100.0%** (12/12) | >= 90.0% |
-| False Positive Rate | **0.0%** (0/12) | 0.0% |
+| Cases | 32 (16 clean / 16 failures) | — |
+| Precision | **100.0%** (16 TP, 0 FP) | 100.0% |
+| Recall | **100.0%** (16/16) | >= 90.0% |
+| False Positive Rate | **0.0%** (0/16) | 0.0% |
 | Expected Code Match | **100.0%** | 100.0% |
 | Median Latency | **~0.4–0.6 ms** | < 50.0 ms |
 | P95 / Max Latency | **~0.8–1.2 ms / ~1.2–4.3 ms** | — |
@@ -368,6 +391,7 @@ Measured via `uv run handoff-verify eval --format markdown` on the bundled 24-ca
 | `pagination` | 2 | 1 | 1 | 1 | 1 | 0 | 0 |
 | `pointers` | 6 | 3 | 3 | 3 | 3 | 0 | 0 |
 | `quotes` | 4 | 2 | 2 | 2 | 2 | 0 | 0 |
+| `real_session` | 8 | 4 | 4 | 4 | 4 | 0 | 0 |
 | `scope` | 5 | 2 | 3 | 3 | 2 | 0 | 0 |
 | `subagent` | 2 | 1 | 1 | 1 | 1 | 0 | 0 |
 

@@ -245,7 +245,7 @@ def test_hook_subagent_stop_never_falls_back_to_parent_transcript(
             }
         )
         res_open = run_claude_code_hook(payload, mode="block", fail_closed=False)
-        assert res_open.exit_code == 0
+        assert res_open.exit_code == 1
         assert res_open.blocked is False
         assert "missing agent_transcript_path" in res_open.stderr
         assert called is False
@@ -389,9 +389,16 @@ def test_hook_warning_and_info_only_passes_emit_system_message_only(
         }
     )
 
-    # Without --strict: neither advise nor block should continue or block on non-failing warnings.
+    # Without --strict or --include-warnings: warning-only reports stay silent by default.
     for mode in ("advise", "block"):
-        res = run_claude_code_hook(payload, mode=mode, strict=False)
+        res_silent = run_claude_code_hook(payload, mode=mode, strict=False)
+        assert res_silent.exit_code == 0
+        assert res_silent.blocked is False
+        assert res_silent.stdout == ""
+        assert res_silent.stderr == ""
+
+        # With --include-warnings: emit systemMessage only (never continue or block).
+        res = run_claude_code_hook(payload, mode=mode, strict=False, include_warnings=True)
         assert res.exit_code == 0
         assert res.blocked is False
         data = json.loads(res.stdout)
@@ -444,7 +451,7 @@ def test_hook_fail_open_vs_fail_closed_on_errors(
 ) -> None:
     # 1. Invalid JSON on stdin (no misleading "internal error:" prefix)
     res_open = run_claude_code_hook("{not valid json", fail_closed=False)
-    assert res_open.exit_code == 0
+    assert res_open.exit_code == 1
     assert res_open.stdout == ""
     assert "malformed JSON" in res_open.stderr
     assert "internal error:" not in res_open.stderr
@@ -454,17 +461,17 @@ def test_hook_fail_open_vs_fail_closed_on_errors(
     assert "malformed JSON" in res_closed.stderr
 
     # 2. Empty stdin
-    assert run_claude_code_hook("", fail_closed=False).exit_code == 0
+    assert run_claude_code_hook("", fail_closed=False).exit_code == 1
     assert run_claude_code_hook("", fail_closed=True).exit_code == 2
 
     # 3. Non-object JSON
-    assert run_claude_code_hook("[1, 2, 3]", fail_closed=False).exit_code == 0
+    assert run_claude_code_hook("[1, 2, 3]", fail_closed=False).exit_code == 1
     assert run_claude_code_hook("[1, 2, 3]", fail_closed=True).exit_code == 2
 
     # 4. Missing transcript file
     missing_payload = json.dumps({"transcript_path": str(tmp_path / "missing.jsonl")})
     res_missing_open = run_claude_code_hook(missing_payload, fail_closed=False)
-    assert res_missing_open.exit_code == 0
+    assert res_missing_open.exit_code == 1
     assert "not found" in res_missing_open.stderr
     assert run_claude_code_hook(missing_payload, fail_closed=True).exit_code == 2
 
@@ -473,7 +480,7 @@ def test_hook_fail_open_vs_fail_closed_on_errors(
     empty_file.write_text("not json at all\n", encoding="utf-8")
     empty_payload = json.dumps({"transcript_path": str(empty_file)})
     res_empty_open = run_claude_code_hook(empty_payload, fail_closed=False)
-    assert res_empty_open.exit_code == 0
+    assert res_empty_open.exit_code == 1
     assert "empty or unrecognized transcript" in res_empty_open.stderr
     assert run_claude_code_hook(empty_payload, fail_closed=True).exit_code == 2
 
@@ -486,7 +493,7 @@ def test_hook_fail_open_vs_fail_closed_on_errors(
 
     monkeypatch.setattr(hooks_mod, "verify_transcript", boom)
     res_crash_open = run_claude_code_hook(valid_payload, fail_closed=False)
-    assert res_crash_open.exit_code == 0
+    assert res_crash_open.exit_code == 1
     assert "simulated verifier explosion" in res_crash_open.stderr
     res_crash_closed = run_claude_code_hook(valid_payload, fail_closed=True)
     assert res_crash_closed.exit_code == 2

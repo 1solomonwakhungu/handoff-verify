@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "description": "24-case seeded evaluation suite for handoff-verify (12 clean sessions, 12 planted failures).",
+  "description": "32-case seeded and real-session evaluation suite for handoff-verify (16 clean sessions, 16 planted failures).",
   "cases": [
     {
       "id": "clean_01_claude_single_read",
@@ -109,6 +109,42 @@
       "expected_codes": [],
       "format": "claude_code",
       "description": "Clean Claude Code session citing a newly written file and quoting verified pytest stdout."
+    },
+    {
+      "id": "clean_13_claude_redirected_log_readback",
+      "file": "cases/clean_13_claude_redirected_log_readback.jsonl",
+      "category": "real_session",
+      "expected_pass": true,
+      "expected_codes": [],
+      "format": "claude_code",
+      "description": "Clean real-shape session redirecting sed/git diff output to /tmp logs and reading them back before citing and quoting."
+    },
+    {
+      "id": "clean_14_claude_grep_context_adjacent",
+      "file": "cases/clean_14_claude_grep_context_adjacent.jsonl",
+      "category": "real_session",
+      "expected_pass": true,
+      "expected_codes": [],
+      "format": "claude_code",
+      "description": "Clean real-shape session citing rg -n -C context lines and adjacent lines from a compound grep command."
+    },
+    {
+      "id": "clean_15_claude_parent_subagent_relay",
+      "file": "cases/clean_15_claude_parent_subagent_relay.jsonl",
+      "category": "real_session",
+      "expected_pass": true,
+      "expected_codes": [],
+      "format": "claude_code",
+      "description": "Clean real-shape parent session relaying Agent subagent citations and read files under basename/repo-relative path spellings."
+    },
+    {
+      "id": "clean_16_claude_negated_and_noncode_absence",
+      "file": "cases/clean_16_claude_negated_and_noncode_absence.jsonl",
+      "category": "real_session",
+      "expected_pass": true,
+      "expected_codes": [],
+      "format": "claude_code",
+      "description": "Clean real-shape session with negated path:line existence mentions and non-code absence phrases (no usage limit, no open issue/PRs, no errors/warnings/changes)."
     },
     {
       "id": "fail_01_claude_unread_pointer",
@@ -244,6 +280,53 @@
       ],
       "format": "generic",
       "description": "Planted Generic JSONL transcript with out-of-window line pointer and truncated search absence claim."
+    },
+    {
+      "id": "fail_13_claude_unredirected_unread",
+      "file": "cases/fail_13_claude_unredirected_unread.jsonl",
+      "category": "real_session",
+      "expected_pass": false,
+      "expected_codes": [
+        "QUOTE_NOT_FOUND",
+        "UNREAD_FILE"
+      ],
+      "format": "claude_code",
+      "description": "Planted real-shape failure: sed redirected to /tmp log that was never read back before citing and quoting."
+    },
+    {
+      "id": "fail_14_claude_grep_far_extrapolation",
+      "file": "cases/fail_14_claude_grep_far_extrapolation.jsonl",
+      "category": "real_session",
+      "expected_pass": false,
+      "expected_codes": [
+        "UNREAD_FILE"
+      ],
+      "format": "claude_code",
+      "description": "Planted real-shape failure: far extrapolation from a grep hit plus passive unread file description."
+    },
+    {
+      "id": "fail_15_claude_subagent_relay_fabricated",
+      "file": "cases/fail_15_claude_subagent_relay_fabricated.jsonl",
+      "category": "real_session",
+      "expected_pass": false,
+      "expected_codes": [
+        "NO_SEARCH_EVIDENCE",
+        "UNREAD_FILE"
+      ],
+      "format": "claude_code",
+      "description": "Planted real-shape failure: parent cites unreported line outside subagent's range and claims no other usages without searching."
+    },
+    {
+      "id": "fail_16_claude_mixed_negated_and_narrow_usage",
+      "file": "cases/fail_16_claude_mixed_negated_and_narrow_usage.jsonl",
+      "category": "real_session",
+      "expected_pass": false,
+      "expected_codes": [
+        "NARROW_SEARCH_SCOPE",
+        "UNREAD_FILE"
+      ],
+      "format": "claude_code",
+      "description": "Planted real-shape failure: negated mention ignored while unread rbac.py citation and narrow-scope 'no other usage' claim are caught."
     }
   ]
 }

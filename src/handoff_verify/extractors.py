@@ -519,10 +519,35 @@ _UNTOUCHED_SUFFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
-_NONEXISTENT_AROUND_RE = re.compile(
-    r"\b(?:does\s+not\s+exist|doesn't\s+exist|did\s+not\s+exist|didn't\s+exist|"
-    r"not\s+found|no\s+longer\s+exists?|is\s+missing|was\s+missing|was\s+not\s+found|"
-    r"was\s+never\s+created|cannot\s+find|could\s+not\s+find|couldn't\s+find)\b",
+_NONEXISTENT_SUBJECT_SUFFIX_RE = re.compile(
+    r"^(?:"
+    r"\s*(?:\([^)\n]{1,40}\)\s*)?(?:still\s+|actually\s+)?"
+    r"(?:does\s+not\s+(?:actually\s+)?exist|doesn't\s+(?:actually\s+)?exist|"
+    r"do\s+not\s+(?:actually\s+)?exist|don't\s+(?:actually\s+)?exist|"
+    r"did\s+not\s+(?:actually\s+)?exist|didn't\s+(?:actually\s+)?exist|"
+    r"no\s+longer\s+exists?|was\s+not\s+found|wasn't\s+found|"
+    r"were\s+not\s+found|weren't\s+found|is\s+not\s+found|isn't\s+found|"
+    r"not\s+found|is\s+missing|was\s+missing|are\s+missing|were\s+missing|"
+    r"is\s+non-?existent|was\s+never\s+created|"
+    r"cannot\s+be\s+found|could\s+not\s+be\s+found|couldn't\s+be\s+found|"
+    r"is\s+not\s+present|isn't\s+present)\b|"
+    r"\s*(?:—|–|-|:)\s*(?:not\s+found|does\s+not\s+exist|doesn't\s+exist|missing|non-?existent)\b|"
+    r"\s+and\s+\S+(?:\s+\S+){0,2}\s+"
+    r"(?:do\s+not\s+exist|don't\s+exist|were\s+not\s+found|weren't\s+found|are\s+missing)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+_NONEXISTENT_PREFIX_RE = re.compile(
+    r"\b(?:"
+    r"there\s+(?:is|was|are|were)\s+no(?:\s+(?:such\s+)?(?:file|line|entry|path))?(?:\s+at)?|"
+    r"there\s+(?:isn't|wasn't)\s+(?:a|any)(?:\s+(?:file|line|entry|path))?(?:\s+at)?|"
+    r"no\s+such(?:\s+file(?:\s+or\s+directory)?)?|"
+    r"non-?existent(?:\s+file)?|"
+    r"missing(?:\s+file)?|"
+    r"cannot\s+find|could\s+not\s+find|couldn't\s+find|"
+    r"no|without"
+    r")\s*[:—–-]?\s*$",
     re.IGNORECASE,
 )
 
@@ -575,6 +600,19 @@ def _is_hypothetical_pointer(
     ):
         return True
 
+    # Negated existence claims apply to both line-numbered (`src/app.py:99` does not exist,
+    # there is no `foo.py:42`) and bare (`bar.py` wasn't found) file pointers.
+    raw_suffix = sentence[match_end : min(len(sentence), match_end + 80)]
+    for sep in (";", ".", " — ", "\n"):
+        idx = raw_suffix.find(sep)
+        if idx != -1:
+            raw_suffix = raw_suffix[:idx]
+    near_prefix = prefix[-50:]
+    if _NONEXISTENT_SUBJECT_SUFFIX_RE.match(raw_suffix) or _NONEXISTENT_PREFIX_RE.search(
+        near_prefix
+    ):
+        return True
+
     if not has_line:
         # R2-9: coordinated prospective sentences ("... add `a.py` and document it in `b.md`")
         if _PROSPECTIVE_SENTENCE_RE.search(sentence) and not re.search(
@@ -590,21 +628,7 @@ def _is_hypothetical_pointer(
         ):
             return True
 
-        # NB9: trim suffix at the first clause boundary so an unrelated later clause
-        # ("`src/ghost.py` validates tokens; missing ones are not found errors") does not suppress.
-        raw_suffix = sentence[match_end : min(len(sentence), match_end + 55)]
-        for sep in (";", ".", " — ", "\n"):
-            idx = raw_suffix.find(sep)
-            if idx != -1:
-                raw_suffix = raw_suffix[:idx]
-        near_prefix = prefix[-40:]
         if _UNTOUCHED_SUFFIX_RE.search(raw_suffix):
-            return True
-        if _NONEXISTENT_AROUND_RE.search(raw_suffix) or re.search(
-            r"\b(?:no|missing|without|cannot\s+find|could\s+not\s+find|couldn't\s+find)\s+$",
-            near_prefix,
-            re.IGNORECASE,
-        ):
             return True
 
     return False
@@ -1319,7 +1343,16 @@ def extract_quote_claims(
 _ABSENCE_STRONG_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"\bno\s+(?:other\s+|remaining\s+|further\s+|additional\s+|more\s+)?"
-        r"(?:callers?|usages?|uses|occurrences?|hits|importers?|implementations?|definitions?)\b",
+        r"(?:callers?|usages|uses|occurrences?|hits|importers?|implementations?|definitions?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bno\s+(?:other|remaining|further|additional|more)\s+usage\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bno\s+usage\s+(?:of\b|(?:in|across)\s+(?:the\s+)?(?:codebase|repo|repository|project)\b|"
+        r"anywhere\b|elsewhere\b)",
         re.IGNORECASE,
     ),
     re.compile(
@@ -1358,7 +1391,7 @@ _ABSENCE_STRONG_PATTERNS: tuple[re.Pattern[str], ...] = (
     # NB4 phrasing gaps
     re.compile(
         r"\b(?:didn't|did\s+not)\s+find\s+any\s+(?:other\s+|remaining\s+|more\s+)?"
-        r"(?:callers?|references?|usages?|matches|occurrences?|issues?|items?|results?)\b",
+        r"(?:callers?|references?|usages?|matches|occurrences?|items?|results?)\b",
         re.IGNORECASE,
     ),
     re.compile(
@@ -1383,7 +1416,7 @@ _ABSENCE_CONTEXTUAL_PATTERNS: tuple[re.Pattern[str], ...] = (
         re.IGNORECASE,
     ),
     re.compile(
-        r"\bno\s+(?:other|remaining|further|additional|more|open|matching)\s+"
+        r"\bno\s+(?:other|remaining|further|additional|more|matching)\s+"
         r"(?:issues?|items?|files?|prs?|pull\s+requests?|records?|pages?|tickets?|todos?)\b",
         re.IGNORECASE,
     ),
@@ -1397,19 +1430,21 @@ _NON_SEARCH_ABSENCE_AFTER_RE = re.compile(
     r"(?:needed|need|required|require)\s+(?:changes?|edits?|updates?|modifications?)|"
     r"(?:with\s+this|with\s+the|on\s+the\s+checklist|in\s+the\s+log)|"
     r"(?:are|were|is)\s+(?:reused|shared|cached|stored|saved|kept)|"
-    r"to\s+(?:change|update|modify|edit|fix)"
+    r"to\s+(?:change|update|modify|edit|fix)|"
+    r"(?:limits?|quotas?|docs?|documentation|examples?|instructions?|guide|section|"
+    r"notes?|text|help|data|stats?|statistics|metrics?|tracking|telemetry|billing|fees?|costs?)"
     r")\b",
     re.IGNORECASE,
 )
 
-# R2-4: Removed self-satisfying words ("found", "remaining", "there are", "exist") so ordinary
-# closing prose ("All tests pass and there are no remaining issues", "No further issues found")
+# R2-4: Removed self-satisfying words ("found", "remaining", "there are", "exist", "prs", "tickets")
+# so ordinary closing prose ("All tests pass and there are no open PRs", "No further issues found")
 # is NOT mistaken for an unverified search/pagination absence claim.
 _SEARCH_OR_LISTING_VERB_RE = re.compile(
     r"\b(?:search(?:ed|ing)?|grep(?:ped|ping)?|rg|list(?:ed|ing)?|"
     r"reviewed\s+all|checked\s+all|scanned|audited|returned|shows?|showed|matching|"
     r"repo|repository|codebase|project|anywhere|elsewhere|pages?|cursors?|"
-    r"gh\s+issue|gh\s+pr|tickets?|prs?|pull\s+requests?)\b",
+    r"gh\s+issue|gh\s+pr)\b",
     re.IGNORECASE,
 )
 

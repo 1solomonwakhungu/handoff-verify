@@ -187,9 +187,9 @@ def test_e2e_init_print_and_write(tmp_path: Path) -> None:
 
 
 def test_e2e_claude_code_hook_fail_open_fail_closed_and_subagent_isolation() -> None:
-    # Malformed stdin fails open (exit 0) by default, and fails closed (exit 2) with --fail-closed
+    # Malformed stdin fails open (exit 1, non-blocking) by default, and fails closed (exit 2)
     proc_open = _run_cli("hook", "claude-code", "--mode", "block", stdin="{not valid json")
-    assert proc_open.returncode == 0
+    assert proc_open.returncode == 1
     assert proc_open.stdout == ""
     assert "handoff-verify hook:" in proc_open.stderr
 
@@ -209,7 +209,7 @@ def test_e2e_claude_code_hook_fail_open_fail_closed_and_subagent_isolation() -> 
         }
     )
     proc_iso = _run_cli("hook", "claude-code", "--mode", "block", stdin=missing_subagent_payload)
-    assert proc_iso.returncode == 0
+    assert proc_iso.returncode == 1
     assert "agent_transcript_path" in proc_iso.stderr
     assert "UNREAD_FILE" not in proc_iso.stderr
 
@@ -217,7 +217,7 @@ def test_e2e_claude_code_hook_fail_open_fail_closed_and_subagent_isolation() -> 
 def test_e2e_eval_subcommand(tmp_path: Path) -> None:
     proc_text = _run_cli("eval")
     assert proc_text.returncode == 0
-    assert "EVAL PASS: 24 cases" in proc_text.stdout
+    assert "EVAL PASS: 32 cases" in proc_text.stdout
     assert "Precision:        100.0%" in proc_text.stdout
     assert "Recall:           100.0%" in proc_text.stdout
 
@@ -230,7 +230,7 @@ def test_e2e_eval_subcommand(tmp_path: Path) -> None:
     assert proc_json.returncode == 0
     payload = json.loads(proc_json.stdout)
     assert payload["passed_targets"] is True
-    assert payload["metrics"]["total"] == 24
+    assert payload["metrics"]["total"] == 32
     assert payload["metrics"]["fp"] == 0
     assert payload["metrics"]["recall"] == 1.0
 

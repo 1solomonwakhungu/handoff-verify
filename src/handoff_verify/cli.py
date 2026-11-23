@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from handoff_verify import __version__
+from handoff_verify.doctor import format_doctor_json, format_doctor_text, run_doctor
 from handoff_verify.evals import EvalSuiteError, format_eval_summary, run_eval_suite
 from handoff_verify.formatters import format_report
 from handoff_verify.hooks import (
@@ -123,6 +124,7 @@ examples:
   handoff-verify check - < session.jsonl        read the transcript from stdin
   handoff-verify inspect session.jsonl          what the agent read, edited and searched
   handoff-verify init --write                   install Claude Code Stop/SubagentStop hooks
+  handoff-verify doctor                         check PATH, Python version, and hook config
 
 transcripts:
   Claude Code   ~/.claude/projects/<cwd-with-dashes>/<session-id>.jsonl
@@ -152,15 +154,29 @@ _HOOK_EPILOG = """\
 Reads the Claude Code hook JSON payload on stdin (hook_event_name, transcript_path,
 agent_transcript_path, last_assistant_message, stop_hook_active, cwd).
 
-  advise  exit 0; on findings prints {"systemMessage", "hookSpecificOutput.additionalContext"}
+  advise  exit 0; on errors prints {"systemMessage", "hookSpecificOutput.additionalContext"}
           so the model sees the findings once and can correct its report
   block   exit 2 with the findings on stderr, so the agent must fix them before stopping
 
+Silent on clean and warning-only reports by default (pass --include-warnings to surface
+warnings as systemMessage, or --strict to treat warnings as errors).
 Never blocks twice in a row: when stop_hook_active is true it only prints a systemMessage.
-Fails open (exit 0, one line on stderr) on unreadable input unless --fail-closed is given.
+Fails open (exit 1, non-blocking in Claude Code while surfacing stderr) on unreadable input
+or internal errors unless --fail-closed (exit 2) is given.
 
 example:
   handoff-verify hook claude-code --mode block < payload.json
+"""
+
+_DOCTOR_EPILOG = """\
+examples:
+  handoff-verify doctor
+  handoff-verify doctor --json
+  handoff-verify doctor --settings ~/.claude/settings.json
+
+exit codes:
+  0  no error-level issues (ready, or setup warnings with next steps printed)
+  1  error-level issue found (e.g. malformed settings.json, missing hook binary, Python < 3.11)
 """
 
 _INIT_EPILOG = """\
@@ -359,6 +375,7 @@ def _cmd_hook_claude_code(args: argparse.Namespace) -> int:
             stdin_text,
             mode=args.mode,
             strict=bool(args.strict),
+            include_warnings=bool(args.include_warnings),
             repo_root=repo_root,
             fail_closed=fail_closed,
         )
@@ -370,7 +387,17 @@ def _cmd_hook_claude_code(args: argparse.Namespace) -> int:
     except Exception as exc:
         with contextlib.suppress(Exception):
             print(f"handoff-verify hook: internal error: {exc}", file=sys.stderr)
-        return 2 if fail_closed else 0
+        return 2 if fail_closed else 1
+
+
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    settings_path = Path(args.settings) if args.settings is not None else None
+    report = run_doctor(settings_path=settings_path)
+    if args.json or args.format == "json":
+        print(format_doctor_json(report))
+    else:
+        print(format_doctor_text(report))
+    return 1 if report.has_errors else 0
 
 
 def _cmd_init(args: argparse.Namespace) -> int:
@@ -572,6 +599,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Treat warnings as verification failures.",
     )
     claude_hook_parser.add_argument(
+        "--include-warnings",
+        action="store_true",
+        help="Emit systemMessage feedback on warning-only reports (default: silent on warnings).",
+    )
+    claude_hook_parser.add_argument(
         "--repo",
         default=None,
         help="Optional repository root (defaults to hook payload cwd if valid).",
@@ -579,7 +611,7 @@ def build_parser() -> argparse.ArgumentParser:
     claude_hook_parser.add_argument(
         "--fail-closed",
         action="store_true",
-        help="Exit 2 on internal/parse/IO errors instead of failing open (exit 0).",
+        help="Exit 2 (blocking) on internal/parse/IO errors instead of failing open (exit 1).",
     )
     claude_hook_parser.set_defaults(func=_cmd_hook_claude_code)
 
@@ -654,6 +686,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     eval_parser.set_defaults(func=_cmd_eval)
 
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Check binary on PATH, Python version, and Claude Code hook configuration.",
+        description=(
+            "Diagnose your local handoff-verify installation and Claude Code hook setup, "
+            "printing actionable next steps."
+        ),
+        epilog=_DOCTOR_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    doctor_parser.add_argument(
+        "--settings",
+        default=None,
+        help="Optional specific Claude settings.json path to inspect.",
+    )
+    doctor_parser.add_argument(
+        "--format",
+        type=_format_choice(("text", "json")),
+        metavar="{text,json}",
+        default="text",
+        help="Output format (default: text).",
+    )
+    doctor_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Shorthand for --format json.",
+    )
+    doctor_parser.set_defaults(func=_cmd_doctor)
+
     return parser
 
 
@@ -674,7 +735,7 @@ def main(argv: list[str] | None = None) -> int:
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else 2
         if is_hook and code != 0 and not fail_closed:
-            return 0
+            return 1
         return code
     try:
         return int(args.func(args))
@@ -682,7 +743,7 @@ def main(argv: list[str] | None = None) -> int:
         with contextlib.suppress(Exception):
             print(f"Error: internal failure: {exc}", file=sys.stderr)
         if is_hook and not fail_closed:
-            return 0
+            return 1
         return 2
 
 
