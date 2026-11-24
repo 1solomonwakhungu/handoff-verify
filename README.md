@@ -115,7 +115,7 @@ handoff-verify eval
 handoff-verify eval --verbose
 handoff-verify eval --strict
 handoff-verify eval --format markdown
-handoff-verify eval --format json
+handoff-verify eval --json          # same as --format json
 handoff-verify eval --cases-dir ./custom-evals
 ```
 
@@ -372,19 +372,21 @@ $ handoff-verify check evals/cases/fail_11_claude_subagent_fabricated.jsonl --fo
 
 ---
 
-## 32-Case Seeded Eval Results
+## Benchmarks & 32-Case Seeded Eval Results
 
-Measured via `uv run handoff-verify eval --format markdown` on the bundled 32-case **seeded evaluation suite** (`evals/manifest.json` + `evals/cases/`: 16 clean sessions and 16 planted failures across Claude Code, Codex CLI, and Generic JSONL, including 8 real-session-shaped `real_session` regression fixtures covering redirected log readbacks, `rg -n -C` / adjacent grep lines, parent/subagent path relays, negated mentions, and non-code absence phrases). Because these cases were authored alongside the verifier as a deterministic regression benchmark rather than a held-out production corpus, treat the table below as baseline regression coverage rather than a guarantee on arbitrary real-world phrasings. Latency numbers vary slightly by machine and scale linearly with transcript size.
+### Seeded evaluation suite (`handoff-verify eval`)
 
-| Metric | Measured (macOS / Python 3.13) | Target |
+Measured via `uv run handoff-verify eval --format markdown` on macOS (Apple Silicon / `arm64`, Python 3.13.14) across the bundled 32-case **seeded evaluation suite** (`evals/manifest.json` + `evals/cases/`: 16 clean sessions and 16 planted failures across Claude Code, Codex CLI, and Generic JSONL, including 8 real-session-shaped `real_session` regression fixtures covering redirected log readbacks, `rg -n -C` / adjacent grep lines, parent/subagent path relays, negated mentions, and non-code absence phrases). Because these cases were authored alongside the verifier as a deterministic regression benchmark rather than a held-out production corpus, treat the table below as baseline regression coverage rather than a guarantee on arbitrary real-world phrasings.
+
+| Metric | Measured (macOS arm64 / Python 3.13.14) | Target |
 | --- | ---: | ---: |
 | Cases | 32 (16 clean / 16 failures) | — |
 | Precision | **100.0%** (16 TP, 0 FP) | 100.0% |
 | Recall | **100.0%** (16/16) | >= 90.0% |
 | False Positive Rate | **0.0%** (0/16) | 0.0% |
 | Expected Code Match | **100.0%** | 100.0% |
-| Median Latency | **~0.4–0.6 ms** | < 50.0 ms |
-| P95 / Max Latency | **~0.8–1.2 ms / ~1.2–4.3 ms** | — |
+| Median Latency | **0.60 ms** | < 50.0 ms |
+| P95 / Max Latency | **1.38 ms / 1.56 ms** | — |
 
 | Category | Total | Clean | Failures | TP | TN | FP | FN |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -396,6 +398,57 @@ Measured via `uv run handoff-verify eval --format markdown` on the bundled 32-ca
 | `real_session` | 8 | 4 | 4 | 4 | 4 | 0 | 0 |
 | `scope` | 5 | 2 | 3 | 3 | 2 | 0 | 0 |
 | `subagent` | 2 | 1 | 1 | 1 | 1 | 0 | 0 |
+
+### Scaling & CLI latency
+
+Measured on the same machine (macOS `arm64`, Python 3.13.14):
+
+| Workload | Transcript size | Parse | Verify | Total (median) | Throughput |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Small session (25 reads × 100 lines) | 115 KB | 1.28 ms | 1.22 ms | **2.50 ms** | 44.8 MB/s |
+| Medium session (250 reads × 100 lines) | 1.14 MB | 9.98 ms | 2.73 ms | **12.74 ms** | 89.4 MB/s |
+| Large session (1,250 reads × 100 lines) | 5.76 MB | 48.53 ms | 10.03 ms | **60.77 ms** | 94.7 MB/s |
+| End-to-end CLI (`handoff-verify check clean_01 --quiet-on-pass`, 15 runs) | 1.6 KB | — | — | **56.8 ms** | *(~54.7 ms Python startup)* |
+
+Reproduce the eval and scaling numbers locally:
+
+```bash
+uv run handoff-verify eval --format markdown
+uv run python -c '
+import json, statistics, tempfile, time
+from pathlib import Path
+from handoff_verify.parsers import auto_parse
+from handoff_verify.pipeline import verify_transcript
+
+with tempfile.TemporaryDirectory() as td:
+    for n in (25, 250, 1250):
+        p = Path(td) / f"b{n}.jsonl"
+        recs = []
+        for i in range(n):
+            body = "\n".join(f"{ln:6d}→def fn_{i}_{ln}(x): return x + {ln}" for ln in range(1, 101))
+            recs += [
+                {"type": "assistant", "cwd": "/repo", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": f"t{i}", "name": "Read", "input": {"file_path": f"/repo/src/p{i%20}/m{i}.py"}}]}},
+                {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": f"t{i}", "content": body}]}},
+            ]
+        recs += [
+            {"type": "assistant", "cwd": "/repo", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "g0", "name": "Grep", "input": {"pattern": "legacy_fn", "output_mode": "content"}}]}},
+            {"type": "user", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "g0", "content": "No matches found"}]}},
+        ]
+        cited = ", ".join(f"`src/p{i%20}/m{i}.py:1-10`" for i in range(10))
+        recs.append({"type": "assistant", "cwd": "/repo", "message": {"role": "assistant", "content": [{"type": "text", "text": f"Verified {cited} (`def fn_9_1(x): return x + 1`). No callers of `legacy_fn` anywhere in the codebase."}]}})
+        raw = "\n".join(json.dumps(r) for r in recs) + "\n"
+        p.write_text(raw, encoding="utf-8")
+        times = []
+        for _ in range(7):
+            t0 = time.perf_counter()
+            rep = verify_transcript(auto_parse(p))
+            times.append((time.perf_counter() - t0) * 1000)
+            assert rep.passed and not rep.findings
+        med = statistics.median(times)
+        mb = len(raw.encode()) / (1024 * 1024)
+        print(f"n={n:4d} ({mb:.2f} MB): median={med:.2f}ms ({mb / (med / 1000):.1f} MB/s)")
+'
+```
 
 ---
 

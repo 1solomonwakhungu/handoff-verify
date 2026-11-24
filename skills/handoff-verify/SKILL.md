@@ -42,17 +42,18 @@ Prefer `--format markdown --quiet-on-pass` (or `--format md`) for compact findin
 
 | Finding Code | Meaning | Fix |
 | --- | --- | --- |
-| `UNREAD_FILE` | Cited a file never read in the transcript | Read the file before citing it |
-| `LINE_OUT_OF_RANGE` | Cited lines outside the read window (`offset`/`limit`) | Read the cited line range |
-| `STALE_FILE_READ` | File was edited after reading (or drifted on disk with `--repo .`; has warning variants) | Re-read after the edit, or drop `--repo .` for historical audits |
-| `UNMATCHED_QUOTE` | Quoted snippet does not match tool output | Re-read and quote verbatim, or paraphrase without quotes |
-| `UNSEARCHED_CLAIM` | Claimed `"no other callers"` / `"not used anywhere"` without a search | Run `rg` / `Grep` across the claimed scope |
-| `TRUNCATED_SEARCH` | Search output hit `head_limit` / truncation | Re-run narrowed or untruncated, or qualify the claim |
-| `SCOPE_MISMATCH` | Search covered a narrower directory than claimed | Search the full claimed scope, or narrow the claim |
-| `UNPAGINATED_COMPLETENESS` | Claimed `"all pages"` / `"all results"` with an unread pagination cursor | Fetch remaining pages, or state how many pages were checked |
-| `UNVERIFIED_ABSENCE` | Generic absence claim lacking search evidence | Run an explicit search or soften the claim |
-| `EXCLUDED_SEARCH_DIRS` *(warning only)* | Search excluded non-trivial source directories | Re-search including them, or state the exclusion |
-| `INVALID_LINE_RANGE` / `LINE_BEYOND_EOF` | Backwards range or line past EOF | Re-read the file and correct the line numbers |
+| `UNREAD_FILE` | Cited a file or `path:line` never read or observed in the transcript | Read the file before citing it |
+| `LINE_OUT_OF_READ_WINDOW` | Cited lines outside the transcript's observed read window (`offset`/`limit`) | Read the cited line range |
+| `STALE_FILE_READ` | File was edited or deleted after reading (or drifted on disk with `--repo .`; has warning variants) | Re-read after the edit, or drop `--repo .` for historical audits |
+| `FILE_NOT_FOUND` | Cited file does not exist on disk in `--repo` | Check the exact path in the repository |
+| `LINE_OUT_OF_BOUNDS` | Cited line number exceeds the live file's line count in `--repo` | Re-read the file and correct the line numbers |
+| `QUOTE_NOT_FOUND` | Quoted code or command output snippet does not appear in observed evidence | Re-read and quote verbatim, or paraphrase without quotes |
+| `QUOTE_MISMATCH` | Quoted snippet was attributed to file A, but was only observed in file B | Attribute the quote to the right file, or re-read file A |
+| `NO_SEARCH_EVIDENCE` | Claimed `"no other callers"` / `"not used anywhere"` without a matching content search | Run `rg` / `Grep` across the claimed scope |
+| `TRUNCATED_SEARCH_OUTPUT` | Absence/completeness claim backed only by truncated search or partial read output | Re-run narrowed or untruncated, or qualify the claim |
+| `NARROW_SEARCH_SCOPE` | Repo-wide (or wider) absence claim backed only by a subdirectory search | Search the full claimed scope, or narrow the claim |
+| `UNREAD_PAGINATION_CURSOR` | Claimed `"all pages"` / `"all results"` with an unread `has_more` / `nextCursor` | Fetch remaining pages, or state how many pages were checked |
+| `EXCLUDED_SEARCH_DIRS` *(warning only)* | Search explicitly excluded non-trivial directories not acknowledged in the claim | Re-search including them, or state the exclusion |
 
 ## Transcript Locations
 
@@ -63,6 +64,6 @@ Prefer `--format markdown --quiet-on-pass` (or `--format md`) for compact findin
 ## Limits
 
 - Checks **grounding against the transcript**, not whether code is correct or tests pass.
-- Currently parses Claude Code and Codex CLI JSONL transcripts (not Cursor, OpenCode, or Antigravity transcripts).
+- Currently parses Claude Code, Codex CLI, and documented Generic JSONL transcripts (not Cursor, OpenCode, or Antigravity transcripts).
 - Shell reads through arbitrary inline scripts (`python -c ...`) cannot always map back to exact line numbers; prefer dedicated file-read tools or `nl -ba` / `sed -n` / `cat -n`.
 - Treat a finding as *"the transcript does not show this"*, not *"this is definitely false"*.
