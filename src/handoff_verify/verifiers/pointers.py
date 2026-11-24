@@ -33,6 +33,7 @@ from handoff_verify.parsers._common import (
 from handoff_verify.verifiers._paths import (
     KNOWN_EXTENSIONLESS_FILES,
     build_base_dirs,
+    is_abs_posix,
     is_basename_path_match,
     is_exact_path_match,
     is_suffix_path_match,
@@ -44,7 +45,7 @@ from handoff_verify.verifiers._redirects import RedirectProvenance, collect_redi
 
 _T = TypeVar("_T")
 
-_GREP_CONTENT_LINE_RE = re.compile(r"^([^\s:][^:\n]*):(\d+)[:-]")
+_GREP_CONTENT_LINE_RE = re.compile(r"^((?:[A-Za-z]:[/\\])?[^\s:][^:\n]*):(\d+)[:-]")
 _DASH_NUM_DASH_RE = re.compile(r"-(\d+)-")
 _ISO_DATE_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\b")
 _BARE_LINENUM_LINE_RE = re.compile(r"^(\d+)[:-]")
@@ -243,7 +244,7 @@ def _is_foreign_shell_edit(
     if edit.operation not in ("bash_modify", "delete") or not base_dirs:
         return False
     norm_edit = normalize_path(edit.file_path, base_dirs=base_dirs)
-    return norm_edit.startswith("/") and norm_edit != norm_claimed
+    return is_abs_posix(norm_edit) and norm_edit != norm_claimed
 
 
 # --- B5 + B15: Pre-built O(N) output line index & observed path index ---
