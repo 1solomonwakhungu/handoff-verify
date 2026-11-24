@@ -24,7 +24,7 @@ _ARROW_PREFIX_RE = re.compile(r"^\s*\d+→")
 _TAB_NUM_PREFIX_RE = re.compile(r"^\s*\d+\t")
 _GREP_PREFIX_RE = re.compile(r"^((?:[A-Za-z]:[/\\])?[^\s:][^:\n]*):\d+[:-]")
 _DASH_NUM_DASH_RE = re.compile(r"-(\d+)-")
-_GREP_NO_LINENUM_RE = re.compile(r"^([^\s:]+):(.*)$")
+_GREP_NO_LINENUM_RE = re.compile(r"^((?:[A-Za-z]:[/\\])?[^\s:]+):(.*)$")
 _BARE_LINENUM_PREFIX_RE = re.compile(r"^\d+[:-]")
 _COLON_NUM_PREFIX_RE = re.compile(r"^\s*\d+\s*[:|]\s?")
 _WS_RUN_RE = re.compile(r"[ \t]+")
@@ -333,9 +333,10 @@ def _append_grep_and_diff_entries(
         m_noln = _GREP_NO_LINENUM_RE.match(ln)
         if m_noln:
             cand_p = m_noln.group(1).strip()
-            cand_base = posixpath.basename(cand_p)
+            cand_posix = cand_p.replace("\\", "/")
+            cand_base = posixpath.basename(cand_posix)
             if (
-                ("/" in cand_p or "." in cand_base)
+                ("/" in cand_posix or "." in cand_base)
                 and not cand_p.startswith(("http", "https"))
                 and "." in cand_base
                 and not cand_base.startswith(".")
