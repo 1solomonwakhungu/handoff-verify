@@ -52,6 +52,11 @@ def _to_posix(raw: str) -> str:
     return s.replace("\\", "/")
 
 
+def is_abs_posix(path: str) -> bool:
+    """Return True if a POSIX-normalized path is absolute (Unix `/` or Windows `C:/`)."""
+    return path.startswith("/") or (len(path) >= 3 and path[0].isalpha() and path[1:3] == ":/")
+
+
 def _norm_base(base: str | Path) -> str:
     s = _to_posix(str(base))
     if not s:
@@ -59,6 +64,8 @@ def _norm_base(base: str | Path) -> str:
     norm = posixpath.normpath(s)
     if norm == "/":
         return "/"
+    if len(norm) == 2 and norm[0].isalpha() and norm[1] == ":":
+        return norm + "/"
     return norm.rstrip("/")
 
 
@@ -89,6 +96,22 @@ def build_base_dirs(cwd: str | None, repo_root: Path | None) -> tuple[str, ...]:
     return tuple(normalized)
 
 
+def _match_base_prefix(norm: str, base: str) -> str | None:
+    """Strip an absolute `base` prefix from an absolute `norm` path, returning relative path."""
+    if not base or not is_abs_posix(base):
+        return None
+    # On Windows drive paths (`C:/...`), match the drive letter case-insensitively.
+    is_win = len(norm) >= 2 and norm[1] == ":" and len(base) >= 2 and base[1] == ":"
+    cmp_norm = (norm[0].lower() + norm[1:]) if is_win else norm
+    cmp_base = (base[0].lower() + base[1:]) if is_win else base
+    if cmp_norm == cmp_base:
+        return "."
+    prefix = cmp_base if cmp_base.endswith("/") else cmp_base + "/"
+    if cmp_norm.startswith(prefix):
+        return norm[len(prefix) :] or "."
+    return None
+
+
 @functools.lru_cache(maxsize=8192)
 def _normalize_path_cached(raw: str, base_dirs: tuple[str, ...]) -> str:
     s = _to_posix(raw)
@@ -101,21 +124,18 @@ def _normalize_path_cached(raw: str, base_dirs: tuple[str, ...]) -> str:
         rest = posixpath.normpath(s[2:]).lstrip("/")
         return "~/" + rest if rest and rest != "." else "~"
 
-    is_abs = s.startswith("/")
+    is_unix_abs = s.startswith("/")
     norm = posixpath.normpath(s)
-    if is_abs and not norm.startswith("/"):
+    if is_unix_abs and not norm.startswith("/"):
         norm = "/" + norm
+    if len(norm) == 2 and norm[0].isalpha() and norm[1] == ":":
+        norm = norm + "/"
 
-    if norm.startswith("/"):
+    if is_abs_posix(norm):
         for base in base_dirs:
-            if not base or not base.startswith("/"):
-                continue
-            if norm == base:
-                return "."
-            prefix = base + "/" if base != "/" else "/"
-            if norm.startswith(prefix):
-                rel = norm[len(prefix) :]
-                return rel or "."
+            rel = _match_base_prefix(norm, base)
+            if rel is not None:
+                return rel
 
     while norm.startswith("./"):
         norm = norm[2:]
@@ -130,18 +150,24 @@ def normalize_path(raw: str, *, base_dirs: Sequence[str] = ()) -> str:
 
 
 def _strip_home_prefix(path: str) -> str | None:
-    """Strip `/Users/<user>/`, `/home/<user>/`, `os.path.expanduser('~')/`, or `~/`."""
+    """Strip `/Users/<user>/`, `/home/<user>/`, `C:/Users/<user>/`, `expanduser('~')/`, or `~/`."""
     if path.startswith("~/"):
         return path[2:]
     with contextlib.suppress(OSError, KeyError, RuntimeError):
         home = os.path.expanduser("~").replace("\\", "/").rstrip("/")
-        if home and home.startswith("/") and path.startswith(home + "/"):
-            return path[len(home) + 1 :]
+        if home and is_abs_posix(home):
+            rel = _match_base_prefix(path, home)
+            if rel is not None and rel != ".":
+                return rel
     for prefix in ("/Users/", "/home/"):
         if path.startswith(prefix):
             rest = path[len(prefix) :]
             if "/" in rest:
                 return rest.split("/", 1)[1]
+    if len(path) >= 9 and path[0].isalpha() and path[1:9].lower() == ":/users/":
+        rest = path[9:]
+        if "/" in rest:
+            return rest.split("/", 1)[1]
     return None
 
 
@@ -158,8 +184,8 @@ def is_exact_path_match(claimed: str, observed: str, *, base_dirs: Sequence[str]
         ho = _strip_home_prefix(norm_o)
         if hc and ho and hc == ho:
             return True
-    c_abs = norm_c.startswith("/")
-    o_abs = norm_o.startswith("/")
+    c_abs = is_abs_posix(norm_c)
+    o_abs = is_abs_posix(norm_o)
     if o_abs and not c_abs and norm_o.endswith("/" + norm_c):
         return True
     return c_abs and not o_abs and norm_c.endswith("/" + norm_o)
@@ -212,9 +238,9 @@ def is_repo_root_path(path: str | None, *, base_dirs: Sequence[str] = ()) -> boo
     norm = normalize_path(s, base_dirs=base_dirs)
     if norm in ("", ".", "./"):
         return True
-    if norm.startswith("/"):
+    if is_abs_posix(norm):
         for base in base_dirs:
-            if base.startswith("/") and (base == norm or base.startswith(norm.rstrip("/") + "/")):
+            if is_abs_posix(base) and _match_base_prefix(base, norm) is not None:
                 return True
     return False
 
@@ -232,17 +258,11 @@ def path_is_within(child: str, parent: str, *, base_dirs: Sequence[str] = ()) ->
     parent_prefix = norm_parent.rstrip("/") + "/"
     if norm_child.startswith(parent_prefix):
         return True
-    if (
-        norm_parent.startswith("/")
-        and not norm_child.startswith("/")
-        and norm_parent.endswith("/" + norm_child)
-    ):
+    c_abs = is_abs_posix(norm_child)
+    p_abs = is_abs_posix(norm_parent)
+    if p_abs and not c_abs and norm_parent.endswith("/" + norm_child):
         return True
-    return (
-        norm_child.startswith("/")
-        and not norm_parent.startswith("/")
-        and ("/" + norm_parent + "/") in (norm_child + "/")
-    )
+    return c_abs and not p_abs and ("/" + norm_parent + "/") in (norm_child + "/")
 
 
 def resolve_in_repo(
@@ -273,7 +293,7 @@ def resolve_in_repo(
             return None
         return None
 
-    if norm_c.startswith("/"):
+    if is_abs_posix(norm_c):
         return _confined(Path(norm_c))
 
     direct = _confined(repo_root / norm_c)
@@ -288,7 +308,7 @@ def resolve_in_repo(
         if is_suffix_path_match(norm_c, norm_o) or (
             "/" not in norm_c and posixpath.basename(norm_o) == norm_c
         ):
-            cand = Path(norm_o) if norm_o.startswith("/") else repo_root / norm_o
+            cand = Path(norm_o) if is_abs_posix(norm_o) else repo_root / norm_o
             confined = _confined(cand)
             if confined is not None and confined.exists():
                 return confined

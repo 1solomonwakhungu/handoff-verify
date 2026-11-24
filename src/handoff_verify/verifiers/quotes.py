@@ -22,7 +22,7 @@ from handoff_verify.verifiers._redirects import collect_redirected_reads
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 _ARROW_PREFIX_RE = re.compile(r"^\s*\d+→")
 _TAB_NUM_PREFIX_RE = re.compile(r"^\s*\d+\t")
-_GREP_PREFIX_RE = re.compile(r"^[^\s:][^:\n]*:\d+[:-]")
+_GREP_PREFIX_RE = re.compile(r"^((?:[A-Za-z]:[/\\])?[^\s:][^:\n]*):\d+[:-]")
 _DASH_NUM_DASH_RE = re.compile(r"-(\d+)-")
 _GREP_NO_LINENUM_RE = re.compile(r"^([^\s:]+):(.*)$")
 _BARE_LINENUM_PREFIX_RE = re.compile(r"^\d+[:-]")
@@ -312,11 +312,12 @@ def _append_grep_and_diff_entries(
     by_file: dict[str, list[str]] = {}
     seen_files: set[str] = set()
     for ln in split_lf_lines(text):
-        if _GREP_PREFIX_RE.match(ln):
-            path_part = ln.split(":", 1)[0].strip()
+        m_grep = _GREP_PREFIX_RE.match(ln)
+        if m_grep:
+            path_part = m_grep.group(1).strip()
             norm_fp = normalize_path(path_part, base_dirs=base_dirs)
             seen_files.add(path_part)
-            content_part = _GREP_PREFIX_RE.sub("", ln, count=1)
+            content_part = ln[m_grep.end() :]
             by_file.setdefault(norm_fp, []).append(content_part)
             continue
         parsed_ctx = _parse_grep_context_content(ln, seen_files)

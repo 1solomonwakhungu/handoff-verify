@@ -7,7 +7,6 @@ import contextlib
 import json
 import os
 import re
-import shlex
 import shutil
 import sys
 from collections.abc import Callable
@@ -15,7 +14,12 @@ from pathlib import Path
 from typing import Any
 
 from handoff_verify import __version__
-from handoff_verify.doctor import format_doctor_json, format_doctor_text, run_doctor
+from handoff_verify.doctor import (
+    _extract_hook_executable,
+    format_doctor_json,
+    format_doctor_text,
+    run_doctor,
+)
 from handoff_verify.evals import EvalSuiteError, format_eval_summary, run_eval_suite
 from handoff_verify.formatters import format_report
 from handoff_verify.hooks import (
@@ -326,7 +330,7 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
 def _cmd_check(args: argparse.Namespace) -> int:
     repo_root: Path | None = None
     if args.repo is not None:
-        repo_root = Path(args.repo)
+        repo_root = Path(args.repo).expanduser()
         if not repo_root.is_dir():
             print(f"Error: repository directory not found: {repo_root}", file=sys.stderr)
             return 2
@@ -370,7 +374,7 @@ def _cmd_hook_claude_code(args: argparse.Namespace) -> int:
     fail_closed = bool(args.fail_closed)
     try:
         stdin_text = sys.stdin.read()
-        repo_root = Path(args.repo) if args.repo is not None else None
+        repo_root = Path(args.repo).expanduser() if args.repo is not None else None
         result = run_claude_code_hook(
             stdin_text,
             mode=args.mode,
@@ -432,7 +436,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
         f"{action} Claude Code hooks in {settings_path} (SubagentStop, Stop; command={hook_cmd!r})."
     )
     executable = _hook_executable(hook_cmd)
-    if executable and shutil.which(executable) is None:
+    if executable and not _hook_executable_resolves(executable):
         print(
             f"Warning: `{executable}` is not on PATH, so the hook will fail with 'command not "
             "found' on every stop. Install the CLI (`uv tool install handoff-verify`) or "
@@ -443,12 +447,18 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _hook_executable(hook_command: str) -> str | None:
-    """Return the program a hook command line starts with, if it can be tokenized."""
-    try:
-        tokens = shlex.split(hook_command)
-    except ValueError:
-        return None
-    return tokens[0] if tokens else None
+    """Return the executable invoking handoff-verify, skipping env vars and shell ops."""
+    return _extract_hook_executable(hook_command)
+
+
+def _hook_executable_resolves(executable: str) -> bool:
+    """Return True if `executable` resolves on PATH or points to an existing local file."""
+    if "${" in executable or "$" in executable:
+        return True
+    exe_path = Path(executable).expanduser()
+    if exe_path.is_absolute() or "/" in executable or "\\" in executable:
+        return exe_path.is_file()
+    return shutil.which(executable) is not None
 
 
 def _cmd_eval(args: argparse.Namespace) -> int:
@@ -459,7 +469,8 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
-    print(format_eval_summary(summary, args.format, verbose=bool(args.verbose)))
+    output_format = "json" if args.json else args.format
+    print(format_eval_summary(summary, output_format, verbose=bool(args.verbose)))
     return 0 if summary.passed_targets else 1
 
 
@@ -673,6 +684,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="{text,markdown,json}",
         default="text",
         help="Output format (default: text).",
+    )
+    eval_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Shorthand for --format json.",
     )
     eval_parser.add_argument(
         "--strict",

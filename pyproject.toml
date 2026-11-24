@@ -35,6 +35,7 @@ dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/1solomonwakhungu/handoff-verify"
+Documentation = "https://github.com/1solomonwakhungu/handoff-verify#readme"
 Repository = "https://github.com/1solomonwakhungu/handoff-verify"
 Issues = "https://github.com/1solomonwakhungu/handoff-verify/issues"
 

@@ -158,6 +158,15 @@ def _transcript_has_final_message(transcript: ParsedTranscript, last_message: st
     return want in have
 
 
+def _file_stat_signature(path: Path) -> tuple[int, int] | None:
+    """Return `(st_size, st_mtime_ns)` for change detection, or None on OSError."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_size, st.st_mtime_ns)
+
+
 def _load_transcript_with_final_message(
     transcript_path: Path,
     last_message: str | None,
@@ -172,6 +181,7 @@ def _load_transcript_with_final_message(
     the final text as `last_assistant_message`: wait briefly for the file to catch up, and
     if it never does, verify the payload text against the tool evidence already on disk.
     """
+    last_sig = _file_stat_signature(transcript_path)
     transcript = auto_parse(transcript_path)
     if last_message is None or _transcript_has_final_message(transcript, last_message):
         return transcript
@@ -179,6 +189,10 @@ def _load_transcript_with_final_message(
     deadline = time.monotonic() + max(0.0, wait_seconds)
     while time.monotonic() < deadline:
         time.sleep(_TRANSCRIPT_POLL_INTERVAL_SECONDS)
+        cur_sig = _file_stat_signature(transcript_path)
+        if cur_sig is not None and cur_sig == last_sig:
+            continue
+        last_sig = cur_sig
         transcript = auto_parse(transcript_path)
         if _transcript_has_final_message(transcript, last_message):
             return transcript
