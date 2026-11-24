@@ -332,7 +332,7 @@ def parse_numbered_lines(
 
 # --- Truncation detection (linear time, anchored to head/tail banners) ---
 
-_GREP_MATCH_LINE_RE = re.compile(r"^[^\s:][^:]*:\d+:")
+_GREP_MATCH_LINE_RE = re.compile(r"^(?:[A-Za-z]:[/\\])?[^\s:][^:]*:\d+:")
 _SHOWING_FIRST_RE = re.compile(
     r"^(?:\[|\(|note:\s*)?showing\s+(?:the\s+)?first\s+(\d+)\s+(?:of|out\s+of)\s+(\d+)\b",
     re.IGNORECASE,

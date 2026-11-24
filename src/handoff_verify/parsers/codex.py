@@ -19,6 +19,7 @@ from handoff_verify.models import (
     ToolEvent,
 )
 from handoff_verify.parsers._common import (
+    MAX_PARSE_WARNINGS,
     analyze_shell_command,
     detect_pagination,
     detect_truncation,
@@ -105,8 +106,9 @@ def _parse_codex_arguments(raw_args: Any, line_no: int, warnings: list[str]) -> 
                     return parsed
                 return {"value": parsed}
             except (ValueError, RecursionError) as exc:
-                msg = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
-                warnings.append(f"Line {line_no}: malformed tool arguments JSON ({msg})")
+                if len(warnings) < MAX_PARSE_WARNINGS:
+                    msg = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
+                    warnings.append(f"Line {line_no}: malformed tool arguments JSON ({msg})")
                 return {"_raw": raw_args}
         return {"input": raw_args}
     if raw_args is None:
@@ -174,6 +176,7 @@ def parse_codex(
     pending_list: list[_PendingCodexCall] = []
     pending_by_id: dict[str, _PendingCodexCall] = {}
     fallback_agent_messages: list[tuple[str, str | None, int | None]] = []
+    suppressed_orphan_warnings = 0
 
     for line_no, record in loaded.records:
         rec_type = record.get("type")
@@ -269,9 +272,12 @@ def parse_codex(
             call_id = safe_str(item.get("call_id") or item.get("id"))
             call = pending_by_id.get(call_id)
             if call is None:
-                transcript.parse_warnings.append(
-                    f"Line {line_no}: orphan {item_type} for call_id={call_id!r}"
-                )
+                if len(transcript.parse_warnings) < MAX_PARSE_WARNINGS:
+                    transcript.parse_warnings.append(
+                        f"Line {line_no}: orphan {item_type} for call_id={call_id!r}"
+                    )
+                else:
+                    suppressed_orphan_warnings += 1
                 continue
             call.raw_output = extract_text_content(item.get("output"))
             call.has_result = True
@@ -288,6 +294,11 @@ def parse_codex(
                         after_event_index=after_idx,
                     )
                 )
+
+    if suppressed_orphan_warnings:
+        transcript.parse_warnings.append(
+            f"... and {suppressed_orphan_warnings} additional orphan tool output warnings"
+        )
 
     # Fall back to event_msg agent_message only if no response_item assistant messages were found
     if not transcript.assistant_messages and fallback_agent_messages:

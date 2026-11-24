@@ -18,6 +18,7 @@ from handoff_verify.models import (
     ToolEvent,
 )
 from handoff_verify.parsers._common import (
+    MAX_PARSE_WARNINGS,
     analyze_shell_command,
     detect_pagination,
     detect_truncation,
@@ -172,6 +173,7 @@ def parse_claude_code(
     pending_by_id: dict[str, _PendingToolCall] = {}
     last_assistant_msg_id: str | None = None
     seen_text_blocks_by_msg_id: dict[str, set[str]] = {}
+    suppressed_orphan_warnings = 0
 
     for line_no, record in loaded.records:
         if transcript.cwd is None and isinstance(record.get("cwd"), str) and record["cwd"].strip():
@@ -261,14 +263,22 @@ def parse_claude_code(
                 tool_use_id = safe_str(block.get("tool_use_id"))
                 call = pending_by_id.get(tool_use_id)
                 if call is None:
-                    transcript.parse_warnings.append(
-                        f"Line {line_no}: orphan tool_result for tool_use_id={tool_use_id!r}"
-                    )
+                    if len(transcript.parse_warnings) < MAX_PARSE_WARNINGS:
+                        transcript.parse_warnings.append(
+                            f"Line {line_no}: orphan tool_result for tool_use_id={tool_use_id!r}"
+                        )
+                    else:
+                        suppressed_orphan_warnings += 1
                     continue
                 call.raw_output = extract_text_content(block.get("content"))
                 call.is_error = bool(block.get("is_error", False))
                 call.tool_use_result = tool_use_result
                 call.has_result = True
+
+    if suppressed_orphan_warnings:
+        transcript.parse_warnings.append(
+            f"... and {suppressed_orphan_warnings} additional orphan tool_result warnings"
+        )
 
     # Convert pending calls in chronological order into typed events
     for call in pending_list:
@@ -510,7 +520,9 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
         else:
             stdout = _LEADING_EXIT_CODE_RE.sub("", raw_out, count=1)
         stderr = tur["stderr"] if isinstance(tur.get("stderr"), str) else ""
-        exit_code = safe_int(tur.get("exitCode") or tur.get("exit_code"))
+        exit_code = safe_int(tur.get("exitCode"))
+        if exit_code is None:
+            exit_code = safe_int(tur.get("exit_code"))
         if exit_code is None:
             m_lead = _LEADING_EXIT_CODE_RE.match(raw_out)
             m_trail = _TRAILING_EXIT_CODE_RE.search(raw_out) if not m_lead else None
@@ -656,6 +668,22 @@ def _materialize_claude_event(transcript: ParsedTranscript, call: _PendingToolCa
                 transcript.file_edits.append(ev_edit)
         if first_event is not None:
             transcript.events.append(first_event)
+        else:
+            ev_fallback = FileEditEvent(
+                event_id=call.event_id,
+                event_index=call.event_index,
+                tool_name=name,
+                timestamp=call.timestamp,
+                raw_input=raw_in,
+                raw_output=raw_out,
+                is_error=call.is_error,
+                has_result=True,
+                file_path=file_path,
+                operation="edit",
+            )
+            transcript.events.append(ev_fallback)
+            if not call.is_error:
+                transcript.file_edits.append(ev_fallback)
         return
 
     if name == "Write":

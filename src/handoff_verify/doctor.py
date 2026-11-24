@@ -178,7 +178,7 @@ def _inspect_settings_file(path: Path) -> dict[str, Any]:
                         exe_path = Path(exe).expanduser()
                         if exe_path.is_absolute():
                             resolves = exe_path.is_file()
-                        elif "/" in exe:
+                        elif "/" in exe or "\\" in exe:
                             # Relative path resolves against project root (parent of .claude) or cwd
                             project_base = (
                                 path.parent.parent if path.parent.name == ".claude" else path.parent
@@ -215,6 +215,14 @@ def _detect_claude_plugin(claude_dirs: list[Path]) -> Path | None:
                         continue
                     if isinstance(val, dict) and val.get("enabled") is False:
                         continue
+                    if isinstance(val, list):
+                        active = [
+                            item
+                            for item in val
+                            if not (isinstance(item, dict) and item.get("enabled") is False)
+                        ]
+                        if not active:
+                            continue
                     return installed
             elif isinstance(plugins, list):
                 for item in plugins:

@@ -25,7 +25,7 @@ if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
   IS_DARWIN=1
 fi
 
-for py in python3 python3.14 python3.13 python3.12 python3.11; do
+for py in python3 python3.15 python3.14 python3.13 python3.12 python3.11; do
   py_path="$(command -v "$py" 2>/dev/null || true)"
   if [ -z "$py_path" ]; then
     continue
