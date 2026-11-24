@@ -11,19 +11,59 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.13"]
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Run checks
+      - name: Install dev dependencies
+        run: uv sync --dev
+      - name: Lint and format check
         run: |
-          if [ ! -f pyproject.toml ]; then
-            echo "Bootstrap commit (no pyproject.toml yet); skipping."
-            exit 0
-          fi
-          uv sync --dev
           uv run ruff check .
           uv run ruff format --check .
-          uv run pytest -v
+      - name: Run unit and integration tests
+        run: uv run pytest -v
+      - name: Run bundled 32-case eval suite
+        run: uv run handoff-verify eval --verbose
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Verify wheel install and CLI in an isolated environment
+        run: |
+          python3 - <<'PY'
+          import glob
+          import pathlib
+          import subprocess
+          import tempfile
+          import zipfile
+
+          wheels = sorted(glob.glob("dist/*.whl"))
+          sdists = sorted(glob.glob("dist/*.tar.gz"))
+          assert len(wheels) == 1 and len(sdists) == 1, (wheels, sdists)
+
+          with zipfile.ZipFile(wheels[0]) as zf:
+              names = set(zf.namelist())
+              assert "handoff_verify/_evals/manifest.json" in names
+              assert any(n.endswith("licenses/LICENSE") for n in names)
+
+          with tempfile.TemporaryDirectory() as td:
+              venv = pathlib.Path(td) / "venv"
+              subprocess.run(["uv", "venv", str(venv)], check=True)
+              subprocess.run(
+                  ["uv", "pip", "install", "--python", str(venv / "bin/python"), wheels[0]],
+                  check=True,
+              )
+              hv = str(venv / "bin/handoff-verify")
+              subprocess.run([hv, "--version"], cwd=td, check=True)
+              subprocess.run([hv, "eval", "--json"], cwd=td, check=True)
+              subprocess.run([hv, "doctor", "--json"], cwd=td, check=True)
+          PY
