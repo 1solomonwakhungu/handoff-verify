@@ -31,6 +31,7 @@ from handoff_verify.parsers._common import (
     parse_numbered_lines,
     safe_int,
     safe_str,
+    split_grep_path_prefix,
     split_lf_lines,
     unwrap_shell_command,
 )
@@ -92,7 +93,12 @@ class _PendingCodexCall:
     has_result: bool = False
 
 
-def _parse_codex_arguments(raw_args: Any, line_no: int, warnings: list[str]) -> dict[str, Any]:
+def _parse_codex_arguments(
+    raw_args: Any,
+    line_no: int,
+    warnings: list[str],
+    suppressed_counter: list[int],
+) -> dict[str, Any]:
     if isinstance(raw_args, dict):
         return raw_args
     if isinstance(raw_args, str):
@@ -109,6 +115,8 @@ def _parse_codex_arguments(raw_args: Any, line_no: int, warnings: list[str]) -> 
                 if len(warnings) < MAX_PARSE_WARNINGS:
                     msg = exc.msg if isinstance(exc, json.JSONDecodeError) else str(exc)
                     warnings.append(f"Line {line_no}: malformed tool arguments JSON ({msg})")
+                else:
+                    suppressed_counter[0] += 1
                 return {"_raw": raw_args}
         return {"input": raw_args}
     if raw_args is None:
@@ -177,6 +185,7 @@ def parse_codex(
     pending_by_id: dict[str, _PendingCodexCall] = {}
     fallback_agent_messages: list[tuple[str, str | None, int | None]] = []
     suppressed_orphan_warnings = 0
+    suppressed_malformed_args = [0]
 
     for line_no, record in loaded.records:
         rec_type = record.get("type")
@@ -218,7 +227,7 @@ def parse_codex(
                 continue
             tool_name = safe_str(item.get("name"))
             raw_in = _parse_codex_arguments(
-                item.get("arguments"), line_no, transcript.parse_warnings
+                item.get("arguments"), line_no, transcript.parse_warnings, suppressed_malformed_args
             )
             call = _PendingCodexCall(
                 event_index=len(pending_list),
@@ -235,7 +244,9 @@ def parse_codex(
             if call_id in pending_by_id:
                 continue
             tool_name = safe_str(item.get("name"))
-            raw_in = _parse_codex_arguments(item.get("input"), line_no, transcript.parse_warnings)
+            raw_in = _parse_codex_arguments(
+                item.get("input"), line_no, transcript.parse_warnings, suppressed_malformed_args
+            )
             call = _PendingCodexCall(
                 event_index=len(pending_list),
                 event_id=call_id,
@@ -295,6 +306,10 @@ def parse_codex(
                     )
                 )
 
+    if suppressed_malformed_args[0]:
+        transcript.parse_warnings.append(
+            f"... and {suppressed_malformed_args[0]} additional malformed tool argument warnings"
+        )
     if suppressed_orphan_warnings:
         transcript.parse_warnings.append(
             f"... and {suppressed_orphan_warnings} additional orphan tool output warnings"
@@ -545,7 +560,8 @@ def _materialize_codex_event(transcript: ParsedTranscript, call: _PendingCodexCa
         matched_files: list[str] = []
         seen: set[str] = set()
         for line in lines:
-            path_part = line.split(":", 1)[0].strip() if ":" in line else line
+            split = split_grep_path_prefix(line)
+            path_part = split[0] if split is not None else line
             if path_part and path_part not in seen:
                 seen.add(path_part)
                 matched_files.append(path_part)

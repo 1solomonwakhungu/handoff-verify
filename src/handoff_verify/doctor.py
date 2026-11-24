@@ -174,7 +174,7 @@ def _inspect_settings_file(path: Path) -> dict[str, Any]:
                     cmd_str = handler["command"].strip()
                     found_cmds.append(cmd_str)
                     exe = _extract_hook_executable(cmd_str)
-                    if exe and "${" not in exe and "$" not in exe:
+                    if exe and "$" not in exe:
                         exe_path = Path(exe).expanduser()
                         if exe_path.is_absolute():
                             resolves = exe_path.is_file()

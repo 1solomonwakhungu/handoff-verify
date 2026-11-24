@@ -29,6 +29,7 @@ from handoff_verify.parsers._common import (
     parse_numbered_lines,
     safe_int,
     safe_str,
+    split_grep_path_prefix,
     split_lf_lines,
 )
 
@@ -116,8 +117,9 @@ def _parse_grep_output(
                 continue
         if output_mode == "content":
             match_count += 1
-            if ":" in line:
-                first = line.split(":", 1)[0].strip()
+            split = split_grep_path_prefix(line)
+            if split is not None:
+                first = split[0]
                 if first and not first.isdigit() and first not in seen:
                     seen.add(first)
                     matched_files.append(first)

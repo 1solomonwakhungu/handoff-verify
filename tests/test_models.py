@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from pathlib import Path
 
 from handoff_verify import __version__
@@ -23,7 +24,9 @@ from handoff_verify.models import (
 
 
 def test_version_exported() -> None:
-    assert __version__ == "0.1.0"
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    expected = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+    assert __version__ == expected == "0.1.1"
 
 
 def test_typed_events_inherit_tool_event_and_serialize() -> None:

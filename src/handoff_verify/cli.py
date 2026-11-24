@@ -453,7 +453,7 @@ def _hook_executable(hook_command: str) -> str | None:
 
 def _hook_executable_resolves(executable: str) -> bool:
     """Return True if `executable` resolves on PATH or points to an existing local file."""
-    if "${" in executable or "$" in executable:
+    if "$" in executable:
         return True
     exe_path = Path(executable).expanduser()
     if exe_path.is_absolute() or "/" in executable or "\\" in executable:

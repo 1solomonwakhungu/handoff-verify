@@ -598,3 +598,162 @@ def test_documented_finding_codes_match_verifier_source() -> None:
     table_section = skill_text.split("| Finding Code |", 1)[1].split("\n\n", 1)[0]
     skill_table_codes = set(re.findall(r"`([A-Z][A-Z0-9_]+)`", table_section))
     assert skill_table_codes == actual_codes
+
+
+def test_windows_drive_grep_without_line_numbers_claude_codex_and_shell(tmp_path: Path) -> None:
+    # 1. Claude Code Grep (output_mode="content", -n: false) with Windows drive paths
+    claude_records = [
+        {
+            "type": "assistant",
+            "cwd": r"C:\repo",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "g1",
+                        "name": "Grep",
+                        "input": {
+                            "pattern": "compute_total",
+                            "path": r"C:\repo",
+                            "output_mode": "content",
+                            "-n": False,
+                        },
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "b1",
+                        "name": "Bash",
+                        "input": {"command": r"rg 'compute_total' C:\repo"},
+                    },
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "g1",
+                        "content": r"C:\repo\src\billing.py:def compute_total(x):",
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "b1",
+                        "content": (
+                            "C:\\repo\\src\\billing.py:def compute_total(x):\n"
+                            "grep: C:\\repo\\src\\cache.pyc: binary file matches\n"
+                        ),
+                    },
+                ],
+            },
+        },
+        {
+            "type": "assistant",
+            "cwd": r"C:\repo",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Found `src/billing.py` defining `def compute_total(x):` "
+                            "and binary `src/cache.pyc`."
+                        ),
+                    }
+                ],
+            },
+        },
+    ]
+    parsed_claude = auto_parse(_write_jsonl(tmp_path / "win_noln_claude.jsonl", claude_records))
+    assert parsed_claude.searches[0].matched_files == [r"C:\repo\src\billing.py"]
+    assert parsed_claude.searches[1].matched_files == [
+        r"C:\repo\src\billing.py",
+        r"C:\repo\src\cache.pyc",
+    ]
+    rep_claude = verify_transcript(parsed_claude)
+    assert rep_claude.passed is True
+    assert rep_claude.findings == []
+
+    # 2. Codex grep_files output without line numbers with Windows drive paths
+    codex_records = [
+        {"type": "session_meta", "payload": {"cwd": r"C:\repo"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "call_id": "c1",
+                "name": "grep_files",
+                "arguments": json.dumps({"pattern": "compute_total", "path": r"C:\repo"}),
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": (
+                    "C:\\repo\\src\\billing.py:def compute_total(x):\nC:\\repo\\src\\only_path.py\n"
+                ),
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": (
+                            "Checked `src/billing.py` (`def compute_total(x):`) and "
+                            "`src/only_path.py`."
+                        ),
+                    }
+                ],
+            },
+        },
+    ]
+    parsed_codex = auto_parse(_write_jsonl(tmp_path / "win_noln_codex.jsonl", codex_records))
+    assert parsed_codex.searches[0].matched_files == [
+        r"C:\repo\src\billing.py",
+        r"C:\repo\src\only_path.py",
+    ]
+    rep_codex = verify_transcript(parsed_codex)
+    assert rep_codex.passed is True
+    assert rep_codex.findings == []
+
+
+def test_codex_malformed_arguments_warnings_are_bounded_with_summary(tmp_path: Path) -> None:
+    records = [
+        {"type": "session_meta", "payload": {"cwd": "/repo"}},
+        *[
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "call_id": f"bad_{i}",
+                    "name": "shell",
+                    "arguments": "{broken json",
+                },
+            }
+            for i in range(80)
+        ],
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Done."}],
+            },
+        },
+    ]
+    parsed = auto_parse(_write_jsonl(tmp_path / "codex_bad_args.jsonl", records))
+    expected_suppressed = 80 - MAX_PARSE_WARNINGS
+    assert any(
+        f"... and {expected_suppressed} additional malformed tool argument warnings" in w
+        for w in parsed.parse_warnings
+    )
+    assert len(parsed.parse_warnings) <= MAX_PARSE_WARNINGS + 2

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "handoff-verify"
-version = "0.1.0"
+version = "0.1.1"
 description = "Deterministic, zero-LLM claim and scope verification for AI coding agents and subagents."
 readme = "README.md"
 license = { file = "LICENSE" }

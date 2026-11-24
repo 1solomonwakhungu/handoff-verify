@@ -333,6 +333,18 @@ def parse_numbered_lines(
 # --- Truncation detection (linear time, anchored to head/tail banners) ---
 
 _GREP_MATCH_LINE_RE = re.compile(r"^(?:[A-Za-z]:[/\\])?[^\s:][^:]*:\d+:")
+_WIN_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:[/\\]")
+
+
+def split_grep_path_prefix(line: str) -> tuple[str, str] | None:
+    """Split `path:rest` preserving an optional Windows drive prefix (`C:\\...` or `C:/...`)."""
+    start = 2 if _WIN_DRIVE_PREFIX_RE.match(line) else 0
+    colon_idx = line.find(":", start)
+    if colon_idx == -1:
+        return None
+    return line[:colon_idx].strip(), line[colon_idx + 1 :]
+
+
 _SHOWING_FIRST_RE = re.compile(
     r"^(?:\[|\(|note:\s*)?showing\s+(?:the\s+)?first\s+(\d+)\s+(?:of|out\s+of)\s+(\d+)\b",
     re.IGNORECASE,
@@ -1395,13 +1407,15 @@ def _parse_matched_files_from_grep_output(
         # Handle `grep: path/to/x.pyc: binary file matches` cleanly as a match
         if _BINARY_MATCH_RE.search(s):
             stripped_bin = _GREP_TOOL_ERROR_RE.sub("", s, count=1)
-            bin_path = stripped_bin.split(":", 1)[0].strip()
+            bin_split = split_grep_path_prefix(stripped_bin)
+            bin_path = bin_split[0] if bin_split is not None else stripped_bin.strip()
             if bin_path and " " not in bin_path and bin_path not in seen:
                 seen.add(bin_path)
                 files.append(bin_path)
             continue
-        if ":" in s:
-            prefix = s.split(":", 1)[0].strip()
+        path_split = split_grep_path_prefix(s)
+        if path_split is not None:
+            prefix = path_split[0]
             looks_like_path = (
                 bool(prefix)
                 and not prefix.isdigit()
@@ -1410,13 +1424,18 @@ def _parse_matched_files_from_grep_output(
                     single_target_path is None
                     or prefix == single_target_path
                     or "/" in prefix
+                    or "\\" in prefix
                     or "." in prefix
                 )
             )
             if looks_like_path and prefix not in seen:
                 seen.add(prefix)
                 files.append(prefix)
-        elif " " not in s and ((files_only_mode and not s.isdigit()) or "/" in s) and s not in seen:
+        elif (
+            " " not in s
+            and ((files_only_mode and not s.isdigit()) or "/" in s or "\\" in s)
+            and s not in seen
+        ):
             seen.add(s)
             files.append(s)
     if match_lines > 0 and not files and single_target_path:
