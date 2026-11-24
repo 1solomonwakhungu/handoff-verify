@@ -7,7 +7,7 @@ All numbers below come directly from the bundled 32-case eval suite (`uv run han
 ## Show HN
 
 **Title:**
-Show HN: handoff-verify – Zero-LLM CLI/hook that checks AI agent citations against transcripts
+Show HN: handoff-verify – Zero-LLM verifier for AI agent handoff claims
 
 **Body:**
 Hi HN,
@@ -22,7 +22,7 @@ Using another LLM as a judge for this felt slow, expensive, and non-deterministi
 2. Verbatim quotes (inline and fenced): checks that quoted snippets appear in what the agent actually read, wrote, or saw in command output, with whitespace/operator normalization and file-attribution checking (`QUOTE_MISMATCH`).
 3. Absence and completeness claims ("no other callers", "not used anywhere", "reviewed all pages"): builds a scope receipt from actual searches and pagination calls, flagging missing searches, truncated outputs, subdirectory-only searches, and unfollowed `nextCursor` / `has_more` responses.
 
-Example on a truncated grep claimed as "no other matches":
+Example on a truncated grep claimed as "no other matches" (timing illustrative):
 
 ```console
 $ handoff-verify check evals/cases/fail_06_claude_truncated_grep.jsonl
@@ -42,7 +42,7 @@ Try it on your last Claude Code session without installing anything:
 uvx handoff-verify check --latest
 ```
 
-Or wire it into Claude Code `Stop` and `SubagentStop` hooks (defaults to `advise` mode, silent on clean passes, with `stop_hook_active` loop protection so it can never trap an agent):
+Or wire it into Claude Code `Stop` and `SubagentStop` hooks (defaults to `advise` mode, silent on clean passes, loop-guarded via `stop_hook_active`):
 
 ```bash
 uv tool install handoff-verify
@@ -104,7 +104,7 @@ claude plugin install handoff-verify@handoff-verify
 A few hook details that mattered a lot in real sessions:
 - On `SubagentStop`, it reads only `agent_transcript_path` and never falls back to the parent session transcript.
 - Claude Code sometimes fires `Stop` before flushing the last assistant message to the JSONL file. The hook compares against `last_assistant_message` in the hook payload, waits briefly for disk to catch up (only re-parsing if the file changes), and falls back to verifying the payload text against the tool evidence on disk.
-- Silent on clean passes and warning-only passes. When `stop_hook_active` is true, it never blocks or continues the turn again.
+- Silent on clean passes and warning-only passes, and loop-guarded via `stop_hook_active` so it will not block or continue the turn twice.
 - Speed: 0.60 ms median on the 32-case eval suite, ~12.7 ms on a 1.1 MB transcript, ~57 ms total CLI wall time.
 
 Start with the default `advise` mode rather than `block`. A finding means "the transcript does not show this", not necessarily that the claim is false (for example, if the agent inspected a file through a custom `python -c` script).
@@ -152,72 +152,63 @@ GitHub: https://github.com/1solomonwakhungu/handoff-verify
 ## X / Twitter Launch Thread
 
 **Tweet 1:**
-Coding agents love saying "no other callers anywhere in the codebase" right after a `head_limit=5` grep, or citing `src/auth.py:48-55` they never read.
+Coding agents often claim "no other callers anywhere" after a head_limit=5 grep, or cite file:line ranges they never read.
 
-I built `handoff-verify`: a zero-LLM, zero-dependency Python CLI + Claude Code hook that checks agent handoffs against their tool-call transcripts in ~1-13ms.
+handoff-verify is a zero-LLM Python CLI + Claude Code hook that checks handoffs against transcripts.
 
-```bash
 uvx handoff-verify check --latest
-```
 
 **Tweet 2:**
-Every tool call and result is already on disk in the session JSONL (Claude Code, Codex CLI, or generic JSONL).
+Tool calls are already in Claude Code, Codex CLI, or generic JSONL logs.
 
-`handoff-verify` checks three things deterministically:
-1. `path:line` pointers (read window, post-edit line shifts, `--repo` disk check)
-2. Verbatim inline & fenced code quotes (including wrong-file attribution)
-3. Absence & completeness claims ("no other callers", "reviewed all pages") against search roots, truncation, and unread pagination cursors
+handoff-verify checks:
+1. path:line pointers (read windows, edit shifts, --repo)
+2. Quoted code (altered or wrong-file)
+3. Scope claims (truncated or narrow grep, unread cursors)
 
 **Tweet 3:**
-Real output on a truncated grep claimed as "no other matches":
+Excerpt of real output on a truncated grep claimed as "no other matches" (timing illustrative):
 
-```
-FAIL: 1 finding (1 error; 4 claims checked, 0 files read, 0.9ms)
-  [ERROR] TRUNCATED_SEARCH_OUTPUT: Claimed `no other matches`, but search output was truncated: Grep#0 (result limit (5) reached).
-    Next step: Re-run the search without head_limit/truncation before claiming absence or completeness.
-```
-
-Quiet when clean (`--quiet-on-pass` prints nothing).
+FAIL: 1 finding (1 error; 4 claims checked, 0.9ms)
+[ERROR] TRUNCATED_SEARCH_OUTPUT: Grep#0 (result limit (5) reached)
+Next step: Re-run without head_limit/truncation.
 
 **Tweet 4:**
 Measured on macOS arm64 / Python 3.13:
 - 32-case seeded eval suite: 100% precision (0 FP), 100% recall (16/16), 0.60ms median
 - 1.14 MB transcript: 12.7ms
 - 5.76 MB transcript: 60.8ms (~95 MB/s)
-- Full CLI invocation: ~57ms
+- Full CLI run: ~57ms
 
 Zero runtime dependencies (Python 3.11+ stdlib only).
 
 **Tweet 5:**
-Wire it into Claude Code `Stop` and `SubagentStop` hooks in two commands (defaults to `advise` mode, loop-guarded with `stop_hook_active`):
+Wire into Claude Code Stop/SubagentStop hooks (advise mode, loop-guarded via stop_hook_active):
 
-```bash
-uv tool install handoff-verify
-handoff-verify init --write
-```
+uv tool install handoff-verify && handoff-verify init --write
 
-Or install the Claude Code plugin / Agent Skill:
-`npx skills add 1solomonwakhungu/handoff-verify`
-
-Code + eval suite: https://github.com/1solomonwakhungu/handoff-verify
+Agent Skill: npx skills add 1solomonwakhungu/handoff-verify
+Repo & plugin: https://github.com/1solomonwakhungu/handoff-verify
 
 ---
 
-## GitHub Release Notes (`v0.1.0`)
+## GitHub Release Notes (`v0.1.1`)
 
-### handoff-verify v0.1.0
+### handoff-verify v0.1.1
 
 Deterministic, zero-LLM verification of AI coding agent and subagent handoffs against tool-call transcripts. Pure Python 3.11+ standard library with zero third-party runtime dependencies.
+
+#### Changes since initial PyPI `0.1.0`
+- **Windows drive-letter path support:** Full normalization, repo-root detection, and grep content/quote parsing for Windows drive paths (`C:\repo\...`, both with and without line numbers) across Claude Code, Codex CLI, shell search outputs, and `doctor`.
+- **Parser hardening:** Fixed falsy-zero `exitCode: 0` handling in Claude Code Bash `toolUseResult`, added fallback `FileEditEvent` for malformed `MultiEdit` entries, and capped orphan/malformed-argument `parse_warnings` in Claude Code and Codex parsers with suppression summaries.
+- **Hook polling performance:** Skips redundant transcript re-parses during `last_assistant_message` wait polling when file size and mtime have not changed.
+- **CLI & plugin polish:** Added `handoff-verify eval --json`, tilde expansion for `--repo`, env-prefix/tilde-aware executable resolution in `init --write`, Claude v2 empty plugin list handling in `doctor`, `python3.15` discovery in `bin/handoff-verify`, synchronized all 12 finding codes in `skills/handoff-verify/SKILL.md`, and added absolute GitHub URLs in `README.md` for PyPI.
+- **CI & packaging:** Expanded CI matrix to Python 3.11, 3.12, and 3.13 with `contents: read` permissions, bumped GitHub Actions to `checkout@v7` and `setup-uv@v7`, added explicit `handoff-verify eval --verbose`, and added an isolated wheel build/install smoke-test job.
 
 #### What it verifies
 - **File pointers (`path:line`, `path:start-end`, `#L10-L20`):** checks transcript read coverage, `offset`/`limit` read windows, post-edit line shifts (`STALE_FILE_READ`), and live disk existence, line bounds, and content drift when `--repo` is provided (`UNREAD_FILE`, `LINE_OUT_OF_READ_WINDOW`, `FILE_NOT_FOUND`, `LINE_OUT_OF_BOUNDS`).
 - **Verbatim code & output quotes:** checks inline and fenced snippets against observed file reads, edits, searches, and command outputs with whitespace/operator normalization (`QUOTE_NOT_FOUND`, `QUOTE_MISMATCH`).
 - **Absence & completeness scope receipts:** verifies claims like *"no other callers"*, *"not used anywhere"*, and *"reviewed all pages"* against search roots, truncation limits, excluded directories, and unread pagination cursors (`NO_SEARCH_EVIDENCE`, `TRUNCATED_SEARCH_OUTPUT`, `NARROW_SEARCH_SCOPE`, `UNREAD_PAGINATION_CURSOR`, `EXCLUDED_SEARCH_DIRS`).
-
-#### Supported harnesses & integrations
-- **Parsers (`--parser auto|claude_code|codex|generic`):** Claude Code main and subagent JSONL logs, Codex CLI modern rollout and legacy logs, and a documented generic JSONL schema. Supports Unix and Windows drive-letter paths plus Unicode filenames.
-- **CLI:** `check` (including `--latest`, stdin `-`, `--repo`, `--strict`, `--quiet-on-pass`, `--format text|markdown|json`, `--json`), `inspect`, `eval`, `init`, `doctor`, and `hook claude-code`.
-- **Claude Code hooks & plugin:** `Stop` and `SubagentStop` hook adapter with `advise` / `block` modes, `stop_hook_active` loop guard, `last_assistant_message` race handling, fail-open default (exit `1`), bundled Claude Code plugin (`.claude-plugin/`, `hooks/hooks.json`, `bin/handoff-verify`), and Agent Skill (`skills/handoff-verify/SKILL.md`).
 
 #### Benchmarks & evals (macOS arm64, Python 3.13.14)
 - **Bundled 32-case eval suite (`handoff-verify eval`):** 100.0% precision (16 TP, 0 FP), 100.0% recall (16/16), 0.0% FPR, 100.0% code match, 0.60 ms median latency (1.38 ms p95, 1.56 ms max).

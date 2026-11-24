@@ -10,7 +10,7 @@ AI coding agents and subagents frequently hand back confident reports containing
 - **Verbatim quotes (inline & fenced):** Does the quoted snippet actually appear in what the agent read, wrote, or observed in command output (exact or whitespace/operator-normalized)?
 - **Absence & completeness scope receipts:** When an agent claims *"no other callers"*, *"no matches"*, *"not used anywhere"*, or *"reviewed all pages"*, did it actually run an untruncated search across the claimed scope, and were all pagination cursors followed?
 
-**Zero LLM calls. Zero third-party runtime dependencies (Python 3.11+ stdlib only). Fast linear-time verification (sub-millisecond on small transcripts; tens of milliseconds on multi-megabyte transcripts). Quiet when clean, loud on anomalies.**
+**Zero LLM calls. Zero third-party runtime dependencies (Python 3.11+ stdlib only). Fast linear-time verification (sub-millisecond on small transcripts; tens of milliseconds on multi-megabyte transcripts). Silent on clean passes (`--quiet-on-pass` or hook mode) with actionable findings on ungrounded claims.**
 
 ---
 
@@ -196,7 +196,7 @@ Generated configuration (`handoff-verify init`):
 
 ## Using it from an agent
 
-[`skills/handoff-verify/SKILL.md`](skills/handoff-verify/SKILL.md) is a ready-made skill that
+[`skills/handoff-verify/SKILL.md`](https://github.com/1solomonwakhungu/handoff-verify/blob/main/skills/handoff-verify/SKILL.md) is a ready-made skill that
 tells an agent when to run the check, how to read a finding, and what to do about each code.
 Copy the folder into `.claude/skills/` (project) or `~/.claude/skills/` (every project):
 
@@ -220,7 +220,7 @@ The bundled eval suite below is a deterministic regression benchmark. As a calib
 
 | Stage | Transcripts with an error-level finding |
 | --- | ---: |
-| As first tagged `0.1.0` | 512 / 1,571 (32.6%) |
+| As first published to PyPI (`0.1.0`) | 512 / 1,571 (32.6%) |
 | After shell-read & scratch-copy fixes | 343 / 1,571 (21.8%) |
 
 Follow-up fixes addressed the top remaining false-alarm classes observed in that corpus:
@@ -484,4 +484,4 @@ uv run handoff-verify eval --verbose
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/1solomonwakhungu/handoff-verify/blob/main/LICENSE).

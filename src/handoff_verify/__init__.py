@@ -19,7 +19,7 @@ from handoff_verify.models import (
 from handoff_verify.parsers import auto_parse, detect_format
 from handoff_verify.pipeline import verify_transcript
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "__version__",
