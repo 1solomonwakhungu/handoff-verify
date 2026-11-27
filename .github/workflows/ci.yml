@@ -46,12 +46,26 @@ jobs:
           import glob
           import pathlib
           import subprocess
+          import tarfile
           import tempfile
           import zipfile
 
           wheels = sorted(glob.glob("dist/*.whl"))
           sdists = sorted(glob.glob("dist/*.tar.gz"))
           assert len(wheels) == 1 and len(sdists) == 1, (wheels, sdists)
+
+          with tarfile.open(sdists[0], "r:gz") as tf:
+              sdist_names = tf.getnames()
+              assert not any("/landing-page/" in n or n.endswith("/landing-page") for n in sdist_names), sdist_names
+              for required in (
+                  "/evals/manifest.json",
+                  "/skills/handoff-verify/SKILL.md",
+                  "/hooks/hooks.json",
+                  "/bin/handoff-verify",
+                  "/.claude-plugin/plugin.json",
+                  "/tests/",
+              ):
+                  assert any(required in n for n in sdist_names), f"Missing {required} in sdist"
 
           with zipfile.ZipFile(wheels[0]) as zf:
               names = set(zf.namelist())
@@ -70,3 +84,22 @@ jobs:
               subprocess.run([hv, "eval", "--json"], cwd=td, check=True)
               subprocess.run([hv, "doctor", "--json"], cwd=td, check=True)
           PY
+
+  landing-page:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: landing-page
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: landing-page/package-lock.json
+      - name: Install landing page dependencies
+        run: npm ci
+      - name: Typecheck landing page
+        run: npm run typecheck
+      - name: Build landing page
+        run: npm run build

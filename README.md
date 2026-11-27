@@ -2,6 +2,8 @@
 
 **Deterministic, zero-LLM claim & scope verification for AI coding agents and subagents.**
 
+Website: [handoff-verify.harlo.dev](https://handoff-verify.harlo.dev) · PyPI: [`handoff-verify`](https://pypi.org/project/handoff-verify/)
+
 AI coding agents and subagents frequently hand back confident reports containing subtle ungrounded claims: citing `path:line` pointers they never read (or read before a line-shifting edit), altering quoted code snippets, or claiming *"no other callers anywhere in the codebase"* after a truncated or subdirectory-scoped grep — or *"reviewed all pages"* while leaving a pagination cursor unread.
 
 `handoff-verify` parses an agent's tool-call transcript and deterministically checks every claim in its final handoff against what the agent actually observed:

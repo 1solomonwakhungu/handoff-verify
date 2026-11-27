@@ -22,3 +22,14 @@ updates:
           - "*"
     commit-message:
       prefix: "ci(deps)"
+
+  - package-ecosystem: npm
+    directory: /landing-page
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      landing-page-minor-and-patch:
+        update-types: [minor, patch]
+    commit-message:
+      prefix: "build(landing-page)"
