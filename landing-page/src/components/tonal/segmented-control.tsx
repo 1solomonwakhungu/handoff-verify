@@ -52,11 +52,15 @@ export function TonalSegmentedControl<T extends string = string>({
   const handleKeyDown = (e: React.KeyboardEvent, idx: number) => {
     if (options.length === 0) return;
     let nextIdx: number | null = null;
-    if (e.key === "ArrowRight") nextIdx = (idx + 1) % options.length;
-    else if (e.key === "ArrowLeft")
+    if (e.key === "ArrowRight" || e.key === "ArrowDown") {
+      nextIdx = (idx + 1) % options.length;
+    } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
       nextIdx = (idx - 1 + options.length) % options.length;
-    else if (e.key === "Home") nextIdx = 0;
-    else if (e.key === "End") nextIdx = options.length - 1;
+    } else if (e.key === "Home") {
+      nextIdx = 0;
+    } else if (e.key === "End") {
+      nextIdx = options.length - 1;
+    }
 
     if (nextIdx !== null) {
       e.preventDefault();
@@ -70,7 +74,7 @@ export function TonalSegmentedControl<T extends string = string>({
       role="radiogroup"
       aria-label={ariaLabel}
       className={cn(
-        "inline-flex flex-wrap items-center gap-0.5 rounded-full bg-[var(--t-surface-muted)] p-1 border border-[var(--t-border-subtle)]",
+        "inline-flex flex-nowrap items-center gap-0.5 max-w-full overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden rounded-full bg-[var(--t-surface-muted)] p-1 border border-[var(--t-border-subtle)]",
         className
       )}
     >
@@ -90,7 +94,7 @@ export function TonalSegmentedControl<T extends string = string>({
             onClick={() => select(opt.value)}
             onKeyDown={(e) => handleKeyDown(e, idx)}
             className={cn(
-              "inline-flex items-center gap-1.5 rounded-full font-medium cursor-pointer transition-all duration-200 [transition-timing-function:var(--t-ease)]",
+              "inline-flex shrink-0 whitespace-nowrap items-center gap-1.5 rounded-full font-medium cursor-pointer transition-all duration-200 [transition-timing-function:var(--t-ease)]",
               "focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--t-ring,var(--t-blue))]",
               size === "sm" ? "px-3 py-1 text-[12px]" : "px-3.5 py-1.5 text-[13px]",
               active
@@ -101,7 +105,7 @@ export function TonalSegmentedControl<T extends string = string>({
             {Icon && <Icon className="h-3.5 w-3.5 shrink-0" />}
             <span>{opt.label}</span>
             {opt.badge !== undefined && (
-              <span className="text-[11px] font-mono text-[var(--t-ink-muted)]">
+              <span className="hidden sm:inline text-[11px] font-mono text-[var(--t-ink-muted)]">
                 {opt.badge}
               </span>
             )}

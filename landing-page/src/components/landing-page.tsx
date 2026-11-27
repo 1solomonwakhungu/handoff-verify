@@ -207,13 +207,13 @@ export function LandingPage() {
 
           <nav
             aria-label="Primary navigation"
-            className="hidden md:flex items-center gap-1"
+            className="hidden lg:flex items-center gap-1"
           >
             {NAV_LINKS.map((link) => (
               <a
                 key={link.href}
                 href={link.href}
-                className="rounded-full px-3.5 py-1.5 text-[13.5px] font-medium text-[var(--t-ink-secondary)] hover:text-[var(--t-ink)] hover:bg-[var(--t-surface)] transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--t-blue)]"
+                className="rounded-full px-3.5 py-1.5 text-[13.5px] font-medium text-[var(--t-ink-secondary)] hover:text-[var(--t-ink)] hover:bg-[var(--t-surface)] transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--t-blue)]"
               >
                 {link.label}
               </a>
@@ -223,7 +223,7 @@ export function LandingPage() {
           <div className="flex items-center gap-2 shrink-0">
             <a
               href={HARLO_URL}
-              className="hidden sm:inline-flex items-center gap-1 rounded-full px-3 py-1.5 text-[12.5px] font-medium text-[var(--t-ink-muted)] hover:text-[var(--t-ink)] hover:bg-[var(--t-surface)] transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--t-blue)]"
+              className="hidden sm:inline-flex items-center gap-1 rounded-full px-3 py-1.5 text-[12.5px] font-medium text-[var(--t-ink-muted)] hover:text-[var(--t-ink)] hover:bg-[var(--t-surface)] transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--t-blue)]"
             >
               <span>harlo.dev</span>
               <ArrowUpRight className="h-3.5 w-3.5" aria-hidden="true" />
@@ -232,8 +232,8 @@ export function LandingPage() {
             <a
               href={REPO_URL}
               target="_blank"
-              rel="noreferrer"
-              className="inline-flex items-center gap-1.5 rounded-full bg-[var(--t-surface)] hover:bg-[var(--t-surface-muted)] border border-[var(--t-border-subtle)] px-3.5 h-8 sm:h-9 text-[12.5px] font-medium text-[var(--t-ink)] transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--t-blue)]"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 rounded-full bg-[var(--t-surface)] hover:bg-[var(--t-surface-muted)] border border-[var(--t-border-subtle)] px-3.5 h-8 sm:h-9 text-[12.5px] font-medium text-[var(--t-ink)] transition-colors whitespace-nowrap focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--t-blue)]"
             >
               <GitBranch className="h-3.5 w-3.5" aria-hidden="true" />
               <span>GitHub</span>
@@ -291,7 +291,7 @@ export function LandingPage() {
                   handoff-verify
                 </strong>{" "}
                 checks every claim deterministically against the local JSONL
-                tool-call transcript — zero LLM calls, zero third-party
+                tool-call transcript — zero LLM calls, zero third-party runtime
                 dependencies.
               </p>
             </div>
@@ -306,7 +306,7 @@ export function LandingPage() {
               <a
                 href={REPO_URL}
                 target="_blank"
-                rel="noreferrer"
+                rel="noopener noreferrer"
                 className="inline-flex items-center justify-center gap-2 font-medium leading-none tracking-[-0.01em] rounded-[var(--t-radius-btn)] px-6 py-3 text-[14px] bg-transparent text-[var(--t-ink)] border border-[var(--t-ink-muted)] hover:bg-[var(--t-hover-overlay)] transition-all duration-200 [transition-timing-function:var(--t-ease)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--t-blue)]"
               >
                 <span>View on GitHub</span>
@@ -319,7 +319,7 @@ export function LandingPage() {
               <TonalSegmentedControl<InstallMethodId>
                 ariaLabel="Choose installation method"
                 size="sm"
-                className="rounded-2xl sm:rounded-full max-w-full"
+                className="self-start"
                 options={INSTALL_METHODS.map((m) => ({
                   value: m.id,
                   label: m.label,
@@ -361,7 +361,7 @@ export function LandingPage() {
                 </TonalChip>
               </div>
 
-              <div className="rounded-[18px] bg-[var(--t-elevated)] border border-[var(--t-border-subtle)] p-4 font-mono text-[12px] leading-[1.65] overflow-x-auto">
+              <div className="rounded-[18px] bg-[var(--t-elevated)] border border-[var(--t-border-subtle)] p-4 font-mono text-[12px] leading-[1.65] overflow-x-auto whitespace-pre-wrap">
                 <div className="text-[var(--t-ink-muted)]">
                   $ handoff-verify check
                   evals/cases/fail_06_claude_truncated_grep.jsonl
@@ -420,7 +420,7 @@ export function LandingPage() {
 
         {/* Interactive Transcript Verification Explorer */}
         <section id="demo" className="flex flex-col gap-6">
-          <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
+          <div className="flex flex-col lg:flex-row lg:items-end justify-between gap-4">
             <div className="max-w-2xl">
               <TonalChip tone="neutral" className="mb-3">
                 Interactive Transcript Explorer
@@ -439,7 +439,7 @@ export function LandingPage() {
             <TonalSegmentedControl<DemoScenarioId>
               ariaLabel="Select verification scenario"
               size="sm"
-              className="rounded-2xl sm:rounded-full max-w-full"
+              className="self-start lg:self-end shrink-0"
               options={DEMO_SCENARIOS.map((s) => ({
                 value: s.id,
                 label: s.shortLabel,
@@ -604,7 +604,7 @@ export function LandingPage() {
 
         {/* All 12 Finding Codes Reference */}
         <section id="codes" className="flex flex-col gap-6">
-          <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
+          <div className="flex flex-col xl:flex-row xl:items-end justify-between gap-4">
             <div className="max-w-2xl">
               <TonalChip tone="neutral" className="mb-3">
                 Stable Finding Codes
@@ -620,7 +620,7 @@ export function LandingPage() {
               </p>
             </div>
 
-            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3 shrink-0">
               <div className="relative">
                 <Search
                   aria-hidden="true"
@@ -632,16 +632,16 @@ export function LandingPage() {
                   onChange={(e) => setCodeQuery(e.target.value)}
                   placeholder="Filter codes..."
                   aria-label="Filter finding codes"
-                  className="w-full sm:w-52 rounded-full bg-[var(--t-surface)] border border-[var(--t-border-subtle)] pl-9 pr-8 py-1.5 text-[13px] text-[var(--t-ink)] placeholder:text-[var(--t-ink-muted)] focus:outline-none focus:bg-[var(--t-elevated)] focus:border-[var(--t-ring)]"
+                  className="w-full sm:w-52 rounded-full bg-[var(--t-surface)] border border-[var(--t-border-subtle)] pl-9 pr-8 py-1.5 text-[13px] text-[var(--t-ink)] placeholder:text-[var(--t-ink-muted)] focus:bg-[var(--t-elevated)] focus:border-[var(--t-ring)] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--t-blue)]"
                 />
                 {codeQuery && (
                   <button
                     type="button"
                     onClick={() => setCodeQuery("")}
                     aria-label="Clear code filter"
-                    className="absolute right-2.5 top-1/2 -translate-y-1/2 inline-flex h-5 w-5 items-center justify-center rounded-full text-[var(--t-ink-muted)] hover:text-[var(--t-ink)] cursor-pointer"
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 inline-flex h-5 w-5 items-center justify-center rounded-full text-[var(--t-ink-muted)] hover:text-[var(--t-ink)] cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--t-blue)]"
                   >
-                    <X className="h-3.5 w-3.5" />
+                    <X className="h-3.5 w-3.5" aria-hidden="true" />
                   </button>
                 )}
               </div>
@@ -649,7 +649,7 @@ export function LandingPage() {
               <TonalSegmentedControl<SeverityFilter>
                 ariaLabel="Filter finding codes by severity"
                 size="sm"
-                className="rounded-2xl sm:rounded-full self-start sm:self-auto"
+                className="self-start sm:self-auto shrink-0"
                 options={[
                   { value: "all", label: "All", badge: FINDING_CODES.length },
                   { value: "error", label: "Errors", badge: errorCount },
@@ -767,9 +767,19 @@ export function LandingPage() {
 
               <CodeBlock
                 label="Quick setup commands"
-                code={`handoff-verify init --write\n# Optional: block mode or uvx wrapper\nhandoff-verify init --write --mode block\nhandoff-verify init --write --command "uvx handoff-verify"\nhandoff-verify doctor`}
-                copyText="handoff-verify init --write && handoff-verify doctor"
+                code={`handoff-verify init --write\nhandoff-verify doctor`}
               />
+              <p className="text-[12.5px] leading-[1.55] text-[var(--t-ink-muted)]">
+                Optional flags:{" "}
+                <code className="font-mono text-[var(--t-ink-secondary)]">
+                  --mode block
+                </code>{" "}
+                or{" "}
+                <code className="font-mono text-[var(--t-ink-secondary)]">
+                  --command &quot;uvx handoff-verify&quot;
+                </code>
+                .
+              </p>
             </SurfaceTile>
 
             <SurfaceTile
@@ -840,7 +850,8 @@ export function LandingPage() {
               Measured Performance & Calibration
             </TonalChip>
             <h2 className="t-headline text-[28px] sm:text-[36px] mb-2">
-              Sub-millisecond checks, calibrated on 1,571 real sessions
+              Sub-millisecond checks on small transcripts, calibrated on 1,571
+              real sessions
             </h2>
             <p className="t-body text-[15px] text-[var(--t-ink-muted)]">
               Measured on macOS (<code className="font-mono text-[0.9em]">arm64</code>,
@@ -965,7 +976,7 @@ export function LandingPage() {
                 </div>
                 <div className="rounded-[16px] bg-[var(--t-elevated)] border border-[var(--t-border-subtle)] p-3.5">
                   <div className="text-[11.5px] text-[var(--t-ink-muted)] mb-1">
-                    After read fixes
+                    After shell-read &amp; scratch-copy fixes
                   </div>
                   <div className="text-[24px] font-medium tracking-[-0.03em] text-[var(--t-success)] tabular-nums">
                     21.8%
@@ -1057,7 +1068,11 @@ export function LandingPage() {
               Codex CLI rollouts, and CI pipelines.
             </p>
             <div className="pt-2">
-              <ChevronLink href={REPO_URL} target="_blank" rel="noreferrer">
+              <ChevronLink
+                href={REPO_URL}
+                target="_blank"
+                rel="noopener noreferrer"
+              >
                 Read full documentation on GitHub
               </ChevronLink>
             </div>
@@ -1084,7 +1099,7 @@ export function LandingPage() {
             <a
               href={REPO_URL}
               target="_blank"
-              rel="noreferrer"
+              rel="noopener noreferrer"
               className="hover:text-[var(--t-ink)] transition-colors"
             >
               GitHub
@@ -1092,7 +1107,7 @@ export function LandingPage() {
             <a
               href={PYPI_URL}
               target="_blank"
-              rel="noreferrer"
+              rel="noopener noreferrer"
               className="hover:text-[var(--t-ink)] transition-colors"
             >
               PyPI

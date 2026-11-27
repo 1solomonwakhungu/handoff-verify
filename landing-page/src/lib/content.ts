@@ -68,7 +68,7 @@ export const DEMO_SCENARIOS: DemoScenario[] = [
   {
     id: "clean",
     label: "Clean Pass",
-    shortLabel: "Clean (exit 0)",
+    shortLabel: "Clean",
     exitCode: 0,
     formatLabel: "text",
     summary:
@@ -107,7 +107,7 @@ Scope receipt:
   {
     id: "fabricated",
     label: "Fabricated Subagent",
-    shortLabel: "Subagent Report",
+    shortLabel: "Subagent",
     exitCode: 1,
     formatLabel: "markdown",
     summary:
@@ -137,7 +137,7 @@ Scope receipt:
   {
     id: "json",
     label: "JSON Schema 1.0",
-    shortLabel: "JSON (v1.0)",
+    shortLabel: "JSON v1.0",
     exitCode: 1,
     formatLabel: "json",
     summary:
@@ -157,10 +157,33 @@ Scope receipt:
     "claims": 2,
     "findings": 1
   },
+  "claims": [
+    {
+      "kind": "pointer",
+      "text": "\`src/auth/tokens.py:3-6\`",
+      "file_path": "src/auth/tokens.py",
+      "start_line": 3,
+      "end_line": 6,
+      "snippet": null,
+      "context": "Bearer headers are parsed in \`src/auth/tokens.py:3-6\`.",
+      "message_index": 0
+    },
+    {
+      "kind": "pointer",
+      "text": "\`src/auth/session_store.py:48-55\`",
+      "file_path": "src/auth/session_store.py",
+      "start_line": 48,
+      "end_line": 55,
+      "snippet": null,
+      "context": "Revoked session IDs are then checked against Redis in \`src/auth/session_store.py:48-55\` before granting access.",
+      "message_index": 0
+    }
+  ],
   "findings": [
     {
       "severity": "error",
       "code": "UNREAD_FILE",
+      "claim": { "...": "..." },
       "evidence": {
         "file_path": "src/auth/session_store.py",
         "claimed_range": [48, 55],
@@ -448,7 +471,8 @@ export const TRANSCRIPT_FORMATS: TranscriptFormatInfo[] = [
     name: "Generic JSONL",
     parserFlag: "--parser generic",
     tone: "neutral",
-    pathHint: "meta · file_read · file_edit · search · command · pagination · assistant",
+    pathHint:
+      "meta · file_read · file_edit · search · command · pagination · tool_call / tool_result · assistant",
     description:
       "Documented line-delimited JSON schema for integrating any custom agent harness or orchestration pipeline with auto-detection.",
   },
@@ -555,7 +579,7 @@ export const FAQ_ITEMS: AccordionItemData[] = [
   {
     question: "Should I start with advise mode or block mode in Claude Code hooks?",
     answer:
-      "Start with the default --mode advise (installed by handoff-verify init --write). In advise mode, error-level findings exit 0 and surface concise feedback via systemMessage and hookSpecificOutput.additionalContext without blocking the turn. Once you have observed how it behaves on your workflows — especially if your agents read files via custom inline scripts — you can opt into --mode block.",
+      "Start with the default --mode advise (installed by handoff-verify init --write). On error-level findings, advise mode exits 0 and emits structured JSON (systemMessage + hookSpecificOutput.additionalContext), which continues the turn once so the agent can correct its report while remaining loop-guarded by stop_hook_active. Once you have observed how it behaves on your workflows — especially if your agents read files via custom inline scripts — you can opt into --mode block (exit 2 on findings).",
   },
   {
     question: "Can a Stop or SubagentStop hook cause an infinite retry loop?",
@@ -570,6 +594,6 @@ export const FAQ_ITEMS: AccordionItemData[] = [
   {
     question: "What exit codes does the CLI return?",
     answer:
-      "For check and eval: exit 0 means verification passed (no error-level findings; pass --strict to fail on warnings too), exit 1 means one or more findings were detected (or eval targets missed), and exit 2 means a usage error, missing/unreadable transcript, or internal error. For hook claude-code: exit 0 when clean or in advise mode, exit 2 on findings in block mode, and exit 1 (fail-open with one stderr diagnostic) on parse/I/O errors unless --fail-closed is set.",
+      "For check: exit 0 means verification passed (no error-level findings; pass --strict to fail on warnings too), exit 1 means one or more findings were detected, and exit 2 means a usage error, unreadable transcript, or internal error. For eval: exit 0 when all targets pass, exit 1 if targets are missed, and exit 2 on a missing or invalid manifest. For hook claude-code: exit 0 when clean or in advise mode, exit 2 on findings in block mode, and exit 1 (fail-open with one stderr diagnostic) on parse/I/O errors unless --fail-closed is set.",
   },
 ];
