@@ -34,7 +34,7 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/1solomonwakhungu/handoff-verify"
+Homepage = "https://handoff-verify.harlo.dev"
 Documentation = "https://github.com/1solomonwakhungu/handoff-verify#readme"
 Repository = "https://github.com/1solomonwakhungu/handoff-verify"
 Issues = "https://github.com/1solomonwakhungu/handoff-verify/issues"
@@ -53,6 +53,15 @@ packages = ["src/handoff_verify"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "evals" = "handoff_verify/_evals"
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "landing-page",
+    "docs/launch.md",
+    "PLAN.md",
+    "AGENTS.md",
+    ".github",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

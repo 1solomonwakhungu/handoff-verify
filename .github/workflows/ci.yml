@@ -70,3 +70,22 @@ jobs:
               subprocess.run([hv, "eval", "--json"], cwd=td, check=True)
               subprocess.run([hv, "doctor", "--json"], cwd=td, check=True)
           PY
+
+  landing-page:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: landing-page
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: landing-page/package-lock.json
+      - name: Install landing page dependencies
+        run: npm ci
+      - name: Typecheck landing page
+        run: npm run typecheck
+      - name: Build landing page
+        run: npm run build
