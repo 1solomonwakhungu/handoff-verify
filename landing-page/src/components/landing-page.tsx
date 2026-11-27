@@ -24,6 +24,7 @@ import { ChevronLink } from "@/components/tonal/chevron-link";
 import { TonalAccordion } from "@/components/tonal/accordion";
 import { TonalSegmentedControl } from "@/components/tonal/segmented-control";
 import { KpiGrid } from "@/components/tonal/kpi-grid";
+import { BrandMark } from "@/components/brand-mark";
 import { CodeBlock } from "@/components/code-block";
 import {
   BENCHMARK_KPIS,
@@ -61,43 +62,6 @@ const PILLAR_ICONS = {
   quotes: Quote,
   scope: Radar,
 } as const;
-
-function BrandMark({ className = "h-6 w-6" }: { className?: string }) {
-  return (
-    <svg
-      viewBox="0 0 32 32"
-      fill="none"
-      aria-hidden="true"
-      className={className}
-    >
-      <rect width="32" height="32" rx="10" fill="var(--t-ink)" />
-      <rect
-        x="7.5"
-        y="6.5"
-        width="13"
-        height="17"
-        rx="3"
-        stroke="var(--t-bg)"
-        strokeWidth="2"
-      />
-      <path
-        d="M11 11.5h6M11 15.5h4"
-        stroke="var(--t-blue)"
-        strokeWidth="2"
-        strokeLinecap="round"
-      />
-      <circle cx="21.5" cy="21.5" r="5.5" fill="var(--t-ink)" />
-      <circle cx="21.5" cy="21.5" r="4.5" fill="var(--t-success)" />
-      <path
-        d="M19.3 21.5l1.5 1.5 3-3"
-        stroke="var(--t-bg)"
-        strokeWidth="1.8"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-    </svg>
-  );
-}
 
 function SeverityChip({ severity }: { severity: FindingSeverity }) {
   if (severity === "error") {

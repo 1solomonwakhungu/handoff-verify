@@ -37,22 +37,37 @@ export default function OpenGraphImage() {
                 width: 40,
                 height: 40,
                 borderRadius: 12,
-                background: "#202124",
+                background: "#131314",
+                border: "1px solid rgba(255,255,255,0.1)",
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
               }}
             >
               <svg
-                width="24"
-                height="24"
-                viewBox="0 0 24 24"
+                width="28"
+                height="28"
+                viewBox="0 0 32 32"
                 fill="none"
               >
                 <path
-                  d="M5 12.5L9.5 17L19 7.5"
-                  stroke="#81C995"
-                  strokeWidth="2.8"
+                  d="M10.5 6H9.5A3.5 3.5 0 0 0 6 9.5V22.5A3.5 3.5 0 0 0 9.5 26H10.5"
+                  stroke="#E3E3E3"
+                  strokeWidth="4"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+                <path
+                  d="M21.5 6H22.5A3.5 3.5 0 0 1 26 9.5V22.5A3.5 3.5 0 0 1 22.5 26H21.5"
+                  stroke="#E3E3E3"
+                  strokeWidth="4"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+                <path
+                  d="M11.75 16.75L14.75 19.75L20.25 13.25"
+                  stroke="#8AB4F8"
+                  strokeWidth="4"
                   strokeLinecap="round"
                   strokeLinejoin="round"
                 />

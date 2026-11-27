@@ -1,3 +1,9 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/handoff-verify-logo-dark-256.png" />
+  <source media="(prefers-color-scheme: light)" srcset="docs/brand/handoff-verify-logo-256.png" />
+  <img alt="handoff-verify logo" src="docs/brand/handoff-verify-logo-256.png" width="72" height="72" />
+</picture>
+
 # handoff-verify
 
 **Deterministic, zero-LLM claim & scope verification for AI coding agents and subagents.**
